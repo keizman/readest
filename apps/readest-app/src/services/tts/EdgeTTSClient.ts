@@ -212,7 +212,7 @@ export class EdgeTTSClient implements TTSClient {
           };
           this.#isPlaying = true;
           audio.src = audioUrl || '';
-          this.#startWordTracking(audio, boundaries);
+          this.#startWordTracking(audio, boundaries, handleEnded);
           if (!this.appService?.isLinuxApp) {
             audio.playbackRate = this.#rate;
           }
@@ -254,7 +254,11 @@ export class EdgeTTSClient implements TTSClient {
   // highlight it. Word offsets are in media time, so audio.playbackRate and
   // pause/resume (including the resume rewind on iOS) are handled naturally
   // by polling audio.currentTime.
-  #startWordTracking(audio: HTMLAudioElement, boundaries: TTSWordBoundary[]) {
+  #startWordTracking(
+    audio: HTMLAudioElement,
+    boundaries: TTSWordBoundary[],
+    onSpeechEnd?: () => void,
+  ) {
     this.#stopWordTracking();
     const controller = this.controller;
     if (!controller) return;
@@ -263,12 +267,39 @@ export class EdgeTTSClient implements TTSClient {
     // suppressed at mark dispatch (see TTSController.prepareSpeakWords).
     controller.prepareSpeakWords(boundaries.map((boundary) => boundary.text));
     if (!boundaries.length) return;
+
+    // Each per-sentence Edge mp3 carries trailing silence after the last word.
+    // Playing sentence-by-sentence (and paragraph-by-paragraph) stacks that
+    // trailing silence with the next segment's turnaround into an over-long
+    // pause at every line/paragraph break. The last word boundary tells us when
+    // speech actually ends, so once playback passes it (plus a small safety
+    // margin so the final word isn't clipped) we finish the segment early and
+    // let playback advance to the preloaded next one — roughly halving the gap.
+    const TICKS_PER_SECOND = 10_000_000;
+    const TRAIL_SAFETY_MARGIN_SEC = 0.12;
+    const MIN_TRAILING_SILENCE_SEC = 0.25;
+    const lastBoundary = boundaries[boundaries.length - 1]!;
+    const speechEndSec = (lastBoundary.offset + lastBoundary.duration) / TICKS_PER_SECOND;
+    let endedEarly = false;
+
     let lastIndex = -1;
     const tick = () => {
-      const index = findBoundaryIndexAtTime(boundaries, audio.currentTime);
+      const currentTime = audio.currentTime;
+      const index = findBoundaryIndexAtTime(boundaries, currentTime);
       if (index !== lastIndex && index >= 0) {
         lastIndex = index;
         controller.dispatchSpeakWord(index);
+      }
+      if (!endedEarly && onSpeechEnd && Number.isFinite(audio.duration)) {
+        const trailingSilence = audio.duration - speechEndSec;
+        if (
+          trailingSilence > MIN_TRAILING_SILENCE_SEC &&
+          currentTime >= speechEndSec + TRAIL_SAFETY_MARGIN_SEC
+        ) {
+          endedEarly = true;
+          onSpeechEnd();
+          return;
+        }
       }
       this.#wordTrackingRafId = requestAnimationFrame(tick);
     };
