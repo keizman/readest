@@ -1,0 +1,5 @@
+# Local Cargo settings for faster parallel builds.
+# Cargo already defaults jobs to CPU count; this makes it explicit and overridable via CARGO_BUILD_JOBS.
+
+[build]
+jobs = 12

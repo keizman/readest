@@ -35,7 +35,10 @@ export class EdgeTTSClient implements TTSClient {
     this.appService = appService;
   }
 
-  async init(protocol: EDGE_TTS_PROTOCOL = 'wss') {
+  // Default to the HTTPS path, which targets the self-hosted Edge TTS server
+  // (see getEdgeTTSBaseUrl). No auth is required, so there is no wss fallback
+  // or tts-need-auth prompt.
+  async init(protocol: EDGE_TTS_PROTOCOL = 'https') {
     this.#edgeTTS = new EdgeSpeechTTS(protocol);
     this.#voices = EdgeSpeechTTS.voices;
     try {
@@ -48,15 +51,7 @@ export class EdgeTTSClient implements TTSClient {
       });
       this.initialized = true;
     } catch {
-      if (protocol === 'wss') {
-        if (this.controller?.isAuthenticated) {
-          await this.init('https');
-        } else {
-          this.controller?.dispatchEvent(new CustomEvent('tts-need-auth'));
-        }
-      } else {
-        this.initialized = false;
-      }
+      this.initialized = false;
     }
     return this.initialized;
   }

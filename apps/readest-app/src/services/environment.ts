@@ -1,5 +1,9 @@
 import { AppService } from '@/types/system';
-import { READEST_NODE_BASE_URL, READEST_WEB_BASE_URL } from './constants';
+import {
+  READEST_EDGE_TTS_BASE_URL,
+  READEST_NODE_BASE_URL,
+  READEST_WEB_BASE_URL,
+} from './constants';
 import { getRuntimeConfig } from './runtimeConfig';
 
 declare global {
@@ -19,6 +23,11 @@ export const getBaseUrl = () =>
   READEST_WEB_BASE_URL;
 export const getNodeBaseUrl = () =>
   process.env['NEXT_PUBLIC_NODE_BASE_URL'] ?? READEST_NODE_BASE_URL;
+
+// Base URL of the self-hosted Edge TTS server. Overridable at build time via
+// NEXT_PUBLIC_EDGE_TTS_BASE_URL; otherwise defaults to the hosted instance.
+export const getEdgeTTSBaseUrl = () =>
+  process.env['NEXT_PUBLIC_EDGE_TTS_BASE_URL'] ?? READEST_EDGE_TTS_BASE_URL;
 
 export const isMacPlatform = () =>
   typeof window !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform);

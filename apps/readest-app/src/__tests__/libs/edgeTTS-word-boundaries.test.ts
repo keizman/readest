@@ -38,6 +38,7 @@ vi.mock('isomorphic-ws', () => ({
 
 vi.mock('@/services/environment', () => ({
   getAPIBaseUrl: () => 'http://localhost/api',
+  getEdgeTTSBaseUrl: () => 'http://localhost',
   isTauriAppPlatform: () => false,
 }));
 
@@ -47,16 +48,15 @@ vi.mock('@/utils/supabase', () => ({
   createSupabaseAdminClient: () => ({}),
 }));
 
-// Controllable stub for the authenticated HTTPS proxy fetch.
+// Controllable stub for the self-hosted HTTPS Edge TTS fetch.
 const httpState = vi.hoisted(() => ({
   headers: {} as Record<string, string>,
   body: new Uint8Array([1, 2, 3]),
 }));
-vi.mock('@/utils/fetch', () => ({
-  fetchWithAuth: vi.fn(
-    async () => new Response(httpState.body, { status: 200, headers: httpState.headers }),
-  ),
-}));
+vi.stubGlobal(
+  'fetch',
+  vi.fn(async () => new Response(httpState.body, { status: 200, headers: httpState.headers })),
+);
 
 const makeBinaryAudioFrame = (audio: Uint8Array) => {
   const header = new TextEncoder().encode('Path:audio\r\n');

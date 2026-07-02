@@ -59,6 +59,9 @@ android {
             }
         }
         getByName("release") {
+            // The self-hosted Edge TTS server is reached over cleartext HTTP
+            // (see READEST_EDGE_TTS_BASE_URL); allow it in release builds too.
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
             isMinifyEnabled = true
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("signing")

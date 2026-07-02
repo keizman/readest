@@ -3,8 +3,7 @@ import WebSocket from 'isomorphic-ws';
 import { randomMd5 } from '@/utils/misc';
 import { LRUCache } from '@/utils/lru';
 import { genSSML } from '@/utils/ssml';
-import { fetchWithAuth } from '@/utils/fetch';
-import { getAPIBaseUrl, isTauriAppPlatform } from '@/services/environment';
+import { getEdgeTTSBaseUrl, isTauriAppPlatform } from '@/services/environment';
 
 // Cloudflare Workers expose a global `WebSocketPair` that is not available in
 // browsers or Node.js. The Node `ws` package (used transitively via
@@ -368,9 +367,11 @@ export class EdgeSpeechTTS {
   }
 
   async #fetchEdgeSpeechHttp({ lang, text, voice, rate }: EdgeTTSPayload): Promise<Response> {
-    const url = getAPIBaseUrl() + '/tts/edge';
+    // Point at the self-hosted Edge TTS server (no auth required); it returns
+    // audio/mpeg plus word boundaries in the WORD_BOUNDARIES_HEADER.
+    const url = getEdgeTTSBaseUrl() + '/api/tts/edge';
 
-    const response = await fetchWithAuth(url, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
