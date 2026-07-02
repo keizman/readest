@@ -34,6 +34,7 @@ import {
   getRangeRectInWebview,
   getRangeTextStyleInWebview,
   getTextFromRange,
+  getWordRangeFromPoint,
 } from '@/utils/sel';
 import { eventDispatcher } from '@/utils/event';
 import { findTocItemBS } from '@/services/nav';
@@ -109,6 +110,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
   const getView = useReaderStore((s) => s.getView);
   const getViewsById = useReaderStore((s) => s.getViewsById);
   const getViewSettings = useReaderStore((s) => s.getViewSettings);
+  const getViewState = useReaderStore((s) => s.getViewState);
   const { setNotebookVisible, setNotebookNewAnnotation, setNotebookNewHighlightId } =
     useNotebookStore();
   const { clearBooknotesNav } = useSidebarStore();
@@ -629,6 +631,17 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
       const doc = content?.doc;
       const index = content?.index;
       if (!doc || index === undefined) return;
+      // In listen mode (TTS already running/enabled), a double-tap on a
+      // paragraph means "read from here" instead of raising the word toolbar:
+      // resolve the word under the point and restart TTS from that range so
+      // playback jumps to the tapped paragraph/sentence.
+      if (getViewState(bookKey)?.ttsEnabled) {
+        const range = getWordRangeFromPoint(doc, data.clientX, data.clientY);
+        if (range) {
+          eventDispatcher.dispatch('tts-speak', { bookKey, index, range: range.cloneRange() });
+          return;
+        }
+      }
       // A double-click is a deliberate act-on-word gesture, so let the quick
       // action fire without the touch long-press hold gate (matching a mouse
       // selection, which sets this to 0 on pointerdown).
