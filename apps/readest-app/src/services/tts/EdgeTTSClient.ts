@@ -38,21 +38,17 @@ export class EdgeTTSClient implements TTSClient {
   // Default to the HTTPS path, which targets the self-hosted Edge TTS server
   // (see getEdgeTTSBaseUrl). No auth is required, so there is no wss fallback
   // or tts-need-auth prompt.
+  //
+  // The voice list is a static, local catalog and the self-hosted server has
+  // no per-voice gating, so mark the client ready without a live network probe.
+  // A single failed/slow probe at startup must not disable every voice in the
+  // picker (that made voices like zh-CN-YunxiNeural unselectable); transient
+  // server issues surface at playback time, where #createAudioUrlWithRetry
+  // already retries and errors are reported.
   async init(protocol: EDGE_TTS_PROTOCOL = 'https') {
     this.#edgeTTS = new EdgeSpeechTTS(protocol);
     this.#voices = EdgeSpeechTTS.voices;
-    try {
-      await this.#edgeTTS.create({
-        lang: 'en',
-        text: 'test',
-        voice: 'en-US-AriaNeural',
-        rate: 1.0,
-        pitch: 1.0,
-      });
-      this.initialized = true;
-    } catch {
-      this.initialized = false;
-    }
+    this.initialized = true;
     return this.initialized;
   }
 

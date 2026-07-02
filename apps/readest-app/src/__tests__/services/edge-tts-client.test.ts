@@ -119,7 +119,7 @@ describe('EdgeTTSClient', () => {
       expect(voices.map((v) => v.id)).toContain('en-US-AriaNeural');
     });
 
-    test('init failure does not prompt for auth (self-hosted, no wss fallback)', async () => {
+    test('init does not prompt for auth (self-hosted, no wss fallback)', async () => {
       const dispatchEvent = vi.fn();
       const mockController = {
         isAuthenticated: false,
@@ -127,28 +127,30 @@ describe('EdgeTTSClient', () => {
       } as unknown as TTSController;
       const c = new EdgeTTSClient(mockController);
 
-      createBehavior = () => Promise.reject(new Error('server unreachable'));
-
       const result = await c.init();
-      expect(result).toBe(false);
-      expect(c.initialized).toBe(false);
+      expect(result).toBe(true);
       expect(dispatchEvent).not.toHaveBeenCalledWith(
         expect.objectContaining({ type: 'tts-need-auth' }),
       );
     });
 
-    test('failure sets initialized to false', async () => {
+    test('init is optimistic: stays initialized even if a probe would fail', async () => {
+      // The self-hosted server needs no auth and the voice list is static, so
+      // init must not gate voice selection on a live network probe (a transient
+      // server hiccup previously disabled every voice in the picker).
       const mockController = {
-        isAuthenticated: true,
+        isAuthenticated: false,
         dispatchEvent: vi.fn(),
       } as unknown as TTSController;
       const c = new EdgeTTSClient(mockController);
 
-      createBehavior = () => Promise.reject(new Error('failed'));
+      createBehavior = () => Promise.reject(new Error('server unreachable'));
 
       const result = await c.init();
-      expect(result).toBe(false);
-      expect(c.initialized).toBe(false);
+      expect(result).toBe(true);
+      expect(c.initialized).toBe(true);
+      const voices = await c.getAllVoices();
+      expect(voices.every((v) => !v.disabled)).toBe(true);
     });
   });
 
