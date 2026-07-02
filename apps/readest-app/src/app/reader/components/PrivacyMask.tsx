@@ -6,7 +6,7 @@ import { useEnv } from '@/context/EnvContext';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
-import { isBookPrivate, isBookMasked, setBookMasked } from '@/utils/privacy';
+import { isBookPrivate, isBookMasked, setBookMasked, setBookPrivate } from '@/utils/privacy';
 
 interface PrivacyMaskProps {
   bookHash: string;
@@ -14,12 +14,18 @@ interface PrivacyMaskProps {
 }
 
 /**
- * Reader overlay for books the user marked "private" (see utils/privacy.ts).
+ * Reader privacy control (see utils/privacy.ts).
+ *
+ * The eye toggle is always shown in the reader's top-right so content can be
+ * hidden on demand on every platform - notably Android, which has no shelf
+ * context menu to mark a book private. Hiding marks the book private (so the
+ * choice is remembered and the book reopens masked); revealing keeps it private
+ * but remembers the revealed state.
  *
  * The mask is a solid theme-background layer sitting above the book content but
  * below the reader chrome (header/footer/TTS bar use z >= 40, the mask uses a
  * low z and is pointer-events-none), so it hides the text without blocking page
- * turns or any controls. The reveal toggle is remembered per book.
+ * turns or any controls.
  */
 const PrivacyMask: React.FC<PrivacyMaskProps> = ({ bookHash, gridInsets }) => {
   const _ = useTranslation();
@@ -27,12 +33,21 @@ const PrivacyMask: React.FC<PrivacyMaskProps> = ({ bookHash, gridInsets }) => {
   const { settings, setSettings, saveSettings } = useSettingsStore();
   const iconSize = useResponsiveSize(20);
 
-  if (!isBookPrivate(settings, bookHash)) return null;
   const masked = isBookMasked(settings, bookHash);
 
   const toggleMask = async () => {
     const current = useSettingsStore.getState().settings;
-    const next = setBookMasked(current, bookHash, !isBookMasked(current, bookHash));
+    let next: typeof current;
+    if (isBookMasked(current, bookHash)) {
+      // Reveal: keep the book private but remember the revealed state.
+      next = setBookMasked(current, bookHash, false);
+    } else if (isBookPrivate(current, bookHash)) {
+      next = setBookMasked(current, bookHash, true);
+    } else {
+      // First hide from the reader also marks the book private so it is
+      // remembered and reopens masked next time.
+      next = setBookPrivate(current, bookHash, true);
+    }
     setSettings(next);
     await saveSettings(envConfig, next);
   };
