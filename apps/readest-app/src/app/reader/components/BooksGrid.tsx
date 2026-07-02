@@ -14,6 +14,7 @@ import { getViewInsets } from '@/utils/insets';
 import SearchResultsNav from './sidebar/SearchResultsNav';
 import BooknotesNav from './sidebar/BooknotesNav';
 import FoliateViewer from './FoliateViewer';
+import PrivacyMask from './PrivacyMask';
 import SectionInfo from './SectionInfo';
 import HeaderBar from './HeaderBar';
 import PageNavigationButtons from './PageNavigationButtons';
@@ -190,6 +191,7 @@ const BookCellInner: React.FC<BookCellProps> = ({
         gridInsets={gridInsets}
         contentInsets={contentInsets}
       />
+      <PrivacyMask bookHash={book.hash} gridInsets={gridInsets} />
       {viewSettings.vertical && viewSettings.scrolled && (
         <>
           {(showFooter || viewSettings.doubleBorder) && (

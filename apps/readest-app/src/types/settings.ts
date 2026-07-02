@@ -317,6 +317,17 @@ export interface SystemSettings {
    */
   biometricUnlockEnabled?: boolean;
 
+  /**
+   * Local-only (never synced) privacy state. `privateBookHashes` lists the
+   * content-hashes the user marked "private": opening such a book masks its
+   * content behind a solid overlay until revealed, and TTS never exposes the
+   * spoken text in the OS media/now-playing metadata. `privateBookMaskStates`
+   * remembers the per-book reveal choice (hash -> masked); a private book with
+   * no recorded choice defaults to masked.
+   */
+  privateBookHashes?: string[];
+  privateBookMaskStates?: Record<string, boolean>;
+
   kosync: KOSyncSettings;
   readwise: ReadwiseSettings;
   hardcover: HardcoverSettings;

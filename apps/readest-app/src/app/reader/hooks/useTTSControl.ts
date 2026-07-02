@@ -17,6 +17,8 @@ import { throttle } from '@/utils/throttle';
 import { isCfiInLocation } from '@/utils/cfi';
 import { getLocale } from '@/utils/misc';
 import { buildTTSMediaMetadata } from '@/utils/ttsMetadata';
+import { isBookMasked } from '@/utils/privacy';
+import { useSettingsStore } from '@/store/settingsStore';
 import { invokeUseBackgroundAudio } from '@/utils/bridge';
 import { estimateTTSTime } from '@/utils/ttsTime';
 import { useTTSMediaSession } from './useTTSMediaSession';
@@ -191,7 +193,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     if (!ttsController || !bookKey) return;
     const bookData = getBookData(bookKey);
     if (!bookData || !bookData.book) return;
-    const { title, author, coverImageUrl } = bookData.book;
+    const { title, author, coverImageUrl, hash: bookHash } = bookData.book;
 
     const handleNeedAuth = () => {
       eventDispatcher.dispatch('toast', {
@@ -208,15 +210,21 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       const mark = (e as CustomEvent<TTSMark>).detail;
       const ttsMediaMetadata = viewSettings?.ttsMediaMetadata ?? 'sentence';
 
-      const metadata = buildTTSMediaMetadata({
-        markText: mark?.text || '',
-        markName: mark?.name || '',
-        sectionLabel: sectionLabel || '',
-        title,
-        author,
-        ttsMediaMetadata,
-        previousSectionLabel: previousSectionLabelRef.current,
-      });
+      // For private (masked) books, never surface the spoken sentence in the OS
+      // now-playing/media metadata — fall back to the book title so lock-screen
+      // and notification shade don't leak the content being read.
+      const masked = isBookMasked(useSettingsStore.getState().settings, bookHash);
+      const metadata = masked
+        ? { title, artist: author, album: title, shouldUpdate: true }
+        : buildTTSMediaMetadata({
+            markText: mark?.text || '',
+            markName: mark?.name || '',
+            sectionLabel: sectionLabel || '',
+            title,
+            author,
+            ttsMediaMetadata,
+            previousSectionLabel: previousSectionLabelRef.current,
+          });
 
       if (ttsMediaMetadata === 'chapter') {
         previousSectionLabelRef.current = sectionLabel;

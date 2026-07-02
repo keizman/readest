@@ -627,6 +627,7 @@ export type BookContextMenuItemId =
   | 'download'
   | 'upload'
   | 'share'
+  | 'togglePrivate'
   | 'delete';
 
 /**
@@ -727,6 +728,9 @@ export const getBookContextMenuItemIds = (book: Book): BookContextMenuItemId[] =
   // Share is offered for any local-or-uploaded book; the dialog uploads first
   // if the book hasn't been pushed yet.
   if (book.downloadedAt || book.uploadedAt) ids.push('share');
+  // Local-only privacy toggle; label (mark vs unmark) is resolved by the caller
+  // from the local settings, so the id is always present here.
+  ids.push('togglePrivate');
   ids.push('delete');
   return ids;
 };

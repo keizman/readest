@@ -176,6 +176,7 @@ vi.mock('@/utils/cfi', () => ({
 
 vi.mock('@/utils/misc', () => ({
   getLocale: () => 'en',
+  stubTranslation: (key: string) => key,
 }));
 
 vi.mock('@/utils/ttsMetadata', () => ({

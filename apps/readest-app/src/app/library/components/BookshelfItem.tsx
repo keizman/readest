@@ -20,6 +20,7 @@ import {
   type BookContextMenuItemId,
 } from '@/app/library/utils/libraryUtils';
 import { md5Fingerprint } from '@/utils/md5';
+import { isBookPrivate, setBookPrivate } from '@/utils/privacy';
 import BookItem from './BookItem';
 import GroupItem from './GroupItem';
 import { useOpenBook } from '../hooks/useOpenBook';
@@ -125,8 +126,8 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
   handleUpdateReadingStatus,
 }) => {
   const _ = useTranslation();
-  const { appService } = useEnv();
-  const { settings } = useSettingsStore();
+  const { envConfig, appService } = useEnv();
+  const { settings, setSettings, saveSettings } = useSettingsStore();
   const { openBook } = useOpenBook({ setLoading, handleBookDownload });
 
   const showBookDetailsModal = useCallback(async (book: Book) => {
@@ -247,6 +248,19 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
           eventDispatcher.dispatch('show-share-dialog', { book });
         },
       },
+      togglePrivate: {
+        text: isBookPrivate(settings, book.hash) ? _('Unmark as Private') : _('Mark as Private'),
+        action: async () => {
+          const current = useSettingsStore.getState().settings;
+          const nextSettings = setBookPrivate(
+            current,
+            book.hash,
+            !isBookPrivate(current, book.hash),
+          );
+          setSettings(nextSettings);
+          await saveSettings(envConfig, nextSettings);
+        },
+      },
       delete: {
         text: _('Delete'),
         action: async () => {
@@ -337,7 +351,7 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
         groupContextMenuHandler(item as BooksGroup);
       }
     }, 100),
-    [itemSelected, settings.localBooksDir],
+    [itemSelected, settings.localBooksDir, settings.privateBookHashes],
   );
 
   const { pressing, handlers } = useLongPress(
