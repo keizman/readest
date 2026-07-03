@@ -125,6 +125,10 @@ const FoliateViewer: React.FC<{
   const containerRef = useRef<HTMLDivElement | null>(null);
   const isViewCreated = useRef(false);
   const doubleClickDisabled = useRef(!!viewSettings?.disableDoubleClick);
+  // Double-tap is off by default on mobile (tap-to-turn), but listen mode needs
+  // it so a double-tap can jump TTS to the tapped paragraph. Track whether a TTS
+  // session is active and force double-tap on while it is.
+  const ttsActiveRef = useRef(false);
   const [toastMessage, setToastMessage] = useState('');
   const [loading, setLoading] = useState(false);
   const [scrollMargins, setScrollMargins] = useState({ top: 0, bottom: 0 });
@@ -687,7 +691,7 @@ const FoliateViewer: React.FC<{
       view.renderer.setStyles?.(getStyles(viewSettings, undefined, getLoadedFonts()));
       applyTranslationStyle(viewSettings);
 
-      doubleClickDisabled.current = viewSettings.disableDoubleClick!;
+      doubleClickDisabled.current = viewSettings.disableDoubleClick! && !ttsActiveRef.current;
       const animated = viewSettings.animated!;
       const eink = viewSettings.isEink!;
       const maxColumnCount = viewSettings.maxColumnCount!;
@@ -896,9 +900,24 @@ const FoliateViewer: React.FC<{
 
   useEffect(() => {
     if (viewRef.current && viewRef.current.renderer) {
-      doubleClickDisabled.current = !!viewSettings?.disableDoubleClick;
+      doubleClickDisabled.current = !!viewSettings?.disableDoubleClick && !ttsActiveRef.current;
     }
   }, [viewSettings?.disableDoubleClick]);
+
+  // Force double-tap on while a TTS session exists so listen mode can jump to a
+  // tapped paragraph even when the (mobile-default) double-tap setting is off.
+  useEffect(() => {
+    const handlePlaybackState = (event: CustomEvent) => {
+      const detail = event.detail as { bookKey?: string; state?: string } | undefined;
+      if (detail?.bookKey !== bookKey) return;
+      ttsActiveRef.current = detail.state === 'playing' || detail.state === 'paused';
+      doubleClickDisabled.current = !!viewSettings?.disableDoubleClick && !ttsActiveRef.current;
+    };
+    eventDispatcher.on('tts-playback-state', handlePlaybackState);
+    return () => {
+      eventDispatcher.off('tts-playback-state', handlePlaybackState);
+    };
+  }, [bookKey, viewSettings?.disableDoubleClick]);
 
   useEffect(() => {
     if (viewRef.current && viewRef.current.renderer && viewSettings) {

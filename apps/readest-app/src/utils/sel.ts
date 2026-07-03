@@ -507,6 +507,58 @@ export const getWordRangeAt = (node: Node, offset: number): Range | null => {
   return null;
 };
 
+// Block-level tags a paragraph tap should snap to when the point isn't on a
+// word (a gap between/around words). Used by listen mode to jump TTS to the
+// start of the tapped paragraph/block.
+const BLOCK_LEVEL_TAGS = new Set([
+  'P',
+  'LI',
+  'BLOCKQUOTE',
+  'H1',
+  'H2',
+  'H3',
+  'H4',
+  'H5',
+  'H6',
+  'DIV',
+  'SECTION',
+  'ARTICLE',
+  'TD',
+  'TH',
+  'DD',
+  'DT',
+  'FIGCAPTION',
+  'PRE',
+]);
+
+// A collapsed range at the start of the block/paragraph under a point (in `doc`
+// viewport coordinates). Returns null when no block is found. Used as the
+// fallback for a listen-mode double-tap that misses a word so playback still
+// jumps to the tapped paragraph.
+export const getBlockRangeFromPoint = (doc: Document, x: number, y: number): Range | null => {
+  let node: Node | null = null;
+  if (doc.caretPositionFromPoint) {
+    node = doc.caretPositionFromPoint(x, y)?.offsetNode ?? null;
+  } else if (doc.caretRangeFromPoint) {
+    node = doc.caretRangeFromPoint(x, y)?.startContainer ?? null;
+  }
+  if (!node) node = doc.elementFromPoint(x, y);
+  let el: Element | null =
+    node?.nodeType === Node.ELEMENT_NODE ? (node as Element) : (node?.parentElement ?? null);
+  while (el && !BLOCK_LEVEL_TAGS.has(el.tagName)) {
+    el = el.parentElement;
+  }
+  if (!el) return null;
+  const range = doc.createRange();
+  try {
+    range.selectNodeContents(el);
+    range.collapse(true);
+  } catch {
+    return null;
+  }
+  return range;
+};
+
 // The word range under a point (in `doc` viewport coordinates), like a native
 // double-click. Returns null when the point isn't on word-like text.
 export const getWordRangeFromPoint = (doc: Document, x: number, y: number): Range | null => {

@@ -35,6 +35,7 @@ import {
   getRangeTextStyleInWebview,
   getTextFromRange,
   getWordRangeFromPoint,
+  getBlockRangeFromPoint,
 } from '@/utils/sel';
 import { eventDispatcher } from '@/utils/event';
 import { findTocItemBS } from '@/services/nav';
@@ -633,10 +634,13 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
       if (!doc || index === undefined) return;
       // In listen mode (TTS already running/enabled), a double-tap on a
       // paragraph means "read from here" instead of raising the word toolbar:
-      // resolve the word under the point and restart TTS from that range so
-      // playback jumps to the tapped paragraph/sentence.
+      // restart TTS from the tapped word, or from the start of the tapped
+      // paragraph/block when the tap misses a word, so playback always jumps to
+      // the tapped paragraph.
       if (getViewState(bookKey)?.ttsEnabled) {
-        const range = getWordRangeFromPoint(doc, data.clientX, data.clientY);
+        const range =
+          getWordRangeFromPoint(doc, data.clientX, data.clientY) ??
+          getBlockRangeFromPoint(doc, data.clientX, data.clientY);
         if (range) {
           eventDispatcher.dispatch('tts-speak', { bookKey, index, range: range.cloneRange() });
           return;
