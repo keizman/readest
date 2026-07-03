@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { estimateTTSTime } from '@/utils/ttsTime';
+import { estimateSpeechDuration, estimateTTSTime } from '@/utils/ttsTime';
 import { BookProgress } from '@/types/book';
 
 const createProgress = (values: {
@@ -71,5 +71,21 @@ describe('estimateTTSTime', () => {
 
     expect(result.bookRemainingSec).toBe(120);
     expect(result.finishAtTimestamp).toBe(121000);
+  });
+});
+
+describe('estimateSpeechDuration', () => {
+  it('estimates five minutes for roughly 900 English words', () => {
+    const text = Array.from({ length: 900 }, () => 'word').join(' ');
+
+    expect(estimateSpeechDuration(text)).toBe(300);
+  });
+
+  it('estimates five minutes for roughly 1350 CJK characters', () => {
+    expect(estimateSpeechDuration('中'.repeat(1350))).toBe(300);
+  });
+
+  it('combines CJK characters and Latin words without counting punctuation', () => {
+    expect(estimateSpeechDuration('中文，hello world!')).toBeCloseTo(2 / 4.5 + 2 / 3, 5);
   });
 });

@@ -46,6 +46,7 @@ const NowPlayingBar: React.FC = () => {
         aria-label={_('Resume listening')}
         className={clsx(
           'bg-base-100 border-base-300 flex items-center gap-3 rounded-xl border p-2 shadow-sm',
+          'eink-bordered',
           'cursor-pointer transition-transform duration-200 hover:scale-[1.01]',
         )}
       >

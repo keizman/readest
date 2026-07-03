@@ -358,6 +358,13 @@ export class EdgeSpeechTTS {
     }
   });
   private static boundariesCache = new LRUCache<string, TTSWordBoundary[]>(200);
+  // Preload is triggered from several controller paths as playback advances.
+  // Coalesce identical in-flight work so overlapping look-ahead never sends
+  // duplicate HTTP requests before the first response reaches the LRU cache.
+  private static pendingAudio = new Map<
+    string,
+    Promise<{ url: string; boundaries: TTSWordBoundary[] }>
+  >();
   private protocol: EDGE_TTS_PROTOCOL = 'wss';
 
   constructor(protocol?: EDGE_TTS_PROTOCOL) {
@@ -749,14 +756,27 @@ export class EdgeSpeechTTS {
     if (cachedUrl) {
       return { url: cachedUrl, boundaries: EdgeSpeechTTS.boundariesCache.get(cacheKey) ?? [] };
     }
-    const { response, boundaries } = await this.#fetchEdgeSpeech(payload);
-    const arrayBuffer = await response.arrayBuffer();
-    const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
-    const objectUrl = URL.createObjectURL(blob);
-    EdgeSpeechTTS.audioCache.set(cacheKey, blob);
-    EdgeSpeechTTS.audioUrlCache.set(cacheKey, objectUrl);
-    EdgeSpeechTTS.boundariesCache.set(cacheKey, boundaries);
-    return { url: objectUrl, boundaries };
+    const pending = EdgeSpeechTTS.pendingAudio.get(cacheKey);
+    if (pending) return pending;
+
+    const request = (async () => {
+      const { response, boundaries } = await this.#fetchEdgeSpeech(payload);
+      const arrayBuffer = await response.arrayBuffer();
+      const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+      const objectUrl = URL.createObjectURL(blob);
+      EdgeSpeechTTS.audioCache.set(cacheKey, blob);
+      EdgeSpeechTTS.audioUrlCache.set(cacheKey, objectUrl);
+      EdgeSpeechTTS.boundariesCache.set(cacheKey, boundaries);
+      return { url: objectUrl, boundaries };
+    })();
+    EdgeSpeechTTS.pendingAudio.set(cacheKey, request);
+    try {
+      return await request;
+    } finally {
+      if (EdgeSpeechTTS.pendingAudio.get(cacheKey) === request) {
+        EdgeSpeechTTS.pendingAudio.delete(cacheKey);
+      }
+    }
   }
 
   async createAudioUrl(payload: EdgeTTSPayload): Promise<string> {

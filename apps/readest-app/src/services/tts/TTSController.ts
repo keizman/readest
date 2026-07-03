@@ -16,6 +16,7 @@ import { EdgeTTSClient } from './EdgeTTSClient';
 import { TTSUtils } from './TTSUtils';
 import { TTSClient } from './TTSClient';
 import { isValidLang } from '@/utils/lang';
+import { estimateSpeechDuration } from '@/utils/ttsTime';
 import {
   computeWordOffsets,
   getTextSubRange,
@@ -31,17 +32,14 @@ import {
 // across sessions.
 let ttsPositionSequence = 0;
 
-// How far ahead to prefetch audio so playback keeps a large buffer and never
-// issues a request mid-play (weak-network / short-offline resilience). We look
-// ahead until the estimated buffered speech reaches ~5 minutes, capped by a
-// paragraph limit so a stretch of very short paragraphs can't trigger a huge
-// synchronous look-ahead (each look-ahead step re-materializes a paragraph's
-// SSML). The Edge client caches up to 200 payloads, well above this buffer, so
-// nothing already fetched is re-requested — steady state only fetches the one
-// newly-revealed far paragraph per advance. ~4.5 CJK chars/sec ⇒ 5 min ≈ 1350
-// chars; the small margin covers rate/estimate variance.
-const PREFETCH_TARGET_CHARS = 1400;
-const PREFETCH_MAX_PARAGRAPHS = 16;
+// Keep at least five minutes of wall-clock speech ready in the Edge LRU cache.
+// Duration is estimated per paragraph (CJK chars vs. words), so English and
+// short dialogue receive the same real playback buffer as dense CJK prose.
+// 100 paragraphs is still below the 200-entry cache in the worst short-block
+// case, while avoiding the old 16-paragraph cap that held under two minutes of
+// English dialogue. Prefetch continues into following sections when needed.
+const PREFETCH_TARGET_SECONDS = 5 * 60;
+const PREFETCH_MAX_PARAGRAPHS = 100;
 
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
 // utterance it cannot synthesize offline — typically a specific unsupported
@@ -259,6 +257,13 @@ export class TTSController extends EventTarget {
       return true;
     }
 
+    this.view.tts = await this.#createTTS(doc, this.#getHighlighter());
+    console.log(`[TTS] Initialized TTS for section ${sectionIndex}`);
+
+    return true;
+  }
+
+  async #createTTS(doc: Document, highlighter: (range: Range) => void) {
     const { TTS } = await import('foliate-js/tts.js');
     const { textWalker } = await import('foliate-js/text-walker.js');
     let granularity: TTSGranularity = this.view.language.isCJK ? 'sentence' : 'word';
@@ -267,7 +272,7 @@ export class TTSController extends EventTarget {
       granularity = supportedGranularities[0]!;
     }
 
-    this.view.tts = new TTS(
+    return new TTS(
       doc,
       textWalker,
       createRejectFilter({
@@ -291,12 +296,9 @@ export class TTSController extends EventTarget {
         ],
         contents: [{ tag: 'a', content: /^[\[\(]?[\*\d]+[\)\]]?$/ }],
       }),
-      this.#getHighlighter(),
+      highlighter,
       granularity,
     );
-    console.log(`[TTS] Initialized TTS for section ${sectionIndex}`);
-
-    return true;
   }
 
   async #initTTSForNextSection(): Promise<boolean> {
@@ -352,7 +354,7 @@ export class TTSController extends EventTarget {
   }
 
   async preloadNextSSML(
-    targetChars: number = PREFETCH_TARGET_CHARS,
+    targetSeconds: number = PREFETCH_TARGET_SECONDS,
     maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
   ) {
     const tts = this.view.tts;
@@ -364,14 +366,14 @@ export class TTSController extends EventTarget {
     // can dispatch marks against the wrong #ranges, causing incorrect highlights
     // and accidental page turns. Stop once the estimated buffered speech reaches
     // the target so long paragraphs don't over-fetch and short ones still build
-    // a real buffer (bounded by maxParagraphs).
+    // a real time-based buffer (bounded by maxParagraphs).
     const rawSsmls: string[] = [];
-    let estChars = 0;
-    for (let i = 0; i < maxParagraphs && estChars < targetChars; i++) {
+    let estimatedSeconds = 0;
+    for (let i = 0; i < maxParagraphs && estimatedSeconds < targetSeconds; i++) {
       const ssml = tts.next();
       if (!ssml) break;
       rawSsmls.push(ssml);
-      estChars += ssml.replace(/<[^>]+>/g, '').length;
+      estimatedSeconds += estimateSpeechDuration(ssml.replace(/<[^>]+>/g, ''), this.ttsRate);
     }
     for (let i = 0; i < rawSsmls.length; i++) {
       tts.prev();
@@ -384,6 +386,39 @@ export class TTSController extends EventTarget {
     for (const raw of rawSsmls) {
       const ssml = await this.#preprocessSSML(raw);
       if (ssml) await this.preloadSSML(ssml, new AbortController().signal);
+    }
+
+    // A chapter boundary must not shrink the offline window. Build isolated
+    // TTS iterators for following sections, so look-ahead can continue without
+    // changing view.tts or the current paragraph/highlight state.
+    let paragraphCount = rawSsmls.length;
+    const sections = this.view.book.sections;
+    for (
+      let sectionIndex = this.#ttsSectionIndex + 1;
+      sections &&
+      sectionIndex < sections.length &&
+      paragraphCount < maxParagraphs &&
+      estimatedSeconds < targetSeconds;
+      sectionIndex++
+    ) {
+      const section = sections[sectionIndex];
+      if (!section?.createDocument) continue;
+      const doc = await section.createDocument();
+      const html = doc.querySelector('html');
+      const lang = html?.getAttribute('lang') || html?.getAttribute('xml:lang') || '';
+      if (html && !isValidLang(lang) && this.ttsLang) {
+        html.setAttribute('lang', this.ttsLang);
+        html.setAttribute('xml:lang', this.ttsLang);
+      }
+      const sectionTTS = await this.#createTTS(doc, () => {});
+      let raw = sectionTTS.start();
+      while (raw && paragraphCount < maxParagraphs && estimatedSeconds < targetSeconds) {
+        estimatedSeconds += estimateSpeechDuration(raw.replace(/<[^>]+>/g, ''), this.ttsRate);
+        paragraphCount++;
+        const ssml = await this.#preprocessSSML(raw);
+        if (ssml) await this.preloadSSML(ssml, new AbortController().signal);
+        raw = sectionTTS.next();
+      }
     }
   }
 

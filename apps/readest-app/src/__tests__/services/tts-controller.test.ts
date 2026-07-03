@@ -1289,6 +1289,41 @@ describe('TTSController', () => {
       // No next() should happen after an async operation
       expect(callOrder).not.toContain('next-after-async');
     });
+
+    test('buffers at least five minutes even when the text has many short paragraphs', async () => {
+      const paragraph = Array.from({ length: 20 }, () => 'word').join(' ');
+      const paragraphs = Array.from({ length: 50 }, () => `<speak>${paragraph}</speak>`);
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const preloadSpy = vi.spyOn(controller, 'preloadSSML').mockResolvedValue();
+
+      await controller.preloadNextSSML();
+
+      // 20 words is ~6.7 seconds at 180 wpm, so a five-minute buffer needs
+      // about 45 paragraphs. The previous 16-paragraph cap only held ~107s.
+      expect(preloadSpy.mock.calls.length).toBeGreaterThanOrEqual(45);
+      expect(mockView.tts!.prev).toHaveBeenCalledTimes(preloadSpy.mock.calls.length);
+    });
+
+    test('continues prefetching into the next section when the current one is too short', async () => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        next: vi.fn().mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const preloadSpy = vi.spyOn(controller, 'preloadSSML').mockResolvedValue();
+      const nextSection = mockView.book.sections![1]!;
+
+      await controller.preloadNextSSML(1, 2);
+
+      expect(nextSection.createDocument).toHaveBeenCalledOnce();
+      expect(preloadSpy).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('initViewTTS', () => {

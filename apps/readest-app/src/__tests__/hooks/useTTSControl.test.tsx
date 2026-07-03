@@ -33,6 +33,7 @@ const mockView = {
   },
   resolveCFI: vi.fn().mockReturnValue({ index: 0, anchor: () => new Range() }),
   getCFI: vi.fn().mockReturnValue('cfi'),
+  getCFIProgress: vi.fn().mockResolvedValue({ fraction: 0.6 }),
   deselect: vi.fn(),
   resolveNavigation: vi.fn(),
   goTo: vi.fn(),
@@ -65,7 +66,7 @@ const mockViewSettings = {
 
 const mockBookData = {
   isFixedLayout: false,
-  book: { primaryLanguage: 'en', title: 'T', author: 'A', coverImageUrl: '' },
+  book: { hash: 'book-1', primaryLanguage: 'en', title: 'T', author: 'A', coverImageUrl: '' },
 };
 
 vi.mock('@/store/readerStore', () => {
@@ -147,7 +148,10 @@ vi.mock('@/services/tts', () => ({
       backward: vi.fn().mockResolvedValue(undefined),
       getVoices: vi.fn().mockResolvedValue([]),
       getVoiceId: vi.fn().mockReturnValue(''),
+      getCurrentHighlightCfi: vi.fn().mockReturnValue(null),
+      reapplyCurrentHighlight: vi.fn(),
       redispatchPosition: vi.fn(),
+      view: mockView,
       state: 'idle',
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
@@ -215,9 +219,10 @@ vi.mock('@/app/reader/hooks/useTTSMediaSession', () => ({
 }));
 
 // Imports must come AFTER vi.mock calls so they pick up the mocked modules.
-import { useTTSControl } from '@/app/reader/hooks/useTTSControl';
+import { stopDetachedTTS, useTTSControl } from '@/app/reader/hooks/useTTSControl';
 import { eventDispatcher } from '@/utils/event';
 import { useReaderStore } from '@/store/readerStore';
+import { useNowPlayingStore } from '@/store/nowPlayingStore';
 
 const getSetTTSEnabledMock = () =>
   (
@@ -478,5 +483,48 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
 
     expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledTimes(1);
     expect(mockView.goTo).not.toHaveBeenCalled();
+  });
+});
+
+describe('useTTSControl detached bookshelf progress', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+    mockView.getCFIProgress.mockClear();
+    mockViewSettings.ttsLocation = null;
+    useNowPlayingStore.setState({ nowPlaying: null, resumeRequestBookId: null });
+  });
+
+  afterEach(() => {
+    stopDetachedTTS();
+    cleanup();
+  });
+
+  it('keeps the bookshelf progress in sync while TTS plays after reader unmount', async () => {
+    const rendered = render(<Harness />);
+    await act(async () => {
+      const pending = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await pending;
+    });
+
+    rendered.unmount();
+    const controller = ttsControllerInstances[0] as {
+      addEventListener: { mock: { calls: [string, (event: Event) => void][] } };
+    };
+    const detachedHandler = controller.addEventListener.mock.calls
+      .filter(([name]) => name === 'tts-highlight-mark')
+      .at(-1)?.[1];
+    if (!detachedHandler) throw new Error('detached progress listener was not registered');
+
+    await act(async () => {
+      detachedHandler(
+        new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/8!/4/2)' } }),
+      );
+      await vi.waitFor(() => expect(mockView.getCFIProgress).toHaveBeenCalledOnce());
+    });
+
+    expect(useNowPlayingStore.getState().nowPlaying?.fraction).toBe(0.6);
   });
 });

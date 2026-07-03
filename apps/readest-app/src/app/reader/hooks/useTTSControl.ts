@@ -217,6 +217,8 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
           controller.onSectionChange = async () => {};
           detachedController = controller;
           detachedBookKey = bookKey;
+          const detachedView = controller.view;
+          const detachedBookId = getBookData(bookKey)?.book?.hash;
           // Track position so resume picks up from the correct spot.
           const handleDetachedMark = (e: Event) => {
             const { cfi } = (e as CustomEvent<{ cfi: string }>).detail;
@@ -229,6 +231,27 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
               }
             } catch {
               /* best-effort */
+            }
+            // The reader progress subscription unmounts with the route, but the
+            // shelf bar remains visible while detached TTS keeps advancing.
+            // Resolve the spoken CFI through the retained book view and update
+            // only the matching now-playing session (the user may have started
+            // another book before this async lookup finishes).
+            if (detachedBookId) {
+              void detachedView
+                .getCFIProgress(cfi)
+                .then((resolved) => {
+                  const fraction = resolved?.fraction;
+                  const store = useNowPlayingStore.getState();
+                  if (
+                    typeof fraction === 'number' &&
+                    Number.isFinite(fraction) &&
+                    store.nowPlaying?.bookId === detachedBookId
+                  ) {
+                    store.updateNowPlaying({ fraction });
+                  }
+                })
+                .catch(() => {});
             }
           };
           controller.addEventListener('tts-highlight-mark', handleDetachedMark);
