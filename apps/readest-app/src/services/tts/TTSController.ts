@@ -31,6 +31,18 @@ import {
 // across sessions.
 let ttsPositionSequence = 0;
 
+// How far ahead to prefetch audio so playback keeps a large buffer and never
+// issues a request mid-play (weak-network / short-offline resilience). We look
+// ahead until the estimated buffered speech reaches ~5 minutes, capped by a
+// paragraph limit so a stretch of very short paragraphs can't trigger a huge
+// synchronous look-ahead (each look-ahead step re-materializes a paragraph's
+// SSML). The Edge client caches up to 200 payloads, well above this buffer, so
+// nothing already fetched is re-requested — steady state only fetches the one
+// newly-revealed far paragraph per advance. ~4.5 CJK chars/sec ⇒ 5 min ≈ 1350
+// chars; the small margin covers rate/estimate variance.
+const PREFETCH_TARGET_CHARS = 1400;
+const PREFETCH_MAX_PARAGRAPHS = 16;
+
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
 // utterance it cannot synthesize offline — typically a specific unsupported
 // character, hit characteristically on the first utterance after a chapter
@@ -339,32 +351,40 @@ export class TTSController extends EventTarget {
     for await (const _ of iter);
   }
 
-  async preloadNextSSML(count: number = 4) {
+  async preloadNextSSML(
+    targetChars: number = PREFETCH_TARGET_CHARS,
+    maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
+  ) {
     const tts = this.view.tts;
     if (!tts) return;
 
-    // Gather all next SSMLs and rewind synchronously to avoid a race condition:
+    // Gather the next SSMLs and rewind synchronously to avoid a race condition:
     // tts.next() replaces TTS.#ranges (used by setMark() during playback).
     // If async gaps exist between next()/prev() calls, a concurrent #speak()
     // can dispatch marks against the wrong #ranges, causing incorrect highlights
-    // and accidental page turns.
+    // and accidental page turns. Stop once the estimated buffered speech reaches
+    // the target so long paragraphs don't over-fetch and short ones still build
+    // a real buffer (bounded by maxParagraphs).
     const rawSsmls: string[] = [];
-    for (let i = 0; i < count; i++) {
+    let estChars = 0;
+    for (let i = 0; i < maxParagraphs && estChars < targetChars; i++) {
       const ssml = tts.next();
       if (!ssml) break;
       rawSsmls.push(ssml);
+      estChars += ssml.replace(/<[^>]+>/g, '').length;
     }
     for (let i = 0; i < rawSsmls.length; i++) {
       tts.prev();
     }
 
-    const ssmls: string[] = [];
+    // Preload nearest-first and sequentially so the buffer fills in reading
+    // order and requests ramp up rather than firing every paragraph at once
+    // (gentler on the self-hosted TTS server). Callers don't await this, so the
+    // sequential fill runs in the background without blocking playback.
     for (const raw of rawSsmls) {
       const ssml = await this.#preprocessSSML(raw);
-      if (!ssml) break;
-      ssmls.push(ssml);
+      if (ssml) await this.preloadSSML(ssml, new AbortController().signal);
     }
-    await Promise.all(ssmls.map((ssml) => this.preloadSSML(ssml, new AbortController().signal)));
   }
 
   async #preprocessSSML(ssml?: string) {

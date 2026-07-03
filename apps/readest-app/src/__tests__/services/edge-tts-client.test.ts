@@ -609,4 +609,157 @@ describe('EdgeTTSClient', () => {
       await resultPromise;
     });
   });
+
+  describe('char batching', () => {
+    class MockAudio {
+      static instances: MockAudio[] = [];
+      src = '';
+      currentTime = 0;
+      preload = '';
+      playbackRate = 1;
+      volume = 1;
+      onended: ((e?: Event) => void) | null = null;
+      onerror: ((e?: unknown) => void) | null = null;
+      constructor() {
+        MockAudio.instances.push(this);
+      }
+      setAttribute() {}
+      play() {
+        return Promise.resolve();
+      }
+      pause() {}
+    }
+
+    let rafCallbacks: Map<number, FrameRequestCallback>;
+    let rafId = 0;
+    const runRaf = () => {
+      const cbs = [...rafCallbacks.values()];
+      rafCallbacks.clear();
+      for (const cb of cbs) cb(0);
+    };
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    let mockController: {
+      dispatchSpeakMark: ReturnType<typeof vi.fn>;
+      prepareSpeakWords: ReturnType<typeof vi.fn>;
+      dispatchSpeakWord: ReturnType<typeof vi.fn>;
+    };
+
+    beforeEach(() => {
+      MockAudio.instances = [];
+      rafCallbacks = new Map();
+      vi.stubGlobal('Audio', MockAudio);
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        rafCallbacks.set(++rafId, cb);
+        return rafId;
+      });
+      vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+        rafCallbacks.delete(id);
+      });
+      mockController = {
+        dispatchSpeakMark: vi.fn(),
+        prepareSpeakWords: vi.fn(),
+        dispatchSpeakWord: vi.fn(),
+      };
+      client = new EdgeTTSClient(mockController as unknown as TTSController);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    // Drive the whole generator, ending each batch's audio so playback advances.
+    const consumeBatches = async (it: AsyncGenerator<unknown>) => {
+      let res = await it.next();
+      while (!res.done) {
+        const endPromise = it.next();
+        await flush();
+        MockAudio.instances.at(-1)!.onended?.();
+        await endPromise;
+        res = await it.next();
+      }
+    };
+
+    test('merges consecutive marks under the char budget into one request', async () => {
+      parsedMarks = [
+        { name: '0', text: 'a'.repeat(40), language: 'en', offset: 0 },
+        { name: '1', text: 'b'.repeat(40), language: 'en', offset: 40 },
+      ] as never;
+      await client.init();
+      await consumeBatches(client.speak('<ssml/>', new AbortController().signal));
+      // 80 chars <= 120 => a single Edge request for both sentences.
+      expect(createAudioBehavior).toHaveBeenCalledTimes(1);
+    });
+
+    test('splits marks that exceed the char budget into multiple requests', async () => {
+      parsedMarks = [
+        { name: '0', text: 'a'.repeat(80), language: 'en', offset: 0 },
+        { name: '1', text: 'b'.repeat(80), language: 'en', offset: 80 },
+      ] as never;
+      await client.init();
+      await consumeBatches(client.speak('<ssml/>', new AbortController().signal));
+      // 160 chars > 120 => two requests.
+      expect(createAudioBehavior).toHaveBeenCalledTimes(2);
+    });
+
+    test('never merges marks of different languages into one request', async () => {
+      parsedMarks = [
+        { name: '0', text: 'hello', language: 'en', offset: 0 },
+        { name: '1', text: 'bonjour', language: 'fr', offset: 5 },
+      ] as never;
+      await client.init();
+      await consumeBatches(client.speak('<ssml/>', new AbortController().signal));
+      expect(createAudioBehavior).toHaveBeenCalledTimes(2);
+    });
+
+    test('remaps combined boundaries back to each mark for per-sentence highlighting', async () => {
+      parsedMarks = [
+        { name: '0', text: 'Hello world', language: 'en', offset: 0 },
+        { name: '1', text: 'Bye now', language: 'en', offset: 11 },
+      ] as never;
+      createAudioBehavior = vi.fn(() =>
+        Promise.resolve({
+          url: 'blob:mock-url',
+          boundaries: [
+            { offset: 1_000_000, duration: 4_000_000, text: 'Hello' },
+            { offset: 6_000_000, duration: 4_000_000, text: 'world' },
+            { offset: 16_000_000, duration: 4_000_000, text: 'Bye' },
+            { offset: 21_000_000, duration: 4_000_000, text: 'now' },
+          ],
+        }),
+      );
+      await client.init();
+      const it = client.speak('<ssml/>', new AbortController().signal);
+      const first = await it.next();
+      expect((first.value as { code: string }).code).toBe('boundary');
+      const resultPromise = it.next();
+      await flush();
+      const audio = MockAudio.instances.at(-1)!;
+
+      // First sentence set up synchronously with only its own words.
+      expect(mockController.dispatchSpeakMark).toHaveBeenNthCalledWith(1, parsedMarks[0]);
+      expect(mockController.prepareSpeakWords).toHaveBeenNthCalledWith(1, ['Hello', 'world']);
+
+      audio.currentTime = 0.11;
+      runRaf();
+      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(0);
+      audio.currentTime = 0.65;
+      runRaf();
+      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(1);
+
+      // Crossing into the second sentence dispatches its mark + word list, and
+      // word indexes restart at 0 within that sentence.
+      audio.currentTime = 1.65;
+      runRaf();
+      expect(mockController.dispatchSpeakMark).toHaveBeenNthCalledWith(2, parsedMarks[1]);
+      expect(mockController.prepareSpeakWords).toHaveBeenNthCalledWith(2, ['Bye', 'now']);
+      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(0);
+      audio.currentTime = 2.15;
+      runRaf();
+      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(1);
+
+      audio.onended?.();
+      await resultPromise;
+    });
+  });
 });

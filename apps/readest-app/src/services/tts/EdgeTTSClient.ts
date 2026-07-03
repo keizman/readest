@@ -2,12 +2,41 @@ import { getUserLocale } from '@/utils/misc';
 import { isSameLang } from '@/utils/lang';
 import { TTSClient, TTSMessageEvent } from './TTSClient';
 import { EdgeSpeechTTS, EdgeTTSPayload, EDGE_TTS_PROTOCOL, TTSWordBoundary } from '@/libs/edgeTTS';
-import { TTSGranularity, TTSVoice, TTSVoicesGroup } from './types';
+import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 import { AppService } from '@/types/system';
 import { parseSSMLMarks } from '@/utils/ssml';
 import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
+
+// Short volume ramp applied at the end of each Edge segment. A single <audio>
+// element is reused for every sentence, so each boundary tears down and
+// reassigns audio.src — which clicks/pops ("电波"/静电) whenever the waveform
+// isn't sitting at a zero sample. Fading the element volume to zero before the
+// cut removes that step discontinuity. The fade runs inside the segment's
+// trailing silence, so it's inaudible and never clips speech. rAF-driven, but
+// the audio's natural `onended` is a safe fallback if frames stall (e.g. the
+// app is backgrounded), so playback always advances and volume is restored.
+const SEGMENT_FADE_OUT_MS = 60;
+
+// Edge word-boundary offsets/durations are in 100-nanosecond ticks.
+const TICKS_PER_SECOND = 10_000_000;
+// End a segment once playback passes the last word (plus a small margin so the
+// final word isn't clipped) whenever the trailing silence is long enough to be
+// worth trimming.
+const TRAIL_SAFETY_MARGIN_SEC = 0.12;
+const MIN_TRAILING_SILENCE_SEC = 0.25;
+
+// Group consecutive sentence-marks of a paragraph into a single Edge request of
+// up to this many characters. Each foliate paragraph carries one mark per
+// sentence, and the client used to issue one request per mark — short CJK
+// sentences (e.g. dialogue) meant many tiny requests and a torn-down <audio>
+// src (hence a gap/click) at every sentence. Batching yields one mp3 that plays
+// gaplessly across its sentences and cuts request frequency; ~120 chars keeps
+// first-audio latency low (~25-30s of CJK speech per request). Word/sentence
+// highlighting is preserved by remapping the combined word-boundaries back to
+// each mark. Marks are never split, and a batch never mixes languages.
+const BATCH_MAX_CHARS = 120;
 
 export class EdgeTTSClient implements TTSClient {
   name = 'edge-tts';
@@ -29,6 +58,7 @@ export class EdgeTTSClient implements TTSClient {
   #startedAt = 0;
   #fadeCompensation: number | null = null;
   #wordTrackingRafId: number | null = null;
+  #fadeRafId: number | null = null;
 
   constructor(controller?: TTSController, appService?: AppService | null) {
     this.controller = controller;
@@ -94,37 +124,35 @@ export class EdgeTTSClient implements TTSClient {
     const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
 
     if (preload) {
-      // preload the first 2 marks immediately and the rest in the background
+      // Preload by batch (not per mark) so the cached payloads are keyed on the
+      // exact combined text that playback will request — otherwise the cache
+      // would miss and playback would re-fetch mid-play. First couple of
+      // batches immediately, the rest in the background.
+      const batches = this.#buildBatches(marks);
       const maxImmediate = 2;
-      for (let i = 0; i < Math.min(maxImmediate, marks.length); i++) {
-        if (signal.aborted) break;
-        const mark = marks[i]!;
-        const { language: voiceLang } = mark;
+      const preloadBatch = async (batch: TTSMark[]) => {
+        const voiceLang = batch[0]!.language;
         const voiceId = await this.getVoiceIdFromLang(voiceLang);
         this.#currentVoiceId = voiceId;
+        const text = batch.map((m) => m.text).join('');
+        await this.#createAudioUrlWithRetry(this.getPayload(voiceLang, text, voiceId), signal);
+      };
+      for (let i = 0; i < Math.min(maxImmediate, batches.length); i++) {
+        if (signal.aborted) break;
         try {
-          await this.#createAudioUrlWithRetry(
-            this.getPayload(voiceLang, mark.text, voiceId),
-            signal,
-          );
+          await preloadBatch(batches[i]!);
         } catch (err) {
-          console.warn('Error preloading mark', i, err);
+          console.warn('Error preloading batch', i, err);
         }
       }
-      if (marks.length > maxImmediate) {
+      if (batches.length > maxImmediate) {
         (async () => {
-          for (let i = maxImmediate; i < marks.length; i++) {
-            const mark = marks[i]!;
+          for (let i = maxImmediate; i < batches.length; i++) {
+            if (signal.aborted) break;
             try {
-              if (signal.aborted) break;
-              const { language: voiceLang } = mark;
-              const voiceId = await this.getVoiceIdFromLang(voiceLang);
-              await this.#createAudioUrlWithRetry(
-                this.getPayload(voiceLang, mark.text, voiceId),
-                signal,
-              );
+              await preloadBatch(batches[i]!);
             } catch (err) {
-              console.warn('Error preloading mark (bg)', i, err);
+              console.warn('Error preloading batch (bg)', i, err);
             }
           }
         })();
@@ -147,15 +175,17 @@ export class EdgeTTSClient implements TTSClient {
     audio.setAttribute('x-webkit-airplay', 'deny');
     audio.preload = 'auto';
 
-    for (const mark of marks) {
-      this.controller?.dispatchSpeakMark(mark);
+    const batches = this.#buildBatches(marks);
+    for (const batch of batches) {
+      const firstMark = batch[0]!;
+      const batchText = batch.map((m) => m.text).join('');
       let abortHandler: null | (() => void) = null;
       try {
-        const { language: voiceLang } = mark;
+        const voiceLang = firstMark.language;
         const voiceId = await this.getVoiceIdFromLang(voiceLang);
         this.#speakingLang = voiceLang;
         const audioResult = await this.#edgeTTS?.createAudio(
-          this.getPayload(voiceLang, mark.text, voiceId),
+          this.getPayload(voiceLang, batchText, voiceId),
         );
         const audioUrl = audioResult?.url;
         const boundaries = audioResult?.boundaries ?? [];
@@ -166,8 +196,8 @@ export class EdgeTTSClient implements TTSClient {
 
         yield {
           code: 'boundary',
-          message: `Start chunk: ${mark.name}`,
-          mark: mark.name,
+          message: `Start chunk: ${firstMark.name}`,
+          mark: firstMark.name,
         } as TTSMessageEvent;
 
         const result = await new Promise<TTSMessageEvent>((resolve) => {
@@ -182,7 +212,7 @@ export class EdgeTTSClient implements TTSClient {
             if (resolved) return;
             resolved = true;
             cleanUp();
-            resolve({ code: 'end', message: `Chunk finished: ${mark.name}` });
+            resolve({ code: 'end', message: `Chunk finished: ${firstMark.name}` });
           };
 
           abortHandler = () => {
@@ -203,7 +233,7 @@ export class EdgeTTSClient implements TTSClient {
           };
           this.#isPlaying = true;
           audio.src = audioUrl || '';
-          this.#startWordTracking(audio, boundaries, handleEnded);
+          this.#startBatchTracking(audio, batch, boundaries, handleEnded);
           if (!this.appService?.isLinuxApp) {
             audio.playbackRate = this.#rate;
           }
@@ -223,12 +253,12 @@ export class EdgeTTSClient implements TTSClient {
         yield result;
       } catch (error) {
         if (error instanceof Error && error.message === 'No audio data received.') {
-          console.warn('No audio data received for:', mark.text);
-          yield { code: 'end', message: `Chunk finished: ${mark.name}` } as TTSMessageEvent;
+          console.warn('No audio data received for:', batchText);
+          yield { code: 'end', message: `Chunk finished: ${firstMark.name}` } as TTSMessageEvent;
           continue;
         }
         const message = error instanceof Error ? error.message : String(error);
-        console.warn('TTS error for mark:', mark.text, message);
+        console.warn('TTS error for mark:', batchText, message);
         yield { code: 'error', message } as TTSMessageEvent;
         break;
       } finally {
@@ -240,45 +270,115 @@ export class EdgeTTSClient implements TTSClient {
     await this.stopInternal();
   }
 
+  // Group a paragraph's sentence-marks into requests of up to BATCH_MAX_CHARS
+  // characters. Consecutive marks are merged until adding the next would exceed
+  // the budget; a single over-long mark stands alone. A batch never mixes
+  // languages so each Edge request has one voice/lang.
+  #buildBatches(marks: TTSMark[]): TTSMark[][] {
+    const batches: TTSMark[][] = [];
+    let current: TTSMark[] = [];
+    let currentLen = 0;
+    let currentLang: string | null = null;
+    for (const mark of marks) {
+      const len = mark.text.length;
+      const sameLang = currentLang === null || mark.language === currentLang;
+      if (current.length > 0 && (!sameLang || currentLen + len > BATCH_MAX_CHARS)) {
+        batches.push(current);
+        current = [];
+        currentLen = 0;
+        currentLang = null;
+      }
+      current.push(mark);
+      currentLen += len;
+      currentLang = mark.language;
+    }
+    if (current.length > 0) batches.push(current);
+    return batches;
+  }
+
+  // Split the combined word-boundaries of a batched mp3 back to each sentence
+  // mark, so highlighting stays per sentence even though several sentences
+  // share one request/mp3. Each boundary word is located in the combined text
+  // (sequential search) and assigned to the mark whose character span contains
+  // it. `startSec` is when each mark's first word begins in the shared mp3.
+  #partitionBatch(batch: TTSMark[], boundaries: TTSWordBoundary[]) {
+    const base = batch[0]!.offset;
+    const combined = batch.map((m) => m.text).join('');
+    const spanEnd = batch.map((m) => m.offset - base + m.text.length);
+    const perMark: TTSWordBoundary[][] = batch.map(() => []);
+    let searchPos = 0;
+    let markIdx = 0;
+    for (const boundary of boundaries) {
+      let pos = combined.indexOf(boundary.text, searchPos);
+      if (pos < 0) {
+        pos = searchPos;
+      } else {
+        searchPos = pos + boundary.text.length;
+      }
+      while (markIdx < spanEnd.length - 1 && pos >= spanEnd[markIdx]!) markIdx++;
+      perMark[markIdx]!.push(boundary);
+    }
+    const startSec: number[] = [];
+    for (let i = 0; i < batch.length; i++) {
+      const first = perMark[i]![0];
+      startSec[i] = first ? first.offset / TICKS_PER_SECOND : (startSec[i - 1] ?? 0);
+    }
+    return { perMark, startSec };
+  }
+
   // Follow playback time against the word-boundary metadata of the current
-  // chunk and tell the controller which word is being spoken so it can
-  // highlight it. Word offsets are in media time, so audio.playbackRate and
-  // pause/resume (including the resume rewind on iOS) are handled naturally
-  // by polling audio.currentTime.
-  #startWordTracking(
+  // batch and drive per-sentence highlighting: when playback crosses into a new
+  // mark, dispatch that mark (sentence highlight) and hand its words to the
+  // controller; within a mark, report the spoken word. Word offsets are in
+  // media time, so audio.playbackRate and pause/resume (including the resume
+  // rewind on iOS) are handled naturally by polling audio.currentTime.
+  #startBatchTracking(
     audio: HTMLAudioElement,
+    batch: TTSMark[],
     boundaries: TTSWordBoundary[],
     onSpeechEnd?: () => void,
   ) {
     this.#stopWordTracking();
     const controller = this.controller;
     if (!controller) return;
-    // Always hand the words to the controller — with boundaries it highlights
-    // word-by-word; with none it draws the sentence highlight that was
-    // suppressed at mark dispatch (see TTSController.prepareSpeakWords).
-    controller.prepareSpeakWords(boundaries.map((boundary) => boundary.text));
+
+    const { perMark, startSec } = this.#partitionBatch(batch, boundaries);
+    let currentMark = -1;
+    let lastWord = -1;
+    const enterMark = (i: number) => {
+      currentMark = i;
+      lastWord = -1;
+      controller.dispatchSpeakMark(batch[i]!);
+      // With words the controller highlights word-by-word; with none it draws
+      // the sentence highlight suppressed at mark dispatch (see
+      // TTSController.prepareSpeakWords).
+      controller.prepareSpeakWords(perMark[i]!.map((boundary) => boundary.text));
+    };
+
+    // Set up the first mark synchronously so its sentence highlight + word list
+    // are ready before the first frame (matches the single-sentence path and
+    // lets callers observe prepareSpeakWords without waiting for a frame).
+    enterMark(0);
     if (!boundaries.length) return;
 
-    // Each per-sentence Edge mp3 carries trailing silence after the last word.
-    // Playing sentence-by-sentence (and paragraph-by-paragraph) stacks that
-    // trailing silence with the next segment's turnaround into an over-long
-    // pause at every line/paragraph break. The last word boundary tells us when
-    // speech actually ends, so once playback passes it (plus a small safety
-    // margin so the final word isn't clipped) we finish the segment early and
-    // let playback advance to the preloaded next one — roughly halving the gap.
-    const TICKS_PER_SECOND = 10_000_000;
-    const TRAIL_SAFETY_MARGIN_SEC = 0.12;
-    const MIN_TRAILING_SILENCE_SEC = 0.25;
+    // Each Edge mp3 carries trailing silence after the last word. Stacked with
+    // the next segment's turnaround it becomes an over-long pause at every
+    // batch/paragraph break. The last word boundary tells us when speech ends,
+    // so once playback passes it (plus a small safety margin so the final word
+    // isn't clipped) we finish the segment early and let playback advance to
+    // the preloaded next one — roughly halving the gap.
     const lastBoundary = boundaries[boundaries.length - 1]!;
     const speechEndSec = (lastBoundary.offset + lastBoundary.duration) / TICKS_PER_SECOND;
     let endedEarly = false;
 
-    let lastIndex = -1;
     const tick = () => {
       const currentTime = audio.currentTime;
-      const index = findBoundaryIndexAtTime(boundaries, currentTime);
-      if (index !== lastIndex && index >= 0) {
-        lastIndex = index;
+      let mark = currentMark;
+      while (mark + 1 < batch.length && startSec[mark + 1]! <= currentTime) mark++;
+      if (mark !== currentMark) enterMark(mark);
+      const index = findBoundaryIndexAtTime(perMark[currentMark]!, currentTime);
+      if (index !== lastWord && index >= 0) {
+        lastWord = index;
         controller.dispatchSpeakWord(index);
       }
       if (!endedEarly && onSpeechEnd && Number.isFinite(audio.duration)) {
@@ -288,12 +388,13 @@ export class EdgeTTSClient implements TTSClient {
           currentTime >= speechEndSec + TRAIL_SAFETY_MARGIN_SEC
         ) {
           endedEarly = true;
-          // Pause before ending: onSpeechEnd runs cleanUp() which sets
-          // audio.src = '', and clearing the source mid-playback cuts the
-          // output abruptly and clicks/pops at the sentence boundary. Pausing
-          // in the trailing-silence region stops output cleanly first.
-          audio.pause();
-          onSpeechEnd();
+          // Fade to silence before ending: onSpeechEnd runs cleanUp() which
+          // sets audio.src = '', and clearing a source that isn't at a zero
+          // sample clicks/pops at the segment boundary. We're already inside
+          // the trailing silence, so the ramp is inaudible and never clips the
+          // final word. Returning here stops the tick loop (no reschedule); the
+          // fade drives the segment end via onSpeechEnd.
+          this.#fadeVolume(audio, audio.volume, 0, SEGMENT_FADE_OUT_MS, onSpeechEnd);
           return;
         }
       }
@@ -307,6 +408,42 @@ export class EdgeTTSClient implements TTSClient {
       cancelAnimationFrame(this.#wordTrackingRafId);
       this.#wordTrackingRafId = null;
     }
+    if (this.#fadeRafId !== null) {
+      cancelAnimationFrame(this.#fadeRafId);
+      this.#fadeRafId = null;
+    }
+    // Restore full volume for the next (reused) segment, and so an interrupted
+    // fade can never leave playback muted.
+    if (this.#audioElement) this.#audioElement.volume = 1;
+  }
+
+  // Linear ramp of the element volume, used to smooth segment boundaries. A
+  // single in-flight fade at a time; starting a new one cancels the previous.
+  #fadeVolume(
+    audio: HTMLAudioElement,
+    from: number,
+    to: number,
+    durationMs: number,
+    onDone?: () => void,
+  ) {
+    if (this.#fadeRafId !== null) {
+      cancelAnimationFrame(this.#fadeRafId);
+      this.#fadeRafId = null;
+    }
+    const start = performance.now();
+    audio.volume = from;
+    const step = () => {
+      const t = durationMs > 0 ? Math.min(1, (performance.now() - start) / durationMs) : 1;
+      audio.volume = from + (to - from) * t;
+      if (t < 1) {
+        this.#fadeRafId = requestAnimationFrame(step);
+      } else {
+        this.#fadeRafId = null;
+        audio.volume = to;
+        onDone?.();
+      }
+    };
+    this.#fadeRafId = requestAnimationFrame(step);
   }
 
   async pause() {
