@@ -40,3 +40,11 @@ rust-version = "1.77.2"
 [patch.crates-io]
 tauri = { path = "packages/tauri/crates/tauri" }
 tauri-plugin-fs = { path = "packages/tauri-plugins/plugins/fs" }
+
+[profile.dev]
+# `tauri android build --debug` otherwise ships the Rust lib with full native
+# DWARF debug info, producing a ~460 MB libreadestlib.so (Android stores .so
+# uncompressed, so it dominates the APK). We debug the JS/webview layer, not the
+# native backend, so strip the native debug info to keep debug APKs small while
+# staying unoptimized and fast to build. Symbol names are kept for panic traces.
+strip = "debuginfo"
