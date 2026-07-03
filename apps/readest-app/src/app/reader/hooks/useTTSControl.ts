@@ -5,6 +5,7 @@ import { useThemeStore } from '@/store/themeStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useBookProgress } from '@/store/readerProgressStore';
+import { useNowPlayingStore } from '@/store/nowPlayingStore';
 import { useProofreadStore } from '@/store/proofreadStore';
 import { TransformContext } from '@/services/transformers/types';
 import { proofreadTransformer } from '@/services/transformers/proofread';
@@ -76,6 +77,16 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const emitPlaybackState = (state: 'playing' | 'paused' | 'stopped') => {
     playbackStateRef.current = state;
     eventDispatcher.dispatch('tts-playback-state', { bookKey, state });
+    // Keep the cross-route "now playing" bar in sync with this session so the
+    // library reflects the current book, progress, and play/pause state.
+    const store = useNowPlayingStore.getState();
+    const hash = getBookData(bookKey)?.book?.hash;
+    if (store.nowPlaying && hash && store.nowPlaying.bookId === hash) {
+      store.updateNowPlaying({
+        isPlaying: state === 'playing',
+        fraction: getProgress(bookKey)?.fraction ?? store.nowPlaying.fraction,
+      });
+    }
   };
 
   // A follower (paragraph / RSVP mode) that engages mid-session asks the
@@ -386,6 +397,21 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   // Reactive subscription via readerProgressStore so the effect below
   // re-runs on page turns without dragging in the whole readerStore.
   const progress = useBookProgress(bookKey);
+
+  // Auto-resume TTS when the book was opened from the library "now playing" bar.
+  // Wait until progress exists (the view is positioned) before starting so
+  // handleTTSSpeak resumes from the saved ttsLocation. Runs at most once.
+  const autoResumedRef = useRef(false);
+  useEffect(() => {
+    if (autoResumedRef.current || !progress) return;
+    const hash = getBookData(bookKey)?.book?.hash;
+    if (!hash) return;
+    if (useNowPlayingStore.getState().consumeResume(hash)) {
+      autoResumedRef.current = true;
+      eventDispatcher.dispatch('tts-speak', { bookKey });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progress, bookKey]);
   useEffect(() => {
     const ttsController = ttsControllerRef.current;
     if (!ttsController) return;
@@ -693,6 +719,16 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         }
         setTtsClientsInitialized(true);
         setTTSEnabled(bookKey, true);
+        const { title, author, coverImageUrl, hash } = bookData.book;
+        useNowPlayingStore.getState().setNowPlaying({
+          bookHash: hash,
+          bookId: hash,
+          title,
+          author,
+          coverImageUrl,
+          fraction: getProgress(bookKey)?.fraction ?? 0,
+          isPlaying: true,
+        });
       } catch (error) {
         eventDispatcher.dispatch('toast', {
           message: _('TTS not supported for this document'),
