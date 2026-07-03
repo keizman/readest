@@ -94,6 +94,7 @@ import ImportFromFolderDialog, {
   ImportFromFolderResult,
 } from './components/ImportFromFolderDialog';
 import ImportFromUrlDialog from './components/ImportFromUrlDialog';
+import WiFiTransferDialog, { WifiTransferFile } from './components/WiFiTransferDialog';
 import { convertToEpubWithWorker } from '@/services/send/conversion/conversionWorker';
 import { getClipOptions } from '@/services/send/clipOptions';
 import { invoke } from '@tauri-apps/api/core';
@@ -186,6 +187,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
     searchParams?.get('opds') === 'true',
   );
   const [showImportFromUrl, setShowImportFromUrl] = useState(false);
+  const [showWifiTransfer, setShowWifiTransfer] = useState(false);
   const [loading, setLoading] = useState(false);
   // Seed from the library store: if we already have books in memory (the
   // common reader → library return path), treat the page as loaded
@@ -832,6 +834,17 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
     setLoading(false);
   };
 
+  const handleWifiTransferFiles = async (files: WifiTransferFile[]) => {
+    const paths = files.map((file) => file.path);
+    try {
+      await importBooks(files.map((file) => ({ path: file.path, name: file.name })));
+    } finally {
+      await invoke('cleanup_wifi_transfer_files', { paths }).catch((error) => {
+        console.warn('Failed to clean up Wi-Fi transfer files:', error);
+      });
+    }
+  };
+
   const updateBookTransferProgress = throttle((bookHash: string, progress: ProgressPayload) => {
     if (progress.total === 0) return;
     const progressPct = (progress.progress / progress.total) * 100;
@@ -1424,6 +1437,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
             appService?.canReadExternalDir ? handleImportBooksFromDirectory : undefined
           }
           onImportBookFromUrl={isTauriAppPlatform() ? () => setShowImportFromUrl(true) : undefined}
+          onOpenWifiTransfer={isTauriAppPlatform() ? () => setShowWifiTransfer(true) : undefined}
           onOpenCatalogManager={handleShowOPDSDialog}
           onToggleSelectMode={() => handleSetSelectMode(!isSelectMode)}
           onSelectAll={handleSelectAll}
@@ -1606,6 +1620,11 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
         isOpen={showImportFromUrl}
         onClose={() => setShowImportFromUrl(false)}
         onSubmit={handleImportBookFromUrl}
+      />
+      <WiFiTransferDialog
+        isOpen={showWifiTransfer}
+        onClose={() => setShowWifiTransfer(false)}
+        onFilesUploaded={handleWifiTransferFiles}
       />
       <Toast />
     </div>

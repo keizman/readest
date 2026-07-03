@@ -43,6 +43,8 @@
     </array>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Readest uses your local network only while Wi-Fi Transfer is open so you can send books from another device.</string>
     <key>CFBundleURLTypes</key>
     <array>
       <dict>

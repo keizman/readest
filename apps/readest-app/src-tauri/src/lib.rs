@@ -36,6 +36,7 @@ mod range_file;
 #[cfg(desktop)]
 mod spawn_fresh_browser;
 mod transfer_file;
+mod wifi_transfer;
 #[cfg(desktop)]
 mod window_state;
 #[cfg(target_os = "windows")]
@@ -49,6 +50,9 @@ use tauri_plugin_oauth::start;
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_opener::OpenerExt;
 use transfer_file::{download_file, upload_file};
+use wifi_transfer::{
+    cleanup_wifi_transfer_files, start_wifi_transfer, stop_wifi_transfer, WifiTransferState,
+};
 
 #[cfg(any(desktop, target_os = "ios"))]
 fn allow_file_in_scopes(app: &AppHandle, files: Vec<PathBuf>) {
@@ -269,6 +273,9 @@ pub fn run() {
         .plugin(tauri_plugin_oauth::init())
         .invoke_handler(tauri::generate_handler![
             start_server,
+            start_wifi_transfer,
+            stop_wifi_transfer,
+            cleanup_wifi_transfer_files,
             download_file,
             upload_file,
             get_environment_variable,
@@ -313,6 +320,7 @@ pub fn run() {
         .plugin(tauri_plugin_native_bridge::init())
         .plugin(tauri_plugin_native_tts::init())
         .plugin(tauri_plugin_webview_upgrade::init())
+        .manage(WifiTransferState::default())
         // Serves local file byte-ranges to `RemoteFile` via `?path=&start=&end=`
         // (range-in-URL, not a `Range` header) so Android's WebView doesn't
         // re-apply the offset. Scope-gated by `asset_protocol_scope`.

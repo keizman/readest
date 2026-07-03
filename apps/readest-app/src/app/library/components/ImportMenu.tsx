@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import { MdLink, MdRssFeed } from 'react-icons/md';
+import { MdLink, MdRssFeed, MdWifi } from 'react-icons/md';
 import { IoFileTray } from 'react-icons/io5';
 import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
@@ -11,6 +11,7 @@ interface ImportMenuProps {
   onImportBooksFromFiles: () => void;
   onImportBooksFromDirectory?: () => void;
   onImportBookFromUrl?: () => void;
+  onOpenWifiTransfer?: () => void;
   onOpenCatalogManager: () => void;
 }
 
@@ -19,6 +20,7 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
   onImportBooksFromFiles,
   onImportBooksFromDirectory,
   onImportBookFromUrl,
+  onOpenWifiTransfer,
   onOpenCatalogManager,
 }) => {
   const _ = useTranslation();
@@ -44,6 +46,11 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
     setIsDropdownOpen?.(false);
   };
 
+  const handleOpenWifiTransfer = () => {
+    onOpenWifiTransfer?.();
+    setIsDropdownOpen?.(false);
+  };
+
   return (
     <Menu
       className={clsx('dropdown-content bg-base-100 rounded-box !relative z-[1] mt-3 p-2 shadow')}
@@ -66,6 +73,13 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
           label={_('From Web URL')}
           Icon={<MdLink className='h-5 w-5' />}
           onClick={handleImportFromUrl}
+        />
+      )}
+      {onOpenWifiTransfer && (
+        <MenuItem
+          label={_('Wi-Fi Transfer')}
+          Icon={<MdWifi className='h-5 w-5' />}
+          onClick={handleOpenWifiTransfer}
         />
       )}
       <MenuItem
