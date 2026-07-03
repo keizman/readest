@@ -5,6 +5,7 @@ import { MdClose, MdPlayArrow, MdPause, MdMenuBook } from 'react-icons/md';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { useNowPlayingStore } from '@/store/nowPlayingStore';
+import { stopDetachedTTS } from '@/app/reader/hooks/useTTSControl';
 import { navigateToReader } from '@/utils/nav';
 
 /**
@@ -31,6 +32,7 @@ const NowPlayingBar: React.FC = () => {
 
   const handleDismiss = (e: React.MouseEvent) => {
     e.stopPropagation();
+    stopDetachedTTS();
     clearNowPlaying();
   };
 

@@ -29,6 +29,24 @@ interface UseTTSControlProps {
   onRequestHidePanel?: () => void;
 }
 
+// Module-level: holds the TTS controller that keeps playing after reader unmounts.
+// Allows audio to continue when navigating to the shelf and seamless reclaim on return.
+let detachedController: TTSController | null = null;
+let detachedBookKey: string | null = null;
+let detachedCleanup: (() => void) | null = null;
+
+export function stopDetachedTTS() {
+  if (detachedController) {
+    detachedController.shutdown();
+    detachedController = null;
+  }
+  if (detachedCleanup) {
+    detachedCleanup();
+    detachedCleanup = null;
+  }
+  detachedBookKey = null;
+}
+
 export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProps) => {
   const _ = useTranslation();
   const { appService } = useEnv();
@@ -191,8 +209,35 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       eventDispatcher.off('tts-set-rate', handleTTSSetRate);
       eventDispatcher.off('tts-highlight-sentence', handleTTSHighlightSentence);
       eventDispatcher.off('tts-sync-request', handleTTSSyncRequest);
-      if (ttsControllerRef.current) {
-        ttsControllerRef.current.shutdown();
+      const controller = ttsControllerRef.current;
+      if (controller) {
+        if (playbackStateRef.current === 'playing' || playbackStateRef.current === 'paused') {
+          // Detach: let audio keep playing while user browses the shelf.
+          // Disable view-dependent navigation (renderer is going away).
+          controller.onSectionChange = async () => {};
+          detachedController = controller;
+          detachedBookKey = bookKey;
+          // Track position so resume picks up from the correct spot.
+          const handleDetachedMark = (e: Event) => {
+            const { cfi } = (e as CustomEvent<{ cfi: string }>).detail;
+            if (!cfi) return;
+            try {
+              const vs = useReaderStore.getState().getViewSettings(bookKey);
+              if (vs) {
+                vs.ttsLocation = cfi;
+                useReaderStore.getState().setViewSettings(bookKey, vs);
+              }
+            } catch {
+              /* best-effort */
+            }
+          };
+          controller.addEventListener('tts-highlight-mark', handleDetachedMark);
+          detachedCleanup = () => {
+            controller.removeEventListener('tts-highlight-mark', handleDetachedMark);
+          };
+        } else {
+          controller.shutdown();
+        }
         ttsControllerRef.current = null;
       }
     };
@@ -398,7 +443,8 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   // re-runs on page turns without dragging in the whole readerStore.
   const progress = useBookProgress(bookKey);
 
-  // Auto-resume TTS when the book was opened from the library "now playing" bar.
+  // Auto-resume TTS when the book was opened from the library "now playing" bar,
+  // OR reclaim the detached controller that kept playing while on the shelf.
   // Wait until progress exists (the view is positioned) before starting so
   // handleTTSSpeak resumes from the saved ttsLocation. Runs at most once.
   const autoResumedRef = useRef(false);
@@ -406,6 +452,40 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     if (autoResumedRef.current || !progress) return;
     const hash = getBookData(bookKey)?.book?.hash;
     if (!hash) return;
+
+    // If a detached controller is still running for this book, reclaim it
+    // seamlessly (no audio interruption).
+    if (
+      detachedController &&
+      detachedBookKey === bookKey &&
+      detachedController.state !== 'stopped'
+    ) {
+      autoResumedRef.current = true;
+      const controller = detachedController;
+      detachedController = null;
+      detachedBookKey = null;
+      if (detachedCleanup) {
+        detachedCleanup();
+        detachedCleanup = null;
+      }
+
+      const view = getView(bookKey);
+      if (view) {
+        controller.view = view;
+        controller.onSectionChange = handleSectionChange;
+      }
+      ttsControllerRef.current = controller;
+      setTtsController(controller);
+      setIsPlaying(controller.state === 'playing');
+      setIsPaused(controller.state.includes('paused'));
+      setShowIndicator(true);
+      emitPlaybackState(controller.state === 'playing' ? 'playing' : 'paused');
+      setTTSEnabled(bookKey, true);
+      // Consume any pending resume request so it doesn't fire again.
+      useNowPlayingStore.getState().consumeResume(hash);
+      return;
+    }
+
     if (useNowPlayingStore.getState().consumeResume(hash)) {
       autoResumedRef.current = true;
       eventDispatcher.dispatch('tts-speak', { bookKey });
@@ -575,6 +655,8 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const handleStop = useCallback(
     async (bookKey: string) => {
       const ttsController = ttsControllerRef.current;
+      // Also stop any lingering detached controller.
+      stopDetachedTTS();
       // Reset all UI/session state up front — including the TTS toggle
       // (ttsEnabled) and indicator that color the TTS icon — so disabling TTS
       // always takes effect immediately. The teardown below is best-effort and
@@ -667,6 +749,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       }
 
       const primaryLang = bookData.book.primaryLanguage;
+
+      // Stop any detached controller from a prior navigation.
+      stopDetachedTTS();
 
       if (ttsControllerRef.current) {
         ttsControllerRef.current.stop();
