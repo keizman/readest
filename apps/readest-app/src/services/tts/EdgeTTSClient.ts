@@ -288,6 +288,11 @@ export class EdgeTTSClient implements TTSClient {
           currentTime >= speechEndSec + TRAIL_SAFETY_MARGIN_SEC
         ) {
           endedEarly = true;
+          // Pause before ending: onSpeechEnd runs cleanUp() which sets
+          // audio.src = '', and clearing the source mid-playback cuts the
+          // output abruptly and clicks/pops at the sentence boundary. Pausing
+          // in the trailing-silence region stops output cleanly first.
+          audio.pause();
           onSpeechEnd();
           return;
         }
