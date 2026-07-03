@@ -188,7 +188,7 @@ const TTSControl: React.FC<TTSControlProps> = ({ bookKey, gridInsets }) => {
         <div
           ref={iconRef}
           className={clsx(
-            'absolute h-12 w-12',
+            'absolute z-40 h-12 w-12',
             'transition-transform duration-300',
             viewSettings?.rtl ? 'left-8' : 'right-6',
             !appService?.hasSafeAreaInset && 'bottom-[70px] sm:bottom-14',
