@@ -28,6 +28,8 @@ import { useLibraryStore } from '@/store/libraryStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { navigateToLibrary, navigateToReader, showReaderWindow } from '@/utils/nav';
+import { isBookPrivate, setBookPrivate } from '@/utils/privacy';
+import { isMd5 } from '@/utils/md5';
 import {
   createBookFilter,
   createBookGroups,
@@ -175,7 +177,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   const router = useRouter();
   const searchParams = useSearchParams();
   const { envConfig, appService } = useEnv();
-  const { settings } = useSettingsStore();
+  const { settings, setSettings, saveSettings } = useSettingsStore();
   const { safeAreaInsets } = useThemeStore();
 
   const groupId = searchParams?.get('group') || '';
@@ -452,6 +454,23 @@ const Bookshelf: React.FC<BookshelfProps> = ({
     setShowStatusAlert(true);
   };
 
+  // Toggle the local-only "private" flag on the selection. If every selected
+  // valid book is already private, unmark them all; otherwise mark them all
+  // private (private books open masked by default). Local-only, never synced.
+  const privateSelectedBooks = async () => {
+    const hashes = getSelectedBooks().filter((id) => isMd5(id));
+    if (hashes.length === 0) return;
+    const current = useSettingsStore.getState().settings;
+    const allPrivate = hashes.every((hash) => isBookPrivate(current, hash));
+    let next = current;
+    for (const hash of hashes) {
+      next = setBookPrivate(next, hash, !allPrivate);
+    }
+    setSettings(next);
+    await saveSettings(envConfig, next);
+    handleSetSelectMode(false);
+  };
+
   const sendSelectedBook = async () => {
     // "Send" hands the actual book file (epub/pdf/...) to the OS share
     // sheet (UIActivityViewController on iOS, Intent.ACTION_SEND on
@@ -678,6 +697,10 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   );
 
   const selectedBooks = getSelectedBooks();
+  const selectedValidHashes = selectedBooks.filter((id) => isMd5(id));
+  const allSelectedPrivate =
+    selectedValidHashes.length > 0 &&
+    selectedValidHashes.every((hash) => isBookPrivate(settings, hash));
   const isGridMode = viewMode === 'grid';
   const hasItems = sortedBookshelfItems.length > 0;
   // In grid mode the Import-Books "+" tile is rendered as an extra grid cell
@@ -889,6 +912,8 @@ const Bookshelf: React.FC<BookshelfProps> = ({
           onGroup={groupSelectedBooks}
           onDetails={openBookDetails}
           onStatus={showStatusSelection}
+          onPrivate={privateSelectedBooks}
+          privateActive={allSelectedPrivate}
           onSend={sendSelectedBook}
           onDelete={deleteSelectedBooks}
           onCancel={() => handleSetSelectMode(false)}

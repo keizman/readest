@@ -5,6 +5,8 @@ import {
   MdOutlineCancel,
   MdInfoOutline,
   MdCheckCircleOutline,
+  MdOutlineLock,
+  MdOutlineLockOpen,
 } from 'react-icons/md';
 import { IoShareSocialOutline } from 'react-icons/io5';
 import { LuFolderPlus } from 'react-icons/lu';
@@ -25,6 +27,11 @@ interface SelectModeActionsProps {
   onGroup: () => void;
   onDetails: () => void;
   onStatus: () => void;
+  // Toggle the local-only "private" flag on the selection. When every selected
+  // book is already private, `privateActive` is true so the button offers to
+  // unmark instead. Marking a book private makes it open masked by default.
+  onPrivate: () => void;
+  privateActive?: boolean;
   // The macOS / iPad share popover is anchored to the selected book's
   // cover (located via its data-book-hash attribute), not to this
   // button — the user's visual focus is on the cover they just tapped.
@@ -42,6 +49,8 @@ const SelectModeActions: React.FC<SelectModeActionsProps> = ({
   onGroup,
   onDetails,
   onStatus,
+  onPrivate,
+  privateActive = false,
   onSend,
   onDelete,
   onCancel,
@@ -110,13 +119,21 @@ const SelectModeActions: React.FC<SelectModeActionsProps> = ({
           <MdInfoOutline />
           <div>{_('Details')}</div>
         </button>
+        <button
+          onClick={onPrivate}
+          className={clsx(
+            'flex flex-col items-center justify-center gap-1',
+            (!hasSelection || !hasValidBooks) && 'btn-disabled opacity-50',
+          )}
+        >
+          {privateActive ? <MdOutlineLockOpen /> : <MdOutlineLock />}
+          <div>{privateActive ? _('Unmark') : _('Private')}</div>
+        </button>
         {sendEnabled && (
           <button
             onClick={onSend}
             className={clsx(
               'flex flex-col items-center justify-center gap-1',
-              // Wraps to the start of the second row on narrow viewports.
-              'max-[500px]:col-start-1',
               (!hasSingleSelection || !hasValidBooks) && 'btn-disabled opacity-50',
             )}
           >
@@ -128,12 +145,6 @@ const SelectModeActions: React.FC<SelectModeActionsProps> = ({
           onClick={onDelete}
           className={clsx(
             'flex flex-col items-center justify-center gap-1',
-            // Without Send (Linux/Windows/web), Delete needs an explicit
-            // col-start-2 so the wrapped row {Delete, Cancel} stays centred
-            // under the 4-col grid. With Send present, the layout is
-            // {Send, Delete, Cancel} starting at col-start-1, so Delete
-            // naturally lands in col-start-2 without an override.
-            !sendEnabled && 'max-[500px]:col-start-2',
             !hasSelection && 'btn-disabled opacity-50',
           )}
         >
