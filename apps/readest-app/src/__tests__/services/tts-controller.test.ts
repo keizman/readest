@@ -845,6 +845,37 @@ describe('TTSController', () => {
       expect(mockView.getCFI).toHaveBeenCalledWith(0, captured);
     });
 
+    test('prepareSpeakWords follows a captured range when getLastRange is stale', async () => {
+      document.body.innerHTML = '<p>First sentence. Second sentence.</p>';
+      const textNode = document.body.firstElementChild!.firstChild as Text;
+      const first = document.createRange();
+      first.setStart(textNode, 0);
+      first.setEnd(textNode, 'First sentence.'.length);
+      const second = document.createRange();
+      second.setStart(textNode, 'First sentence. '.length);
+      second.setEnd(textNode, textNode.length);
+
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        setMark: vi.fn(),
+        getLastRange: vi.fn().mockImplementation(() => first.cloneRange()),
+      } as unknown as FoliateView['tts'];
+
+      controller.dispatchSpeakMark({
+        offset: 0,
+        name: '1',
+        text: 'Second sentence.',
+        language: 'en',
+        range: second,
+      });
+      vi.mocked(mockView.getCFI).mockClear();
+      controller.prepareSpeakWords(['Second', 'sentence']);
+
+      const getCFICalls = vi.mocked(mockView.getCFI).mock.calls;
+      expect(getCFICalls.length).toBeGreaterThanOrEqual(1);
+      expect(String(getCFICalls[0]![1])).toBe('Second');
+    });
+
     test('dispatchSpeakWord emits tts-position with kind word', async () => {
       await armWithSentence(makeSentenceRange());
       controller.prepareSpeakWords(['Hello', 'brave', 'world']);

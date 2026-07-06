@@ -668,10 +668,18 @@ export class TTSController extends EventTarget {
     const tts = captureRange ? this.#getTts() : null;
     for (const mark of parsed.marks) {
       if (!hasSpeakableText(mark.text)) continue;
-      const range = tts?.setMark(mark.name) ?? undefined;
+      const raw = tts?.setMark(mark.name);
+      const range = raw?.cloneRange();
       marks.push(range ? { ...mark, range } : mark);
     }
   };
+
+  // Range of the mark currently being spoken. Cross-paragraph batches attach a
+  // captured range and skip setMark, so foliate's getLastRange() stays stale.
+  #getActiveSpeakRange(): Range | null {
+    if (this.#currentSpeakRange) return this.#currentSpeakRange.cloneRange();
+    return this.#getTts()?.getLastRange() ?? null;
+  }
 
   async #collectSpeakableMarksCrossParagraph(
     initialSsml: string,
@@ -1143,10 +1151,16 @@ export class TTSController extends EventTarget {
         // suppress it.
         this.#suppressMarkHighlight =
           this.ttsClient.supportsWordBoundaries() && this.#highlightGranularity === 'word';
-        const range = mark.range ?? this.#getTts()?.setMark(mark.name);
+        const suppressSentenceHighlight = this.#suppressMarkHighlight;
+        const range = mark.range ? mark.range.cloneRange() : this.#getTts()?.setMark(mark.name);
         this.#suppressMarkHighlight = false;
         this.#speakWordsArmed = !!range;
         this.#currentSpeakRange = range ?? null;
+        // Captured ranges bypass setMark (and its highlight); draw the sentence
+        // here unless word mode will take over in prepareSpeakWords.
+        if (range && mark.range && !suppressSentenceHighlight) {
+          this.#getHighlighter()(range.cloneRange());
+        }
         if (this.#sectionTimeline) {
           // Keep the timeline honest as measurements land, then locate the
           // audible sentence for position reporting.
@@ -1183,8 +1197,8 @@ export class TTSController extends EventTarget {
       this.#getHighlighter()(this.#lastSpeakWordRange.cloneRange());
       return;
     }
-    const range = this.#getTts()?.getLastRange();
-    if (range) this.#getHighlighter()(range.cloneRange());
+    const range = this.#getActiveSpeakRange();
+    if (range) this.#getHighlighter()(range);
   }
 
   // CFI of the currently highlighted word during word-by-word playback. Used
@@ -1221,7 +1235,7 @@ export class TTSController extends EventTarget {
         }
       } catch {}
     }
-    const range = this.#getTts()?.getLastRange();
+    const range = this.#getActiveSpeakRange();
     if (!range) return;
     try {
       const cfi = this.view.getCFI(this.#ttsSectionIndex, range);
@@ -1240,7 +1254,7 @@ export class TTSController extends EventTarget {
     // at mark dispatch (not suppressed), so there's nothing to do here — leave
     // word mode off even though the client reported word boundaries.
     if (this.#highlightGranularity === 'sentence') return;
-    const range = this.#getTts()?.getLastRange();
+    const range = this.#getActiveSpeakRange();
     if (!range) return;
     this.#speakWordBaseRange = range;
     const matchText = rangeTextExcludingInert(range);
