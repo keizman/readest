@@ -201,6 +201,22 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
   });
 
+  test('inter-batch gap shrinks when playback rate increases', async () => {
+    parsedMarks = [
+      { name: '0', text: 'a'.repeat(80), language: 'en' },
+      { name: '1', text: 'b'.repeat(80), language: 'en' },
+    ];
+    const client = await startClient();
+    await client.setRate(2);
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+    const [first, second] = ctx().sources;
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.032 / 2, 5);
+    await ctx().advanceTo(5);
+    await done;
+  });
+
   test('word tracking follows the audio clock and survives pause/resume', async () => {
     createAudioDataBehavior = async () => ({
       data: new ArrayBuffer(48000), // 2s

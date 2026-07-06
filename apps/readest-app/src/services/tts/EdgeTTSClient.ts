@@ -286,9 +286,13 @@ export class EdgeTTSClient implements TTSClient {
         signal,
       );
       if (!audio) return;
-      const { perMark } = partitionBatch(batch, this.#applyRateToBoundaries(audio.boundaries));
+      const { perMark } = partitionBatch(batch, audio.boundaries);
       for (let i = 0; i < batch.length; i++) {
-        this.#recordDurations(voiceId, batch[i]!.text, perMark[i] ?? []);
+        this.#recordDurations(
+          voiceId,
+          batch[i]!.text,
+          this.#applyRateToBoundaries(perMark[i] ?? []),
+        );
       }
     };
     for (let i = 0; i < Math.min(maxImmediate, batches.length); i++) {
@@ -375,8 +379,9 @@ export class EdgeTTSClient implements TTSClient {
           continue;
         }
 
-        const rawBoundaries = this.#applyRateToBoundaries(audio.boundaries);
-        const { perMark, startSec } = partitionBatch(batch, rawBoundaries);
+        // Boundaries from Edge live in the decoded MP3 timeline (prosody rate).
+        const bufferBoundaries = audio.boundaries;
+        const { perMark, startSec } = partitionBatch(batch, bufferBoundaries);
 
         for (let mi = 0; mi < batch.length; mi++) {
           if (signal.aborted || this.#activeGeneration !== generation) break batchLoop;
@@ -480,11 +485,11 @@ export class EdgeTTSClient implements TTSClient {
       wordEnds,
       boundaries.map((b) => b.text),
       channel.length,
-      secToSamples(EDGE_KEEP_SEC),
-      secToSamples(TRAILING_KEEP_SEC),
-      secToSamples(MIN_COMPRESS_GAP_SEC),
-      secToSamples(SHORT_PAUSE_SEC),
-      secToSamples(LONG_PAUSE_SEC),
+      secToSamples(EDGE_KEEP_SEC / rate),
+      secToSamples(TRAILING_KEEP_SEC / rate),
+      secToSamples(MIN_COMPRESS_GAP_SEC / rate),
+      secToSamples(SHORT_PAUSE_SEC / rate),
+      secToSamples(LONG_PAUSE_SEC / rate),
     );
 
     const out = new Float32Array(plan.outLength);

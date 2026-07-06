@@ -54,8 +54,10 @@ export interface SilenceCompressionPlan {
   wordStartsOut: number[];
 }
 
-// Fixed replacement pauses (rate-1.0 seconds). Edge TTS bakes in variable
+// Fixed replacement pauses at rate-1.0 media seconds. Edge TTS bakes in variable
 // comma/clause/sentence silences; the client normalizes them to these lengths.
+// EdgeTTSClient divides by the current playback rate when compressing decoded
+// buffers (prosody rate shrinks the MP3 timeline).
 export const SHORT_PAUSE_SEC = 0.018;
 export const LONG_PAUSE_SEC = 0.032;
 // Gaps shorter than this are natural coarticulation between words.
