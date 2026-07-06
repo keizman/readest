@@ -9,14 +9,13 @@ export PATH="/opt/homebrew/opt/node@24/bin:${PNPM_HOME:-$ROOT_DIR/.pnpm-home}/bi
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export NDK_HOME="${NDK_HOME:-$ANDROID_HOME/ndk/28.2.13676358}"
-
 export CARGO_BUILD_JOBS="$JOBS"
 export CMAKE_BUILD_PARALLEL_LEVEL="$JOBS"
 export GRADLE_OPTS="-Dorg.gradle.parallel=true -Dorg.gradle.workers.max=${JOBS} -Dorg.gradle.caching=true"
 export NEXT_TELEMETRY_DISABLED=1
 
 cd "$APP_DIR"
-pnpm tauri android build -t aarch64 --apk --split-per-abi "$@"
+pnpm tauri android build -t aarch64 --apk --split-per-abi --debug "$@"
 
 pick_apk() {
   local dir="$1" name="$2"
@@ -28,19 +27,13 @@ pick_apk() {
 }
 
 APK=""
-APK="$(pick_apk "$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/arm64/release" "app-arm64-release-unsigned.apk" || true)"
+APK="$(pick_apk "$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/arm64/debug" "app-arm64-debug.apk" || true)"
 if [[ -z "$APK" ]]; then
-  APK="$(pick_apk "$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/universal/release" "app-universal-release-unsigned.apk" || true)"
+  APK="$(pick_apk "$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/universal/debug" "app-universal-debug.apk" || true)"
 fi
 if [[ -z "$APK" ]]; then
-  echo "No release APK found under src-tauri/gen/android/app/build/outputs/apk/" >&2
+  echo "No debug APK found under src-tauri/gen/android/app/build/outputs/apk/" >&2
   exit 1
-fi
-
-SIGNED_APK="${APK%-unsigned.apk}.apk"
-if [[ "$APK" == *-unsigned.apk ]]; then
-  bash "$APP_DIR/scripts/sign-android-apk.sh" "$APK" "$SIGNED_APK"
-  APK="$SIGNED_APK"
 fi
 
 echo ""

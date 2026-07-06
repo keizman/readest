@@ -63,8 +63,12 @@ android {
             // (see READEST_EDGE_TTS_BASE_URL); allow it in release builds too.
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isMinifyEnabled = true
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("signing")
+            // Without keystore.properties, sign with the default debug keystore so
+            // local `adb install` works. CI/release uses keystore.properties instead.
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("signing")
+            } else {
+                signingConfigs.getByName("debug")
             }
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
