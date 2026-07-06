@@ -31,6 +31,7 @@ import { Overlay } from '@/components/Overlay';
 import DictionarySheet from '@/app/reader/components/annotator/DictionarySheet';
 import DictionaryPopup from '@/app/reader/components/annotator/DictionaryPopup';
 import TTSFollowIndicator, { TtsSyncStatus } from '@/app/reader/components/tts/TTSFollowIndicator';
+import { TTS_RATE_OPTIONS } from '@/utils/ttsRate';
 
 interface FlatChapter {
   label: string;
@@ -83,10 +84,6 @@ const STORAGE_KEY_HIGHLIGHT_WORD = 'readest_rsvp_cjk_highlight_word';
 const CONTEXT_CHUNK_SIZE = 50;
 const CONTEXT_WINDOW_BEFORE = 200;
 const CONTEXT_WINDOW_AFTER = 1000;
-
-// TTS rate options for the overlay's rate picker (decision 6) — mirrors the
-// 0.5–3.0 range the TTS panel slider clamps to, in 0.25 steps.
-const TTS_RATE_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0];
 
 // Dictionary lookup popup sizing (mirrors the reader's Annotator popup).
 const DICT_POPUP_PADDING = 10;

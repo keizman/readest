@@ -327,6 +327,14 @@ export interface SystemSettings {
    */
   privateBookHashes?: string[];
   privateBookMaskStates?: Record<string, boolean>;
+  /**
+   * Local-only library privacy mode. Book titles are replaced in library and
+   * media-session UI with stable aliases while enabled. The original title is
+   * retained only to refresh the local cache when metadata changes; these
+   * fields are intentionally absent from the settings sync whitelist.
+   */
+  libraryPrivacyModeEnabled?: boolean;
+  privateBookTitleAliases?: Record<string, { title: string; alias: string }>;
 
   kosync: KOSyncSettings;
   readwise: ReadwiseSettings;

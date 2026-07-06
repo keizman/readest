@@ -283,10 +283,11 @@ describe('TTSController', () => {
   });
 
   describe('setRate', () => {
-    test('updates ttsRate and state', async () => {
+    test('updates ttsRate without interrupting the current playback state', async () => {
+      controller.state = 'playing';
       await controller.setRate(1.5);
       expect(controller.ttsRate).toBe(1.5);
-      expect(controller.state).toBe('setrate-paused');
+      expect(controller.state).toBe('playing');
     });
 
     test('delegates to ttsClient.setRate', async () => {

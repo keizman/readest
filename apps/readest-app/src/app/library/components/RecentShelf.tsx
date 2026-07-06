@@ -6,6 +6,8 @@ import { LibraryCoverFitType } from '@/types/settings';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useLongPress } from '@/hooks/useLongPress';
 import BookItem from './BookItem';
+import { useSettingsStore } from '@/store/settingsStore';
+import { getBookDisplayTitle } from '@/utils/privacy';
 
 /**
  * How many recently-read books the top shelf holds. Fixed (no user option) so
@@ -48,6 +50,7 @@ const RecentSlide: React.FC<RecentSlideProps> = ({
   handleBookDownload,
   showBookDetailsModal,
 }) => {
+  const settings = useSettingsStore((state) => state.settings);
   // Pointer-based tap, exactly like the grid (`BookItem` stops click
   // propagation). A swipe-to-scroll moves past useLongPress's moveThreshold and
   // cancels the tap, so horizontal scrolling never opens a book.
@@ -75,7 +78,7 @@ const RecentSlide: React.FC<RecentSlideProps> = ({
         )}
         role='button'
         tabIndex={0}
-        aria-label={book.title}
+        aria-label={getBookDisplayTitle(settings, book)}
         style={{ transition: 'transform 0.2s' }}
         onKeyDown={handleKeyDown}
         {...handlers}

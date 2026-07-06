@@ -46,7 +46,7 @@ const mockView = {
   },
 };
 
-const mockProgress = {
+let mockProgress = {
   location: { start: { cfi: '' }, end: { cfi: '' } },
   index: 0,
   range: null,
@@ -142,6 +142,7 @@ vi.mock('@/services/tts', () => ({
       speak: vi.fn(),
       pause: vi.fn().mockResolvedValue(undefined),
       resume: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
       stop: vi.fn().mockResolvedValue(undefined),
       shutdown: vi.fn().mockResolvedValue(undefined),
       forward: vi.fn().mockResolvedValue(undefined),
@@ -343,6 +344,46 @@ describe('useTTSControl tts-sync-request (mode-entry replay)', () => {
   });
 });
 
+describe('useTTSControl rate changes', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('updates the rate without stopping and restarting active playback', async () => {
+    render(<Harness />);
+    await act(async () => {
+      const pending = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await pending;
+    });
+
+    const controller = ttsControllerInstances[0] as {
+      state: string;
+      setRate: ReturnType<typeof vi.fn>;
+      start: ReturnType<typeof vi.fn>;
+      stop: ReturnType<typeof vi.fn>;
+    };
+    controller.state = 'playing';
+    controller.setRate.mockClear();
+    controller.start.mockClear();
+    controller.stop.mockClear();
+
+    await act(async () => {
+      await eventDispatcher.dispatch('tts-set-rate', { bookKey: 'book-1', rate: 3.25 });
+    });
+
+    expect(controller.setRate).toHaveBeenCalledWith(3.25);
+    expect(controller.stop).not.toHaveBeenCalled();
+    expect(controller.start).not.toHaveBeenCalled();
+  });
+});
+
 describe('useTTSControl handleStop resilience (#4676)', () => {
   beforeEach(() => {
     ttsControllerInstances.length = 0;
@@ -428,6 +469,12 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     mockView.goTo.mockClear();
     mockView.resolveCFI.mockReset();
     mockViewSettings.ttsLocation = null;
+    mockProgress = {
+      location: { start: { cfi: '' }, end: { cfi: '' } },
+      index: 0,
+      range: null,
+      sectionLabel: '',
+    };
   });
 
   afterEach(() => {
@@ -435,7 +482,7 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
   });
 
   const setupAndCaptureHighlightHandler = async () => {
-    render(<Harness />);
+    const rendered = render(<Harness />);
 
     await act(async () => {
       const p = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
@@ -455,11 +502,11 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     const calls = controller.addEventListener.mock.calls;
     const entry = calls.find(([name]) => name === 'tts-highlight-mark');
     if (!entry) throw new Error('tts-highlight-mark listener was not registered');
-    return entry[1];
+    return { handler: entry[1], rerender: rendered.rerender };
   };
 
   it('navigates to the cfi via view.goTo when TTS crosses into a new section', async () => {
-    const handler = await setupAndCaptureHighlightHandler();
+    const { handler } = await setupAndCaptureHighlightHandler();
 
     // primaryIndex is 0 (current view section). Make the TTS cfi resolve to section 1.
     mockView.resolveCFI.mockReturnValue({ index: 1, anchor: () => new Range() });
@@ -473,7 +520,7 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
   });
 
   it('keeps in-section behaviour: scrolls via renderer without navigating', async () => {
-    const handler = await setupAndCaptureHighlightHandler();
+    const { handler } = await setupAndCaptureHighlightHandler();
 
     mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
 
@@ -482,6 +529,32 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     });
 
     expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledTimes(1);
+    expect(mockView.goTo).not.toHaveBeenCalled();
+  });
+
+  it('keeps the manually selected chapter when the user has stopped following TTS', async () => {
+    const { handler, rerender } = await setupAndCaptureHighlightHandler();
+
+    // First establish a TTS location in the visible section. The next progress
+    // render represents the user moving elsewhere, so the hook exposes the
+    // back-to-TTS action and disables automatic following.
+    mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+    await act(async () => {
+      handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'tts-old' } }));
+      mockProgress = {
+        ...mockProgress,
+        location: { start: { cfi: 'manual-chapter' }, end: { cfi: 'manual-chapter-end' } },
+      };
+      rerender(<Harness />);
+      await Promise.resolve();
+    });
+
+    mockView.goTo.mockClear();
+    mockView.resolveCFI.mockReturnValue({ index: 1, anchor: () => new Range() });
+    await act(async () => {
+      handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'tts-next-chapter' } }));
+    });
+
     expect(mockView.goTo).not.toHaveBeenCalled();
   });
 });

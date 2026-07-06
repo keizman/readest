@@ -7,6 +7,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { SILENCE_DATA } from '@/services/tts';
 import { getMediaSession, TauriMediaSession } from '@/libs/mediaSession';
 import { fetchImageAsBase64 } from '@/utils/image';
+import { getBookDisplayTitle, isLibraryPrivacyModeEnabled } from '@/utils/privacy';
 
 interface UseTTSMediaSessionProps {
   bookKey: string;
@@ -66,12 +67,17 @@ export const useTTSMediaSession = ({ bookKey }: UseTTSMediaSessionProps) => {
       const { title, author, coverImageUrl } = bookData.book;
       const { sectionLabel } = progress || {};
       const ttsMediaMetadataMode = viewSettings?.ttsMediaMetadata ?? 'sentence';
+      const privacyTitle = isLibraryPrivacyModeEnabled(settings)
+        ? getBookDisplayTitle(settings, bookData.book)
+        : null;
 
       let artworkImage = '/icon.png';
-      try {
-        artworkImage = await fetchImageAsBase64(coverImageUrl || '/icon.png');
-      } catch {
-        artworkImage = await fetchImageAsBase64('/icon.png');
+      if (!privacyTitle) {
+        try {
+          artworkImage = await fetchImageAsBase64(coverImageUrl || '/icon.png');
+        } catch {
+          artworkImage = await fetchImageAsBase64('/icon.png');
+        }
       }
 
       await mediaSession.setActive({
@@ -89,6 +95,7 @@ export const useTTSMediaSession = ({ bookKey }: UseTTSMediaSessionProps) => {
         title,
         author,
         ttsMediaMetadata: ttsMediaMetadataMode,
+        privacyTitle,
       });
       mediaSession.updateMetadata({
         title: metadata.title,

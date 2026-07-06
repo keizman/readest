@@ -20,6 +20,7 @@ import { setAboutDialogVisible } from '@/components/AboutWindow';
 import useBooksManager from '../../hooks/useBooksManager';
 import MenuItem from '@/components/MenuItem';
 import Menu from '@/components/Menu';
+import { getBookDisplayTitle } from '@/utils/privacy';
 
 interface BookMenuProps {
   menuClassName?: string;
@@ -141,26 +142,29 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
             .filter((book) => !FIXED_LAYOUT_FORMATS.has(book.format))
             .filter((book) => !!book.downloadedAt)
             .slice(0, 20)
-            .map((book) => (
-              <MenuItem
-                key={book.hash}
-                Icon={
-                  <img
-                    src={book.coverImageUrl!}
-                    alt={book.title}
-                    width={56}
-                    height={80}
-                    className='aspect-auto max-h-8 max-w-4 rounded-sm shadow-md'
-                    onError={(e) => {
-                      (e.target as HTMLImageElement).style.display = 'none';
-                    }}
-                  />
-                }
-                label={book.title}
-                labelClass='max-w-36'
-                onClick={() => handleParallelView(book.hash)}
-              />
-            ))}
+            .map((book) => {
+              const displayTitle = getBookDisplayTitle(settings, book);
+              return (
+                <MenuItem
+                  key={book.hash}
+                  Icon={
+                    <img
+                      src={book.coverImageUrl!}
+                      alt={displayTitle}
+                      width={56}
+                      height={80}
+                      className='aspect-auto max-h-8 max-w-4 rounded-sm shadow-md'
+                      onError={(e) => {
+                        (e.target as HTMLImageElement).style.display = 'none';
+                      }}
+                    />
+                  }
+                  label={displayTitle}
+                  labelClass='max-w-36'
+                  onClick={() => handleParallelView(book.hash)}
+                />
+              );
+            })}
         </ul>
       </MenuItem>
       {bookKeys.length > 1 &&

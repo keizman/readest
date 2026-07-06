@@ -19,6 +19,7 @@ import { navigateToLogin } from '@/utils/nav';
 import { formatAuthors, formatDescription, formatSeries } from '@/utils/book';
 import ReadingProgress from './ReadingProgress';
 import BookCover from '@/components/BookCover';
+import { getBookDisplayTitle } from '@/utils/privacy';
 
 interface BookItemProps {
   book: Book;
@@ -66,6 +67,8 @@ const BookItem: React.FC<BookItemProps> = ({
     : undefined;
 
   const seriesText = formatSeries(book.metadata?.series, book.metadata?.seriesIndex);
+  const displayTitle = getBookDisplayTitle(settings, book);
+  const displayBook = displayTitle === book.title ? book : { ...book, title: displayTitle };
 
   return (
     <div
@@ -90,8 +93,9 @@ const BookItem: React.FC<BookItemProps> = ({
         style={bookitemMainStyle}
       >
         <BookCover
+          key={displayTitle}
           mode={mode}
-          book={book}
+          book={displayBook}
           coverFit={coverFit}
           showSpine={false}
           imageClassName='rounded shadow-md'
@@ -125,7 +129,7 @@ const BookItem: React.FC<BookItemProps> = ({
               mode === 'list' && 'line-clamp-1 text-base',
             )}
           >
-            {book.title}
+            {displayTitle}
           </h4>
           {mode === 'list' && (
             <p className='text-neutral-content line-clamp-1 text-sm'>

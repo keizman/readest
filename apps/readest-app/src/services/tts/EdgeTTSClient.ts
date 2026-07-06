@@ -1,5 +1,6 @@
 import { getUserLocale } from '@/utils/misc';
 import { isSameLang } from '@/utils/lang';
+import { LRUCache } from '@/utils/lru';
 import { TTSClient, TTSMessageEvent } from './TTSClient';
 import { EdgeSpeechTTS, EdgeTTSPayload, EDGE_TTS_PROTOCOL, TTSWordBoundary } from '@/libs/edgeTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
@@ -9,23 +10,42 @@ import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
 
-// Short volume ramp applied at the end of each Edge segment. A single <audio>
-// element is reused for every sentence, so each boundary tears down and
-// reassigns audio.src — which clicks/pops ("电波"/静电) whenever the waveform
-// isn't sitting at a zero sample. Fading the element volume to zero before the
-// cut removes that step discontinuity. The fade runs inside the segment's
-// trailing silence, so it's inaudible and never clips speech. rAF-driven, but
-// the audio's natural `onended` is a safe fallback if frames stall (e.g. the
-// app is backgrounded), so playback always advances and volume is restored.
-const SEGMENT_FADE_OUT_MS = 60;
-
 // Edge word-boundary offsets/durations are in 100-nanosecond ticks.
 const TICKS_PER_SECOND = 10_000_000;
-// End a segment once playback passes the last word (plus a small margin so the
-// final word isn't clipped) whenever the trailing silence is long enough to be
-// worth trimming.
+// Trim each segment's trailing silence (the padding Edge appends after the last
+// word) so batches butt together at speech, not at silence. Keep a small margin
+// past the last word so it isn't clipped, and only trim when the silence is long
+// enough to be worth removing.
 const TRAIL_SAFETY_MARGIN_SEC = 0.12;
 const MIN_TRAILING_SILENCE_SEC = 0.25;
+
+// Small lead before the first source of a paragraph starts, so `start(when)` is
+// scheduled just ahead of the clock rather than in the past (which can glitch).
+// Batches within a paragraph are scheduled contiguously with no lead, so this
+// only affects the very first sample of each paragraph.
+const SCHEDULE_LEAD_SEC = 0.02;
+
+// Decoded AudioBuffers are ~10x the mp3 size, so keep this cache small; the mp3
+// blobs stay in EdgeSpeechTTS's larger LRU and re-decoding a cached blob is
+// cheap (single-digit ms), so eviction never costs a network round-trip.
+const AUDIO_BUFFER_CACHE_SIZE = 16;
+
+// Edge TTS always returns 24kHz mp3. Some WebViews (WebKit) decode the mp3 but
+// play the buffer back at the context's device rate (~48kHz) without resampling,
+// doubling the pitch ("chipmunk"). Creating the AudioContext at the source rate
+// removes the mismatch entirely, so there is nothing to resample.
+const EDGE_TTS_SAMPLE_RATE = 24000;
+
+// A single sentence-mark placed on the audio-context timeline. `batchCtxStart`
+// is when its batch's audio begins (context time); word-boundary offsets are
+// media-time relative to that. `markCtxStart` is when this mark's first word is
+// heard, used to switch the sentence highlight as playback crosses marks.
+interface MarkEntry {
+  mark: TTSMark;
+  boundaries: TTSWordBoundary[];
+  batchCtxStart: number;
+  markCtxStart: number;
+}
 
 // Group consecutive sentence-marks of a paragraph into a single Edge request of
 // up to this many characters. Each foliate paragraph carries one mark per
@@ -52,13 +72,16 @@ export class EdgeTTSClient implements TTSClient {
   #pitch = 1.0;
 
   #edgeTTS: EdgeSpeechTTS | null = null;
-  #audioElement: HTMLAudioElement | null = null;
+  #audioContext: AudioContext | null = null;
+  #gainNode: GainNode | null = null;
+  // Currently scheduled sources for the active paragraph. Cancelled on stop and
+  // cleared once a paragraph ends naturally.
+  #sources: AudioBufferSourceNode[] = [];
+  #audioSegmentCache = new LRUCache<string, { buffer: AudioBuffer; boundaries: TTSWordBoundary[] }>(
+    AUDIO_BUFFER_CACHE_SIZE,
+  );
   #isPlaying = false;
-  #pausedAt = 0;
-  #startedAt = 0;
-  #fadeCompensation: number | null = null;
   #wordTrackingRafId: number | null = null;
-  #fadeRafId: number | null = null;
 
   constructor(controller?: TTSController, appService?: AppService | null) {
     this.controller = controller;
@@ -83,7 +106,11 @@ export class EdgeTTSClient implements TTSClient {
   }
 
   getPayload = (lang: string, text: string, voiceId: string) => {
-    return { lang, text, voice: voiceId, rate: 1.0, pitch: this.#pitch } as EdgeTTSPayload;
+    // Speed is rendered server-side via Edge's prosody rate, which changes tempo
+    // while preserving pitch. Applying speed here instead of via the Web Audio
+    // source's playbackRate avoids the "chipmunk" pitch shift that resampling a
+    // buffer faster/slower would cause.
+    return { lang, text, voice: voiceId, rate: this.#rate, pitch: this.#pitch } as EdgeTTSPayload;
   };
 
   // Edge TTS websocket requests fail intermittently; retry the preload a few times
@@ -167,107 +194,186 @@ export class EdgeTTSClient implements TTSClient {
     }
 
     await this.stopInternal();
-    // Reuse the same Audio element inside the ssml session
-    if (!this.#audioElement) {
-      this.#audioElement = new Audio();
-    }
-    const audio = this.#audioElement;
-    audio.setAttribute('x-webkit-airplay', 'deny');
-    audio.preload = 'auto';
 
     const batches = this.#buildBatches(marks);
-    for (const batch of batches) {
-      const firstMark = batch[0]!;
-      const batchText = batch.map((m) => m.text).join('');
-      let abortHandler: null | (() => void) = null;
+    if (batches.length === 0) {
+      yield { code: 'end', message: 'Nothing to speak' } as TTSMessageEvent;
+      return;
+    }
+
+    const ctx = this.#ensureContext();
+    await this.#resumeContext(ctx);
+
+    yield {
+      code: 'boundary',
+      message: `Start chunk: ${batches[0]![0]!.name}`,
+      mark: batches[0]![0]!.name,
+    } as TTSMessageEvent;
+
+    const result = await this.#scheduleParagraph(ctx, batches, signal);
+    yield result;
+
+    await this.stopInternal();
+  }
+
+  #ensureContext(): AudioContext {
+    if (!this.#audioContext) {
+      const Ctor =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       try {
-        const voiceLang = firstMark.language;
-        const voiceId = await this.getVoiceIdFromLang(voiceLang);
-        this.#speakingLang = voiceLang;
-        const audioResult = await this.#edgeTTS?.createAudio(
-          this.getPayload(voiceLang, batchText, voiceId),
-        );
-        const audioUrl = audioResult?.url;
-        const boundaries = audioResult?.boundaries ?? [];
-        if (signal.aborted) {
-          yield { code: 'error', message: 'Aborted' } as TTSMessageEvent;
-          break;
-        }
+        this.#audioContext = new Ctor({ sampleRate: EDGE_TTS_SAMPLE_RATE });
+      } catch {
+        // Some engines reject a forced sample rate; fall back to the default
+        // rate and rely on the playbackRate ratio compensation below.
+        this.#audioContext = new Ctor();
+      }
+      this.#gainNode = this.#audioContext.createGain();
+      this.#gainNode.connect(this.#audioContext.destination);
+    }
+    return this.#audioContext;
+  }
 
-        yield {
-          code: 'boundary',
-          message: `Start chunk: ${firstMark.name}`,
-          mark: firstMark.name,
-        } as TTSMessageEvent;
+  async #resumeContext(ctx: AudioContext) {
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => {});
+    }
+  }
 
-        const result = await new Promise<TTSMessageEvent>((resolve) => {
-          const cleanUp = () => {
-            this.#stopWordTracking();
-            audio.onended = null;
-            audio.onerror = null;
-            audio.src = '';
-          };
-          let resolved = false;
-          const handleEnded = () => {
-            if (resolved) return;
-            resolved = true;
-            cleanUp();
-            resolve({ code: 'end', message: `Chunk finished: ${firstMark.name}` });
-          };
+  // Decode (and cache) the mp3 for a payload into an AudioBuffer. The blob is
+  // already cached by EdgeSpeechTTS, so a cache miss here only pays the (cheap)
+  // decode cost, never a network round-trip.
+  async #getSegment(ctx: AudioContext, payload: EdgeTTSPayload) {
+    const key = `${payload.voice}\u0000${payload.pitch}\u0000${payload.rate}\u0000${payload.text}`;
+    const cached = this.#audioSegmentCache.get(key);
+    if (cached) return cached;
+    const { data, boundaries } = await this.#edgeTTS!.createAudioData(payload);
+    const buffer = await ctx.decodeAudioData(data);
+    const segment = { buffer, boundaries };
+    this.#audioSegmentCache.set(key, segment);
+    return segment;
+  }
 
-          abortHandler = () => {
-            cleanUp();
-            resolve({ code: 'error', message: 'Aborted' });
-          };
-          if (signal.aborted) {
-            abortHandler();
-            return;
-          } else {
-            signal.addEventListener('abort', abortHandler);
-          }
-          audio.onended = handleEnded;
-          audio.onerror = (e) => {
-            cleanUp();
-            console.warn('Audio playback error:', e);
-            resolve({ code: 'error', message: 'Audio playback error' });
-          };
-          this.#isPlaying = true;
-          audio.src = audioUrl || '';
-          this.#startBatchTracking(audio, batch, boundaries, handleEnded);
-          if (!this.appService?.isLinuxApp) {
-            audio.playbackRate = this.#rate;
-          }
-          audio
-            .play()
-            .then(() => {
-              if (this.appService?.isLinuxApp) {
-                audio.playbackRate = this.#rate;
-              }
-            })
-            .catch((err) => {
-              cleanUp();
-              console.error('Failed to play audio:', err);
-              resolve({ code: 'error', message: 'Playback failed: ' + err.message });
-            });
-        });
-        yield result;
+  // Schedule every batch of a paragraph back-to-back on the audio-context
+  // timeline so mid-paragraph sentence periods play gaplessly (batches are cut
+  // arbitrarily inside a continuous paragraph, so any silence between them is
+  // padding). Trailing silence is trimmed via each batch's last word boundary,
+  // and the next batch butts on at that point. Word/sentence highlighting is
+  // driven from context time in #startTracking. Resolves 'end' when the last
+  // scheduled source finishes, or 'error' on abort.
+  async #scheduleParagraph(
+    ctx: AudioContext,
+    batches: TTSMark[][],
+    signal: AbortSignal,
+  ): Promise<TTSMessageEvent> {
+    const gain = this.#gainNode!;
+    const markEntries: MarkEntry[] = [];
+    const sources: AudioBufferSourceNode[] = [];
+    let startTime = ctx.currentTime + SCHEDULE_LEAD_SEC;
+    let lastSource: AudioBufferSourceNode | null = null;
+    let pendingError: string | null = null;
+
+    for (const batch of batches) {
+      if (signal.aborted) break;
+      const voiceLang = batch[0]!.language;
+      const voiceId = await this.getVoiceIdFromLang(voiceLang);
+      this.#speakingLang = voiceLang;
+      this.#currentVoiceId = voiceId;
+      const text = batch.map((m) => m.text).join('');
+
+      let segment: { buffer: AudioBuffer; boundaries: TTSWordBoundary[] };
+      try {
+        segment = await this.#getSegment(ctx, this.getPayload(voiceLang, text, voiceId));
       } catch (error) {
-        if (error instanceof Error && error.message === 'No audio data received.') {
-          console.warn('No audio data received for:', batchText);
-          yield { code: 'end', message: `Chunk finished: ${firstMark.name}` } as TTSMessageEvent;
+        const message = error instanceof Error ? error.message : String(error);
+        if (message === 'No audio data received.') {
+          console.warn('No audio data received for:', text);
           continue;
         }
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn('TTS error for mark:', batchText, message);
-        yield { code: 'error', message } as TTSMessageEvent;
+        console.warn('TTS error for batch:', text, message);
+        pendingError = message;
         break;
-      } finally {
-        if (abortHandler) {
-          signal.removeEventListener('abort', abortHandler);
-        }
       }
+      if (signal.aborted) break;
+
+      const { buffer, boundaries } = segment;
+      const speechEndSec = boundaries.length
+        ? (boundaries[boundaries.length - 1]!.offset +
+            boundaries[boundaries.length - 1]!.duration) /
+          TICKS_PER_SECOND
+        : buffer.duration;
+      const trailingSilence = buffer.duration - speechEndSec;
+      const playMediaDur =
+        trailingSilence > MIN_TRAILING_SILENCE_SEC
+          ? Math.min(buffer.duration, speechEndSec + TRAIL_SAFETY_MARGIN_SEC)
+          : buffer.duration;
+
+      if (startTime < ctx.currentTime) startTime = ctx.currentTime;
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      // Speed is already baked into the audio (server-side prosody rate), so the
+      // only playbackRate adjustment is a sample-rate safety net: some WebViews
+      // don't resample the decoded 24kHz Edge mp3 to the context rate, so the
+      // buffer would play back at the context rate and shift pitch. The ratio is
+      // 1 on spec-compliant engines (and when the context is forced to 24kHz).
+      source.playbackRate.value = buffer.sampleRate / ctx.sampleRate;
+      source.connect(gain);
+      const batchCtxStart = startTime;
+      source.start(batchCtxStart);
+      const wallDur = playMediaDur;
+      source.stop(batchCtxStart + wallDur);
+      sources.push(source);
+      lastSource = source;
+
+      const { perMark, startSec } = this.#partitionBatch(batch, boundaries);
+      for (let i = 0; i < batch.length; i++) {
+        markEntries.push({
+          mark: batch[i]!,
+          boundaries: perMark[i]!,
+          batchCtxStart,
+          markCtxStart: batchCtxStart + (startSec[i] ?? 0),
+        });
+      }
+      startTime = batchCtxStart + wallDur;
     }
-    await this.stopInternal();
+
+    this.#sources = sources;
+
+    return new Promise<TTSMessageEvent>((resolve) => {
+      let settled = false;
+      let abortHandler: (() => void) | null = null;
+      const finish = (evt: TTSMessageEvent) => {
+        if (settled) return;
+        settled = true;
+        this.#stopWordTracking();
+        if (abortHandler) signal.removeEventListener('abort', abortHandler);
+        resolve(evt);
+      };
+
+      abortHandler = () => {
+        this.#cancelSources();
+        finish({ code: 'error', message: 'Aborted' });
+      };
+      if (signal.aborted) {
+        this.#cancelSources();
+        finish({ code: 'error', message: 'Aborted' });
+        return;
+      }
+      signal.addEventListener('abort', abortHandler);
+
+      if (!lastSource || markEntries.length === 0) {
+        finish(
+          pendingError
+            ? { code: 'error', message: pendingError }
+            : { code: 'end', message: 'Chunk finished' },
+        );
+        return;
+      }
+
+      this.#isPlaying = true;
+      lastSource.onended = () => finish({ code: 'end', message: 'Chunk finished' });
+      this.#startTracking(ctx, markEntries);
+    });
   }
 
   // Group a paragraph's sentence-marks into requests of up to BATCH_MAX_CHARS
@@ -326,77 +432,44 @@ export class EdgeTTSClient implements TTSClient {
     return { perMark, startSec };
   }
 
-  // Follow playback time against the word-boundary metadata of the current
-  // batch and drive per-sentence highlighting: when playback crosses into a new
-  // mark, dispatch that mark (sentence highlight) and hand its words to the
-  // controller; within a mark, report the spoken word. Word offsets are in
-  // media time, so audio.playbackRate and pause/resume (including the resume
-  // rewind on iOS) are handled naturally by polling audio.currentTime.
-  #startBatchTracking(
-    audio: HTMLAudioElement,
-    batch: TTSMark[],
-    boundaries: TTSWordBoundary[],
-    onSpeechEnd?: () => void,
-  ) {
+  // Drive per-sentence + per-word highlighting from context time across all of
+  // the paragraph's scheduled batches. When playback crosses into a new mark,
+  // dispatch it (sentence highlight) and hand its words to the controller;
+  // within a mark, report the spoken word. Context time naturally accounts for
+  // playbackRate and suspend/resume, so no per-element polling is needed.
+  #startTracking(ctx: AudioContext, markEntries: MarkEntry[]) {
     this.#stopWordTracking();
     const controller = this.controller;
     if (!controller) return;
 
-    const { perMark, startSec } = this.#partitionBatch(batch, boundaries);
-    let currentMark = -1;
+    let currentIdx = -1;
     let lastWord = -1;
     const enterMark = (i: number) => {
-      currentMark = i;
+      currentIdx = i;
       lastWord = -1;
-      controller.dispatchSpeakMark(batch[i]!);
+      const entry = markEntries[i]!;
+      controller.dispatchSpeakMark(entry.mark);
       // With words the controller highlights word-by-word; with none it draws
       // the sentence highlight suppressed at mark dispatch (see
       // TTSController.prepareSpeakWords).
-      controller.prepareSpeakWords(perMark[i]!.map((boundary) => boundary.text));
+      controller.prepareSpeakWords(entry.boundaries.map((boundary) => boundary.text));
     };
 
     // Set up the first mark synchronously so its sentence highlight + word list
-    // are ready before the first frame (matches the single-sentence path and
-    // lets callers observe prepareSpeakWords without waiting for a frame).
+    // are ready before the first frame.
     enterMark(0);
-    if (!boundaries.length) return;
-
-    // Each Edge mp3 carries trailing silence after the last word. Stacked with
-    // the next segment's turnaround it becomes an over-long pause at every
-    // batch/paragraph break. The last word boundary tells us when speech ends,
-    // so once playback passes it (plus a small safety margin so the final word
-    // isn't clipped) we finish the segment early and let playback advance to
-    // the preloaded next one — roughly halving the gap.
-    const lastBoundary = boundaries[boundaries.length - 1]!;
-    const speechEndSec = (lastBoundary.offset + lastBoundary.duration) / TICKS_PER_SECOND;
-    let endedEarly = false;
 
     const tick = () => {
-      const currentTime = audio.currentTime;
-      let mark = currentMark;
-      while (mark + 1 < batch.length && startSec[mark + 1]! <= currentTime) mark++;
-      if (mark !== currentMark) enterMark(mark);
-      const index = findBoundaryIndexAtTime(perMark[currentMark]!, currentTime);
+      const now = ctx.currentTime;
+      let i = currentIdx;
+      while (i + 1 < markEntries.length && markEntries[i + 1]!.markCtxStart <= now) i++;
+      if (i !== currentIdx) enterMark(i);
+      const entry = markEntries[currentIdx]!;
+      const mediaWithinBatch = now - entry.batchCtxStart;
+      const index = findBoundaryIndexAtTime(entry.boundaries, mediaWithinBatch);
       if (index !== lastWord && index >= 0) {
         lastWord = index;
         controller.dispatchSpeakWord(index);
-      }
-      if (!endedEarly && onSpeechEnd && Number.isFinite(audio.duration)) {
-        const trailingSilence = audio.duration - speechEndSec;
-        if (
-          trailingSilence > MIN_TRAILING_SILENCE_SEC &&
-          currentTime >= speechEndSec + TRAIL_SAFETY_MARGIN_SEC
-        ) {
-          endedEarly = true;
-          // Fade to silence before ending: onSpeechEnd runs cleanUp() which
-          // sets audio.src = '', and clearing a source that isn't at a zero
-          // sample clicks/pops at the segment boundary. We're already inside
-          // the trailing silence, so the ramp is inaudible and never clips the
-          // final word. Returning here stops the tick loop (no reschedule); the
-          // fade drives the segment end via onSpeechEnd.
-          this.#fadeVolume(audio, audio.volume, 0, SEGMENT_FADE_OUT_MS, onSpeechEnd);
-          return;
-        }
       }
       this.#wordTrackingRafId = requestAnimationFrame(tick);
     };
@@ -408,74 +481,34 @@ export class EdgeTTSClient implements TTSClient {
       cancelAnimationFrame(this.#wordTrackingRafId);
       this.#wordTrackingRafId = null;
     }
-    if (this.#fadeRafId !== null) {
-      cancelAnimationFrame(this.#fadeRafId);
-      this.#fadeRafId = null;
-    }
-    // Restore full volume for the next (reused) segment, and so an interrupted
-    // fade can never leave playback muted.
-    if (this.#audioElement) this.#audioElement.volume = 1;
   }
 
-  // Linear ramp of the element volume, used to smooth segment boundaries. A
-  // single in-flight fade at a time; starting a new one cancels the previous.
-  #fadeVolume(
-    audio: HTMLAudioElement,
-    from: number,
-    to: number,
-    durationMs: number,
-    onDone?: () => void,
-  ) {
-    if (this.#fadeRafId !== null) {
-      cancelAnimationFrame(this.#fadeRafId);
-      this.#fadeRafId = null;
-    }
-    const start = performance.now();
-    audio.volume = from;
-    const step = () => {
-      const t = durationMs > 0 ? Math.min(1, (performance.now() - start) / durationMs) : 1;
-      audio.volume = from + (to - from) * t;
-      if (t < 1) {
-        this.#fadeRafId = requestAnimationFrame(step);
-      } else {
-        this.#fadeRafId = null;
-        audio.volume = to;
-        onDone?.();
+  #cancelSources() {
+    for (const source of this.#sources) {
+      try {
+        source.onended = null;
+        source.stop();
+        source.disconnect();
+      } catch {
+        // A source that never started (or already stopped) throws; ignore.
       }
-    };
-    this.#fadeRafId = requestAnimationFrame(step);
+    }
+    this.#sources = [];
   }
 
   async pause() {
-    if (!this.#isPlaying || !this.#audioElement) return true;
-    this.#pausedAt = this.#audioElement.currentTime - this.#startedAt;
-    await this.#audioElement.pause();
+    if (!this.#isPlaying || !this.#audioContext) return true;
+    // Suspending freezes the context clock, so scheduled sources pause in place
+    // and resume perfectly aligned — no rewind/fade compensation needed.
+    await this.#audioContext.suspend().catch(() => {});
     this.#isPlaying = false;
     return true;
   }
 
-  #getFadeCompensation() {
-    if (this.#fadeCompensation !== null) return this.#fadeCompensation;
-
-    const userAgent = navigator.userAgent;
-    const isSafari = /Safari/.test(userAgent) && !/Chrome/.test(userAgent);
-    const isIOS = /iPad|iPhone|iPod/.test(userAgent);
-    if (isSafari || isIOS) {
-      this.#fadeCompensation = 0.2;
-    } else {
-      this.#fadeCompensation = 0.0;
-    }
-
-    return this.#fadeCompensation;
-  }
-
   async resume() {
-    if (this.#isPlaying || !this.#audioElement) return true;
-    const fadeCompensation = this.#getFadeCompensation();
-    this.#audioElement.currentTime = Math.max(0, this.#audioElement.currentTime - fadeCompensation);
-    await this.#audioElement.play();
+    if (this.#isPlaying || !this.#audioContext) return true;
+    await this.#audioContext.resume().catch(() => {});
     this.#isPlaying = true;
-    this.#startedAt = this.#audioElement.currentTime - this.#pausedAt;
     return true;
   }
 
@@ -485,17 +518,8 @@ export class EdgeTTSClient implements TTSClient {
 
   private async stopInternal() {
     this.#stopWordTracking();
+    this.#cancelSources();
     this.#isPlaying = false;
-    this.#pausedAt = 0;
-    this.#startedAt = 0;
-    if (this.#audioElement) {
-      this.#audioElement.pause();
-      this.#audioElement.currentTime = 0;
-      if (this.#audioElement?.onended) {
-        this.#audioElement.onended(new Event('stopped'));
-      }
-      this.#audioElement.src = '';
-    }
   }
 
   async setRate(rate: number) {
@@ -561,8 +585,14 @@ export class EdgeTTSClient implements TTSClient {
   }
 
   async shutdown(): Promise<void> {
+    await this.stopInternal();
+    if (this.#audioContext) {
+      await this.#audioContext.close().catch(() => {});
+      this.#audioContext = null;
+      this.#gainNode = null;
+    }
+    this.#audioSegmentCache.clear();
     this.initialized = false;
-    this.#audioElement = null;
     this.#voices = [];
   }
 }

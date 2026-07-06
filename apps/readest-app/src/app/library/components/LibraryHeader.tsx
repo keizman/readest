@@ -1,21 +1,30 @@
 import clsx from 'clsx';
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { FaSearch } from 'react-icons/fa';
 import { PiPlus } from 'react-icons/pi';
 import { PiSelectionAll, PiSelectionAllFill } from 'react-icons/pi';
 import { PiDotsThreeCircle } from 'react-icons/pi';
-import { MdOutlineMenu } from 'react-icons/md';
+import { MdLockOpen, MdLockOutline, MdOutlineMenu } from 'react-icons/md';
 import { IoMdCloseCircle } from 'react-icons/io';
 
 import { useEnv } from '@/context/EnvContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useLibraryStore } from '@/store/libraryStore';
+import { useSettingsStore } from '@/store/settingsStore';
+import { useNowPlayingStore } from '@/store/nowPlayingStore';
 import { useTrafficLight } from '@/hooks/useTrafficLight';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { debounce } from '@/utils/debounce';
 import useShortcuts from '@/hooks/useShortcuts';
+import {
+  ensureBookTitleAliases,
+  getBookDisplayTitle,
+  isLibraryPrivacyModeEnabled,
+  setLibraryPrivacyMode,
+} from '@/utils/privacy';
+import { getMediaSession, TauriMediaSession } from '@/libs/mediaSession';
 import WindowButtons from '@/components/WindowButtons';
 import Dropdown from '@/components/Dropdown';
 import SettingsMenu from './SettingsMenu';
@@ -52,15 +61,25 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
   const _ = useTranslation();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { appService } = useEnv();
+  const { appService, envConfig } = useEnv();
   const { systemUIVisible, statusBarHeight } = useThemeStore();
-  const { currentBookshelf } = useLibraryStore();
+  const { currentBookshelf, library } = useLibraryStore();
+  const { settings, setSettings, saveSettings } = useSettingsStore();
   const [searchQuery, setSearchQuery] = useState(searchParams?.get('q') ?? '');
 
   const headerRef = useRef<HTMLDivElement>(null);
   const { isTrafficLightVisible } = useTrafficLight(headerRef);
   const iconSize18 = useResponsiveSize(18);
   const { safeAreaInsets: insets } = useThemeStore();
+
+  useEffect(() => {
+    if (!isLibraryPrivacyModeEnabled(settings)) return;
+    const books = library.filter((book) => !book.deletedAt);
+    const nextSettings = ensureBookTitleAliases(settings, books);
+    if (nextSettings === settings) return;
+    setSettings(nextSettings);
+    void saveSettings(envConfig, nextSettings);
+  }, [envConfig, library, saveSettings, setSettings, settings]);
 
   useShortcuts({
     onToggleSelectMode,
@@ -91,6 +110,48 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
     (acc, item) => acc + ('books' in item ? item.books.length : 1),
     0,
   );
+
+  const privacyModeEnabled = isLibraryPrivacyModeEnabled(settings);
+  const handleTogglePrivacyMode = async () => {
+    const currentSettings = useSettingsStore.getState().settings;
+    const enabled = !isLibraryPrivacyModeEnabled(currentSettings);
+    const books = library.filter((book) => !book.deletedAt);
+    const nextSettings = setLibraryPrivacyMode(currentSettings, enabled, books);
+    setSettings(nextSettings);
+    await saveSettings(envConfig, nextSettings);
+
+    // Scrub an already-visible lock-screen card immediately, including while
+    // its TTS controller is detached and continuing from the library route.
+    const nowPlaying = useNowPlayingStore.getState().nowPlaying;
+    const mediaSession = getMediaSession();
+    if (!nowPlaying || !mediaSession) return;
+    const displayTitle = getBookDisplayTitle(nextSettings, {
+      hash: nowPlaying.bookHash,
+      title: nowPlaying.title,
+    });
+    const metadata = {
+      title: displayTitle,
+      artist: enabled ? displayTitle : nowPlaying.author,
+      album: displayTitle,
+      artwork: enabled ? '' : nowPlaying.coverImageUrl || '/icon.png',
+    };
+    if (mediaSession instanceof TauriMediaSession) {
+      await mediaSession.updateMetadata(metadata);
+    } else {
+      mediaSession.metadata = new MediaMetadata({
+        ...metadata,
+        artwork: enabled
+          ? [{ src: '/icon.png', sizes: '512x512', type: 'image/png' }]
+          : [
+              {
+                src: nowPlaying.coverImageUrl || '/icon.png',
+                sizes: '512x512',
+                type: 'image/png',
+              },
+            ],
+      });
+    }
+  };
 
   if (!insets) return null;
 
@@ -151,6 +212,26 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
                 <IoMdCloseCircle className='h-4 w-4' />
               </button>
             )}
+            <button
+              type='button'
+              onClick={handleTogglePrivacyMode}
+              className={clsx(
+                'eink-bordered flex h-7 w-7 cursor-pointer items-center justify-center rounded-full',
+                'transition-colors duration-200 focus-visible:outline focus-visible:outline-2',
+                privacyModeEnabled
+                  ? 'bg-base-content text-base-100'
+                  : 'text-base-content/60 hover:bg-base-300',
+              )}
+              aria-label={privacyModeEnabled ? _('Show Book Titles') : _('Hide Book Titles')}
+              title={privacyModeEnabled ? _('Show Book Titles') : _('Hide Book Titles')}
+              aria-pressed={privacyModeEnabled}
+            >
+              {privacyModeEnabled ? (
+                <MdLockOutline className='h-4 w-4' />
+              ) : (
+                <MdLockOpen className='h-4 w-4' />
+              )}
+            </button>
             <span className='bg-base-content/50 mx-2 h-4 w-[0.5px]'></span>
             <Dropdown
               label={_('Import Books')}

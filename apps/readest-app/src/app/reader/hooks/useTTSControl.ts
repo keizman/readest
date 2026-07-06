@@ -18,7 +18,7 @@ import { throttle } from '@/utils/throttle';
 import { isCfiInLocation } from '@/utils/cfi';
 import { getLocale } from '@/utils/misc';
 import { buildTTSMediaMetadata } from '@/utils/ttsMetadata';
-import { isBookMasked } from '@/utils/privacy';
+import { getBookDisplayTitle, isBookMasked, isLibraryPrivacyModeEnabled } from '@/utils/privacy';
 import { useSettingsStore } from '@/store/settingsStore';
 import { invokeUseBackgroundAudio } from '@/utils/bridge';
 import { estimateTTSTime } from '@/utils/ttsTime';
@@ -292,18 +292,24 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       // For private (masked) books, never surface the spoken sentence in the OS
       // now-playing/media metadata — fall back to the book title so lock-screen
       // and notification shade don't leak the content being read.
-      const masked = isBookMasked(useSettingsStore.getState().settings, bookHash);
-      const metadata = masked
-        ? { title, artist: author, album: title, shouldUpdate: true }
-        : buildTTSMediaMetadata({
-            markText: mark?.text || '',
-            markName: mark?.name || '',
-            sectionLabel: sectionLabel || '',
-            title,
-            author,
-            ttsMediaMetadata,
-            previousSectionLabel: previousSectionLabelRef.current,
-          });
+      const currentSettings = useSettingsStore.getState().settings;
+      const masked = isBookMasked(currentSettings, bookHash);
+      const privacyTitle = isLibraryPrivacyModeEnabled(currentSettings)
+        ? getBookDisplayTitle(currentSettings, { hash: bookHash, title })
+        : null;
+      const metadata =
+        masked && !privacyTitle
+          ? { title, artist: author, album: title, shouldUpdate: true }
+          : buildTTSMediaMetadata({
+              markText: mark?.text || '',
+              markName: mark?.name || '',
+              sectionLabel: sectionLabel || '',
+              title,
+              author,
+              ttsMediaMetadata,
+              previousSectionLabel: previousSectionLabelRef.current,
+              privacyTitle,
+            });
 
       if (ttsMediaMetadata === 'chapter') {
         previousSectionLabelRef.current = sectionLabel;
@@ -323,7 +329,13 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
             title: metadata.title,
             artist: metadata.artist,
             album: metadata.album,
-            artwork: [{ src: coverImageUrl || '/icon.png', sizes: '512x512', type: 'image/png' }],
+            artwork: [
+              {
+                src: privacyTitle ? '/icon.png' : coverImageUrl || '/icon.png',
+                sizes: '512x512',
+                type: 'image/png',
+              },
+            ],
           });
         }
       }
@@ -359,11 +371,13 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         // navigation from the highlight cfi directly, stamping the timestamp
         // so the "back-to-TTS" button stays suppressed while progress.location
         // catches up. Skip only when the user is actively selecting text.
-        if (hlContents.some(({ doc }) => (doc.getSelection()?.toString().length ?? 0) > 0)) {
+        if (
+          !followingTTSLocationRef.current ||
+          hlContents.some(({ doc }) => (doc.getSelection()?.toString().length ?? 0) > 0)
+        ) {
           return;
         }
         sectionChangingTimestampRef.current = Date.now();
-        followingTTSLocationRef.current = true;
         view.goTo?.(cfi);
         return;
       }
@@ -531,6 +545,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     // wrongly appears after the view follows the word onto the next page.
     const highlightCfi = ttsController.getCurrentHighlightCfi() ?? ttsLocation;
     if (isCfiInLocation(highlightCfi, location)) {
+      followingTTSLocationRef.current = true;
       setShowBackToCurrentTTSLocation(false);
       // Word-aware re-apply: re-draws the current word during word-by-word
       // playback instead of redrawing the whole sentence over it.
@@ -538,6 +553,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     } else {
       const msSinceSectionChange = Date.now() - sectionChangingTimestampRef.current;
       if (msSinceSectionChange < 2000) return;
+      followingTTSLocationRef.current = false;
       setShowBackToCurrentTTSLocation(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -695,9 +711,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       previousSectionLabelRef.current = undefined;
       setTTSEnabled(bookKey, false);
       getView(bookKey)?.deselect();
-      if (appService?.isMobile) {
-        releaseUnblockAudio();
-      }
+      releaseUnblockAudio();
 
       // Tear down the controller, the lock-screen media session, and the
       // background-audio session best-effort and IN PARALLEL. The controller's
@@ -785,9 +799,11 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         if (appService?.isIOSApp) {
           await invokeUseBackgroundAudio({ enabled: true });
         }
-        if (appService?.isMobile) {
-          unblockAudio();
-        }
+        // The silent keep-alive element anchors navigator.mediaSession. Edge TTS
+        // plays through the Web Audio API (no media element), so run it on every
+        // platform — otherwise desktop web would lose the OS media controls that
+        // the Edge <audio> element used to provide.
+        unblockAudio();
         await initMediaSession();
         setTtsClientsInitialized(false);
 
@@ -915,19 +931,15 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   }, []);
 
   // Rate/voice/timeout/bar controls
-  // rate range: 0.5 - 3, 1.0 is normal speed
+  // Apply the new rate to subsequent speech without stopping/restarting the
+  // current utterance. This keeps playback controls stable and avoids a fresh
+  // synthesis wait; the active utterance finishes at its existing rate.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleSetRate = useCallback(
     throttle(async (rate: number) => {
       const ttsController = ttsControllerRef.current;
       if (ttsController) {
-        if (ttsController.state === 'playing') {
-          await ttsController.stop();
-          await ttsController.setRate(rate);
-          await ttsController.start();
-        } else {
-          await ttsController.setRate(rate);
-        }
+        await ttsController.setRate(rate);
       }
     }, 3000),
     [],

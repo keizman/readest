@@ -11,6 +11,7 @@ import { TranslationFunc, useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useDefaultIconSize, useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { getLanguageName } from '@/utils/lang';
+import { TTS_RATE_MAX, TTS_RATE_MIN, TTS_RATE_OPTIONS } from '@/utils/ttsRate';
 
 type TTSPanelProps = {
   bookKey: string;
@@ -137,7 +138,7 @@ const TTSPanel = ({
 
   const handleSetRate = (e: ChangeEvent<HTMLInputElement>) => {
     let newRate = parseFloat(e.target.value);
-    newRate = Math.max(0.2, Math.min(3.0, newRate));
+    newRate = Math.max(TTS_RATE_MIN, Math.min(TTS_RATE_MAX, newRate));
     setRate(newRate);
     onSetRate(newRate);
     const viewSettings = getViewSettings(bookKey)!;
@@ -208,29 +209,25 @@ const TTSPanel = ({
         <input
           className='range'
           type='range'
-          min={0.0}
-          max={3.0}
-          step='0.1'
+          min={TTS_RATE_MIN}
+          max={TTS_RATE_MAX}
+          step='0.25'
           value={rate}
           onChange={handleSetRate}
+          list='tts-rate-options'
+          aria-label={_('TTS Speed')}
         />
-        <div className='grid w-full grid-cols-7 text-xs'>
-          <span className='text-center'>|</span>
-          <span className='text-center'>|</span>
-          <span className='text-center'>|</span>
-          <span className='text-center'>|</span>
-          <span className='text-center'>|</span>
-          <span className='text-center'>|</span>
-          <span className='text-center'>|</span>
-        </div>
-        <div className='grid w-full grid-cols-7 text-xs'>
-          <span className='text-center'>{_('Slow')}</span>
-          <span className='text-center'></span>
-          <span className='text-center'>1.0</span>
-          <span className='text-center'>1.5</span>
-          <span className='text-center'>2.0</span>
-          <span className='text-center'></span>
-          <span className='text-center'>{_('Fast')}</span>
+        <datalist id='tts-rate-options'>
+          {TTS_RATE_OPTIONS.map((option) => (
+            <option key={option} value={option} />
+          ))}
+        </datalist>
+        <div className='flex w-full items-center justify-between text-xs'>
+          <span>{_('Slow')}</span>
+          <output className='font-medium tabular-nums' aria-live='polite'>
+            {rate.toFixed(rate % 1 === 0 ? 1 : 2)}x
+          </output>
+          <span>{_('Fast')}</span>
         </div>
       </div>
       <div className='flex items-center justify-between space-x-2'>

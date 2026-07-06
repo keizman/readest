@@ -7,6 +7,8 @@ import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { useNowPlayingStore } from '@/store/nowPlayingStore';
 import { stopDetachedTTS } from '@/app/reader/hooks/useTTSControl';
 import { navigateToReader } from '@/utils/nav';
+import { useSettingsStore } from '@/store/settingsStore';
+import { getBookDisplayTitle, isLibraryPrivacyModeEnabled } from '@/utils/privacy';
 
 /**
  * "Now playing" / continue-listening bar shown at the top of the library. It
@@ -20,10 +22,16 @@ const NowPlayingBar: React.FC = () => {
   const nowPlaying = useNowPlayingStore((s) => s.nowPlaying);
   const requestResume = useNowPlayingStore((s) => s.requestResume);
   const clearNowPlaying = useNowPlayingStore((s) => s.clearNowPlaying);
+  const settings = useSettingsStore((s) => s.settings);
 
   if (!nowPlaying) return null;
 
   const percent = Math.round(Math.max(0, Math.min(1, nowPlaying.fraction)) * 100);
+  const privacyModeEnabled = isLibraryPrivacyModeEnabled(settings);
+  const displayTitle = getBookDisplayTitle(settings, {
+    hash: nowPlaying.bookHash,
+    title: nowPlaying.title,
+  });
 
   const handleOpen = () => {
     requestResume(nowPlaying.bookId);
@@ -51,11 +59,11 @@ const NowPlayingBar: React.FC = () => {
         )}
       >
         <div className='bg-base-300 relative h-12 w-9 shrink-0 overflow-hidden rounded'>
-          {nowPlaying.coverImageUrl ? (
+          {nowPlaying.coverImageUrl && !privacyModeEnabled ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={nowPlaying.coverImageUrl}
-              alt={nowPlaying.title}
+              alt={displayTitle}
               className='h-full w-full object-cover'
             />
           ) : (
@@ -65,8 +73,8 @@ const NowPlayingBar: React.FC = () => {
           )}
         </div>
         <div className='min-w-0 flex-grow'>
-          <div className='truncate text-sm font-medium'>{nowPlaying.title}</div>
-          {nowPlaying.author && (
+          <div className='truncate text-sm font-medium'>{displayTitle}</div>
+          {nowPlaying.author && !privacyModeEnabled && (
             <div className='text-base-content/60 truncate text-xs'>{nowPlaying.author}</div>
           )}
           <div className='mt-1 flex items-center gap-2'>

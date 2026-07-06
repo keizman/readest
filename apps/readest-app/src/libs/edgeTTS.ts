@@ -363,7 +363,7 @@ export class EdgeSpeechTTS {
   // duplicate HTTP requests before the first response reaches the LRU cache.
   private static pendingAudio = new Map<
     string,
-    Promise<{ url: string; boundaries: TTSWordBoundary[] }>
+    Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }>
   >();
   private protocol: EDGE_TTS_PROTOCOL = 'wss';
 
@@ -748,13 +748,18 @@ export class EdgeSpeechTTS {
     return this.#fetchEdgeSpeech(payload);
   }
 
-  async createAudio(
+  // Fetch (or reuse the cached) audio blob and word boundaries for a payload.
+  // The blob is the shared source of truth: `createAudio` derives an object URL
+  // from it (HTMLAudioElement path) and `createAudioData` derives raw bytes for
+  // Web Audio `decodeAudioData`. In-flight requests are coalesced so overlapping
+  // look-ahead never issues duplicate HTTP requests.
+  async #ensureBlob(
     payload: EdgeTTSPayload,
-  ): Promise<{ url: string; boundaries: TTSWordBoundary[] }> {
+  ): Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> {
     const cacheKey = hashPayload(payload);
-    const cachedUrl = EdgeSpeechTTS.audioUrlCache.get(cacheKey);
-    if (cachedUrl) {
-      return { url: cachedUrl, boundaries: EdgeSpeechTTS.boundariesCache.get(cacheKey) ?? [] };
+    const cachedBlob = EdgeSpeechTTS.audioCache.get(cacheKey);
+    if (cachedBlob) {
+      return { blob: cachedBlob, boundaries: EdgeSpeechTTS.boundariesCache.get(cacheKey) ?? [] };
     }
     const pending = EdgeSpeechTTS.pendingAudio.get(cacheKey);
     if (pending) return pending;
@@ -763,11 +768,9 @@ export class EdgeSpeechTTS {
       const { response, boundaries } = await this.#fetchEdgeSpeech(payload);
       const arrayBuffer = await response.arrayBuffer();
       const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
-      const objectUrl = URL.createObjectURL(blob);
       EdgeSpeechTTS.audioCache.set(cacheKey, blob);
-      EdgeSpeechTTS.audioUrlCache.set(cacheKey, objectUrl);
       EdgeSpeechTTS.boundariesCache.set(cacheKey, boundaries);
-      return { url: objectUrl, boundaries };
+      return { blob, boundaries };
     })();
     EdgeSpeechTTS.pendingAudio.set(cacheKey, request);
     try {
@@ -777,6 +780,29 @@ export class EdgeSpeechTTS {
         EdgeSpeechTTS.pendingAudio.delete(cacheKey);
       }
     }
+  }
+
+  async createAudio(
+    payload: EdgeTTSPayload,
+  ): Promise<{ url: string; boundaries: TTSWordBoundary[] }> {
+    const cacheKey = hashPayload(payload);
+    const { blob, boundaries } = await this.#ensureBlob(payload);
+    let url = EdgeSpeechTTS.audioUrlCache.get(cacheKey);
+    if (!url) {
+      url = URL.createObjectURL(blob);
+      EdgeSpeechTTS.audioUrlCache.set(cacheKey, url);
+    }
+    return { url, boundaries };
+  }
+
+  // Web Audio playback path: returns the raw mp3 bytes (a fresh ArrayBuffer per
+  // call, since `decodeAudioData` detaches its input) plus word boundaries. The
+  // blob is cached, so repeated decodes never re-hit the network.
+  async createAudioData(
+    payload: EdgeTTSPayload,
+  ): Promise<{ data: ArrayBuffer; boundaries: TTSWordBoundary[] }> {
+    const { blob, boundaries } = await this.#ensureBlob(payload);
+    return { data: await blob.arrayBuffer(), boundaries };
   }
 
   async createAudioUrl(payload: EdgeTTSPayload): Promise<string> {

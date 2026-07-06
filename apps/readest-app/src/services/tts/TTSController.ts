@@ -658,7 +658,6 @@ export class TTSController extends EventTarget {
   }
 
   async setRate(rate: number) {
-    this.state = 'setrate-paused';
     this.ttsRate = rate;
     await this.ttsClient.setRate(this.ttsRate);
   }

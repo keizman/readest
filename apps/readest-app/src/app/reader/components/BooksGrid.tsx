@@ -8,6 +8,7 @@ import { useReaderStore } from '@/store/readerStore';
 import { useBookProgress } from '@/store/readerProgressStore';
 import { useSidebarStore } from '@/store/sidebarStore';
 import { useBookDataStore } from '@/store/bookDataStore';
+import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { getGridTemplate, getInsetEdges } from '@/utils/grid';
 import { getViewInsets } from '@/utils/insets';
@@ -27,6 +28,7 @@ import HintInfo from './HintInfo';
 import ReadingRuler from './ReadingRuler';
 import DoubleBorder from './DoubleBorder';
 import ReadingStatsTracker from './ReadingStatsTracker';
+import { getBookDisplayTitle } from '@/utils/privacy';
 
 interface BooksGridProps {
   bookKeys: string[];
@@ -110,6 +112,7 @@ const BookCellInner: React.FC<BookCellProps> = ({
   // progress-store split removed.
   const progress = useBookProgress(bookKey);
   const viewState = useReaderStore((s) => s.viewStates[bookKey]);
+  const settings = useSettingsStore((s) => s.settings);
   const viewSettings = viewState?.viewSettings ?? null;
 
   // config / bookData are read imperatively: their relevant fields are
@@ -162,6 +165,7 @@ const BookCellInner: React.FC<BookCellProps> = ({
   const horizontalGapPercent = viewSettings.gapPercent;
   const showHeader = viewSettings.showHeader;
   const showFooter = viewSettings.showFooter;
+  const displayTitle = getBookDisplayTitle(settings, book);
 
   return (
     <div
@@ -176,7 +180,7 @@ const BookCellInner: React.FC<BookCellProps> = ({
         bookKey={bookKey}
         gridInsets={gridInsets}
         screenInsets={screenInsets}
-        bookTitle={book.title}
+        bookTitle={displayTitle}
         isTopLeft={index === 0}
         isHoveredAnim={isHoveredAnim}
         onCloseBook={onCloseBook}
@@ -297,6 +301,7 @@ const BooksGrid: React.FC<BooksGridProps> = ({ bookKeys, onCloseBook, onGoToLibr
   const hoveredBookKey = useReaderStore((s) => s.hoveredBookKey);
   const setGridInsets = useReaderStore((s) => s.setGridInsets);
   const getBookData = useBookDataStore((s) => s.getBookData);
+  const settings = useSettingsStore((s) => s.settings);
   const sideBarBookKey = useSidebarStore((s) => s.sideBarBookKey);
   const [dropdownOpenBook, setDropdownOpenBook] = useState<string>('');
 
@@ -308,9 +313,9 @@ const BooksGrid: React.FC<BooksGridProps> = ({ bookKeys, onCloseBook, onGoToLibr
     if (!sideBarBookKey) return;
     const bookData = getBookData(sideBarBookKey);
     if (!bookData || !bookData.book) return;
-    document.title = bookData.book.title;
+    document.title = getBookDisplayTitle(settings, bookData.book);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideBarBookKey]);
+  }, [settings, sideBarBookKey]);
 
   // Memoize the per-book grid insets array — its identity is the input
   // to BookCell.gridInsets, and BookCell is React.memo'd. As long as

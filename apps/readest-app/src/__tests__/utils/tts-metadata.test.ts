@@ -132,4 +132,25 @@ describe('buildTTSMediaMetadata', () => {
       expect(result.shouldUpdate).toBe(true);
     });
   });
+
+  describe('privacy mode', () => {
+    it.each([
+      'sentence',
+      'paragraph',
+      'chapter',
+    ] as const)('replaces all %s lock-screen fields with the private alias', (ttsMediaMetadata) => {
+      const result = buildTTSMediaMetadata({
+        ...baseOptions,
+        ttsMediaMetadata,
+        privacyTitle: 'Book-123456',
+      });
+
+      expect(result).toEqual({
+        title: 'Book-123456',
+        artist: 'Book-123456',
+        album: 'Book-123456',
+        shouldUpdate: true,
+      });
+    });
+  });
 });

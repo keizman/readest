@@ -8,6 +8,8 @@ interface BuildTTSMediaMetadataOptions {
   author: string;
   ttsMediaMetadata: TTSMediaMetadataMode;
   previousSectionLabel?: string;
+  /** Stable local alias used to hide book, chapter, and spoken text on the lock screen. */
+  privacyTitle?: string | null;
 }
 
 interface TTSMediaMetadataResult {
@@ -29,6 +31,15 @@ export function buildTTSMediaMetadata(
     ttsMediaMetadata,
     previousSectionLabel,
   } = options;
+
+  if (options.privacyTitle) {
+    return {
+      title: options.privacyTitle,
+      artist: options.privacyTitle,
+      album: options.privacyTitle,
+      shouldUpdate: true,
+    };
+  }
 
   if (ttsMediaMetadata === 'chapter') {
     const shouldUpdate =
