@@ -349,10 +349,29 @@ export const hashTTSPayload = (payload: EdgeTTSPayload): string => {
 
 export type EDGE_TTS_PROTOCOL = 'wss' | 'https';
 
+// 48 kbit/s mono mp3 ≈ 6 KiB/s — retain ~5 minutes of synthesized audio.
+export const TTS_AUDIO_CACHE_MAX_BYTES = 5 * 60 * 6 * 1024;
+
 export class EdgeSpeechTTS {
   static voices = genVoiceList(EDGE_TTS_VOICES);
-  private static audioCache = new LRUCache<string, Blob>(200);
+  private static audioCacheBytes = 0;
+  private static onAudioCacheEvict = (key: string, blob: Blob) => {
+    EdgeSpeechTTS.audioCacheBytes = Math.max(0, EdgeSpeechTTS.audioCacheBytes - blob.size);
+    EdgeSpeechTTS.boundariesCache.delete(key);
+  };
+  private static audioCache = new LRUCache<string, Blob>(200, EdgeSpeechTTS.onAudioCacheEvict);
   private static boundariesCache = new LRUCache<string, TTSWordBoundary[]>(200);
+  private static trimAudioCache = () => {
+    while (
+      EdgeSpeechTTS.audioCacheBytes > TTS_AUDIO_CACHE_MAX_BYTES &&
+      EdgeSpeechTTS.audioCache.size() > 0
+    ) {
+      const entries = EdgeSpeechTTS.audioCache.entries();
+      const oldest = entries[entries.length - 1];
+      if (!oldest) break;
+      EdgeSpeechTTS.audioCache.delete(oldest[0]);
+    }
+  };
   // In-flight fetches keyed by payload hash. The LRU dedupes storage, not
   // requests: the playback scheduler and the preload paths race for the same
   // sentences at every paragraph start, and without this map each racer opens
@@ -759,7 +778,9 @@ export class EdgeSpeechTTS {
       const arrayBuffer = await response.arrayBuffer();
       const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
       EdgeSpeechTTS.audioCache.set(cacheKey, blob);
+      EdgeSpeechTTS.audioCacheBytes += blob.size;
       EdgeSpeechTTS.boundariesCache.set(cacheKey, boundaries);
+      EdgeSpeechTTS.trimAudioCache();
       return { blob, boundaries };
     })();
     EdgeSpeechTTS.inflight.set(cacheKey, promise);

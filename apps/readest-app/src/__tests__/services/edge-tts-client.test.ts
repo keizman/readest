@@ -11,6 +11,7 @@ type MockAudioData = {
 let createAudioDataBehavior = vi.fn<() => Promise<MockAudioData>>(() =>
   Promise.resolve({ data: new ArrayBuffer(8), boundaries: [] }),
 );
+let createAudioDataPayloads: Array<{ text: string }> = [];
 let parsedMarks: Array<{ name: string; text: string; language: string }> = [];
 
 // --- Mocks ---
@@ -26,7 +27,10 @@ vi.mock('@/libs/edgeTTS', () => {
     EdgeSpeechTTS: class MockEdgeSpeechTTS {
       static voices = voices;
       create = vi.fn().mockImplementation(() => createBehavior());
-      createAudioData = vi.fn().mockImplementation(() => createAudioDataBehavior());
+      createAudioData = vi.fn().mockImplementation((payload: { text: string }) => {
+        createAudioDataPayloads.push(payload);
+        return createAudioDataBehavior();
+      });
     },
     EDGE_TTS_PROTOCOL: 'wss',
   };
@@ -75,6 +79,7 @@ describe('EdgeTTSClient', () => {
     createAudioDataBehavior = vi.fn<() => Promise<MockAudioData>>(() =>
       Promise.resolve({ data: new ArrayBuffer(8), boundaries: [] }),
     );
+    createAudioDataPayloads = [];
     parsedMarks = [];
     client = new EdgeTTSClient();
   });
@@ -480,6 +485,57 @@ describe('EdgeTTSClient', () => {
       await consumePreload(client, new AbortController().signal);
 
       expect(createAudioDataBehavior).not.toHaveBeenCalled();
+    });
+
+    test('ends playback immediately for ellipsis-only marks', async () => {
+      await client.init();
+      parsedMarks = [{ name: '0', text: '……', language: 'zh' }];
+      const events: { code: string }[] = [];
+      for await (const event of client.speak('<ssml/>', new AbortController().signal)) {
+        events.push(event);
+      }
+      expect(createAudioDataBehavior).not.toHaveBeenCalled();
+      expect(events).toEqual([{ code: 'end', message: 'Nothing to speak' }]);
+    });
+  });
+
+  describe('char batching preload', () => {
+    const consumePreload = async (c: EdgeTTSClient, signal: AbortSignal, startup = false) => {
+      for await (const _ of c.speak('<ssml/>', signal, true, startup)) {
+        void _;
+      }
+    };
+
+    test('merges marks under the char budget into one preload request', async () => {
+      await client.init();
+      parsedMarks = [
+        { name: '0', text: 'a'.repeat(20), language: 'en' },
+        { name: '1', text: 'b'.repeat(20), language: 'en' },
+      ];
+      await consumePreload(client, new AbortController().signal);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+      expect(createAudioDataPayloads[0]!.text.length).toBe(40);
+    });
+
+    test('uses a small first batch on startup preload', async () => {
+      await client.init();
+      parsedMarks = [
+        { name: '0', text: 'a'.repeat(30), language: 'en' },
+        { name: '1', text: 'b'.repeat(30), language: 'en' },
+        { name: '2', text: 'c'.repeat(30), language: 'en' },
+      ];
+      await consumePreload(client, new AbortController().signal, true);
+      expect(createAudioDataPayloads.map((p) => p.text.length)).toEqual([30, 60]);
+    });
+
+    test('splits marks that exceed the char budget', async () => {
+      await client.init();
+      parsedMarks = [
+        { name: '0', text: 'a'.repeat(80), language: 'en' },
+        { name: '1', text: 'b'.repeat(80), language: 'en' },
+      ];
+      await consumePreload(client, new AbortController().signal);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
     });
   });
 

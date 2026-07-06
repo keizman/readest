@@ -8,33 +8,38 @@ import { hasSpeakableText, parseSSMLMarks } from '@/utils/ssml';
 import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
-import { findSpeechBounds } from './pcm';
+import {
+  LONG_PAUSE_SEC,
+  MIN_COMPRESS_GAP_SEC,
+  SHORT_PAUSE_SEC,
+  findSpeechBounds,
+  planSilenceCompression,
+} from './pcm';
 import {
   calibrateVoiceRate,
   recordMeasuredDuration,
   recordProvisionalDuration,
 } from './ttsDuration';
+import { buildBatches, markSliceRangeSec, partitionBatch, rebaseBoundaries } from './ttsBatch';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
 
-// Playback pipeline: fetch MP3 (rendered at the playback rate via Edge's
-// pitch-preserving prosody rate, cached per rate) -> decode -> trim silence
-// (trailing edge capped at the last word so periods stay tight) -> schedule
-// gaplessly on the shared AudioContext. Marks are dispatched when a chunk
-// becomes AUDIBLE
-// (player chunk-start events ride source onended, which keeps working with
-// the screen off), not when it is fetched — schedule-ahead would otherwise
-// run foliate's mark cursor ahead of the voice and break prev/next/resume.
+// Playback pipeline: group sentence marks into Edge requests of up to ~120
+// chars (first request smaller for fast startup) -> fetch MP3 (rendered at the
+// playback rate via Edge's prosody rate, cached per combined text) -> decode
+// once per batch -> per-mark slice -> compress inter-word silences -> schedule
+// gaplessly on the shared AudioContext. Marks within a batch share one mp3 and
+// play with no inserted gap; a fixed pause is inserted after the last mark of
+// each batch. Marks dispatch when a chunk becomes AUDIBLE (chunk-start rides
+// source onended), not at fetch time.
 
-// Small natural pause between sentences, replacing Edge's baked-in ~300ms
-// trailing silence. Kept short so periods (。/.) flow instead of dragging;
-// divided by the playback rate so pauses shrink with speed (#2033's "gaps
-// don't scale" complaint).
-const INTER_SENTENCE_GAP_SEC = 0.06;
-// When trimming the trailing edge, keep this much audio past the last word
-// boundary. A sentence-final period renders as a long pause (plus a little
-// breath) that energy-based trimming keeps; capping at the last word is what
-// keeps periods tight.
-const TRAILING_KEEP_SEC = 0.08;
+// Fixed pause at every sentence/line chunk boundary (foliate splits at 。？！
+// and block/line breaks). Matches LONG_PAUSE_SEC so period/newline pacing
+// equals in-chunk sentence enders; scaled by playback rate (#2033).
+const INTER_SENTENCE_GAP_SEC = LONG_PAUSE_SEC;
+// Keep this much audio past the first/last word when trimming a chunk's edges,
+// so word onsets/releases are not clipped (not Edge's baked sentence tail).
+const EDGE_KEEP_SEC = 0.02;
+const TRAILING_KEEP_SEC = 0.02;
 const TICKS_PER_SECOND = 10_000_000;
 
 interface ChunkMeta {
@@ -216,7 +221,7 @@ export class EdgeTTSClient implements TTSClient {
     await this.#player.ensureContext();
     this.#isPlaying = true;
 
-    this.#runScheduler(speakableMarks, signal, generation, queue, chunkMeta);
+    this.#runScheduler(speakableMarks, signal, generation, queue, chunkMeta, startup);
 
     let abortHandler: (() => void) | null = null;
     try {
@@ -267,47 +272,41 @@ export class EdgeTTSClient implements TTSClient {
   }
 
   async *#preload(marks: TTSMark[], signal: AbortSignal, startup: boolean) {
-    // On first playback, block on only one sentence so speech starts quickly.
-    // All later look-ahead keeps the normal two-mark immediate window and the
-    // controller's existing multi-minute background cache.
+    // Preload by batch so LRU keys match playback requests. On startup block on
+    // one small batch; otherwise prefetch two batches before background fill.
+    const batches = buildBatches(marks, startup);
     const maxImmediate = startup ? 1 : 2;
-    for (let i = 0; i < Math.min(maxImmediate, marks.length); i++) {
-      if (signal.aborted) break;
-      const mark = marks[i]!;
-      const voiceId = await this.getVoiceIdFromLang(mark.language);
+    const preloadBatch = async (batch: TTSMark[]) => {
+      const voiceLang = batch[0]!.language;
+      const voiceId = await this.getVoiceIdFromLang(voiceLang);
       this.#currentVoiceId = voiceId;
+      const text = batch.map((m) => m.text).join('');
+      const audio = await this.#createAudioDataWithRetry(
+        this.getPayload(voiceLang, text, voiceId),
+        signal,
+      );
+      if (!audio) return;
+      const { perMark } = partitionBatch(batch, this.#applyRateToBoundaries(audio.boundaries));
+      for (let i = 0; i < batch.length; i++) {
+        this.#recordDurations(voiceId, batch[i]!.text, perMark[i] ?? []);
+      }
+    };
+    for (let i = 0; i < Math.min(maxImmediate, batches.length); i++) {
+      if (signal.aborted) break;
       try {
-        const audio = await this.#createAudioDataWithRetry(
-          this.getPayload(mark.language, mark.text, voiceId),
-          signal,
-        );
-        if (audio) {
-          this.#recordDurations(voiceId, mark.text, this.#applyRateToBoundaries(audio.boundaries));
-        }
+        await preloadBatch(batches[i]!);
       } catch (err) {
-        console.warn('Error preloading mark', i, err);
+        console.warn('Error preloading batch', i, err);
       }
     }
-    if (marks.length > maxImmediate) {
+    if (batches.length > maxImmediate) {
       (async () => {
-        for (let i = maxImmediate; i < marks.length; i++) {
-          const mark = marks[i]!;
+        for (let i = maxImmediate; i < batches.length; i++) {
+          if (signal.aborted) break;
           try {
-            if (signal.aborted) break;
-            const voiceId = await this.getVoiceIdFromLang(mark.language);
-            const audio = await this.#createAudioDataWithRetry(
-              this.getPayload(mark.language, mark.text, voiceId),
-              signal,
-            );
-            if (audio) {
-              this.#recordDurations(
-                voiceId,
-                mark.text,
-                this.#applyRateToBoundaries(audio.boundaries),
-              );
-            }
+            await preloadBatch(batches[i]!);
           } catch (err) {
-            console.warn('Error preloading mark (bg)', i, err);
+            console.warn('Error preloading batch (bg)', i, err);
           }
         }
       })();
@@ -328,75 +327,112 @@ export class EdgeTTSClient implements TTSClient {
     generation: number,
     queue: AsyncQueue<SpeakQueueEvent>,
     chunkMeta: ChunkMeta[],
+    startup: boolean,
   ): Promise<void> {
     const rate = this.#rate;
+    const finishSession = () => {
+      if (!signal.aborted && this.#activeGeneration === generation) {
+        this.#player.endSession(generation);
+      }
+    };
     try {
-      for (const mark of marks) {
-        if (signal.aborted || this.#activeGeneration !== generation) return;
-        // Voices resolve per mark: mixed-language sections speak (and record
-        // durations under) the voice actually used for each sentence.
-        const voiceId = await this.getVoiceIdFromLang(mark.language);
-        this.#speakingLang = mark.language;
+      const batches = buildBatches(marks, startup);
+      batchLoop: for (const batch of batches) {
+        if (signal.aborted || this.#activeGeneration !== generation) break batchLoop;
+        const voiceLang = batch[0]!.language;
+        const voiceId = await this.getVoiceIdFromLang(voiceLang);
+        this.#speakingLang = voiceLang;
         this.#currentVoiceId = voiceId;
-        const payload = this.getPayload(mark.language, mark.text, voiceId);
+        const batchText = batch.map((m) => m.text).join('');
+        const payload = this.getPayload(voiceLang, batchText, voiceId);
 
         let audio: { data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined;
         try {
           audio = await this.#createAudioDataWithRetry(payload, signal);
         } catch (error) {
           if (error instanceof Error && error.message === 'No audio data received.') {
-            console.warn('No audio data received for:', mark.text);
-            queue.push({ kind: 'chunk-skip', markName: mark.name });
+            console.warn('No audio data received for:', batchText);
+            for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
             continue;
           }
           const message = error instanceof Error ? error.message : String(error);
-          console.warn('TTS error for mark:', mark.text, message);
+          console.warn('TTS error for batch:', batchText, message);
           queue.push({ kind: 'error', message });
           return;
         }
-        if (!audio || signal.aborted || this.#activeGeneration !== generation) return;
-        // Server-rate boundaries feed the trailing-trim (they share the decoded
-        // buffer's timeline); the rate-1.0 copy feeds tracking + the timeline.
-        const boundaries = this.#applyRateToBoundaries(audio.boundaries);
-        this.#recordDurations(voiceId, mark.text, boundaries);
+        if (!audio || signal.aborted || this.#activeGeneration !== generation) break batchLoop;
 
-        let prepared: {
-          buffer: TTSAudioBuffer;
-          trimStartSec: number;
-          trimmedDurationSec: number;
-        };
+        let decoded: TTSAudioBuffer;
         try {
-          prepared = await this.#prepareChunkBuffer(audio.data, audio.boundaries, rate);
+          decoded = await this.#player.decode(audio.data);
         } catch (error) {
-          // Malformed MP3 must not dead-end the session: same UX as no-audio.
-          console.warn('Failed to decode TTS audio for:', mark.text, error);
-          queue.push({ kind: 'chunk-skip', markName: mark.name });
+          console.warn('Failed to decode TTS audio for:', batchText, error);
+          for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
           continue;
         }
-        this.#recordDurations(voiceId, mark.text, boundaries, prepared.trimmedDurationSec);
 
-        const ready = await this.#player.waitUntilReady(generation);
-        if (!ready || signal.aborted) return;
-        chunkMeta.push({
-          mark,
-          boundaries,
-          trimStartSec: prepared.trimStartSec,
-          trimmedDurationSec: prepared.trimmedDurationSec,
-        });
-        this.#player.scheduleChunk(generation, prepared.buffer, {
-          trimStartSec: prepared.trimStartSec,
-          mediaScale: prepared.trimmedDurationSec / prepared.buffer.duration,
-          gapSec: INTER_SENTENCE_GAP_SEC / rate,
-        });
-      }
-      if (!signal.aborted && this.#activeGeneration === generation) {
-        // Fires session-end synchronously when every mark was skipped or the
-        // last chunk already ended, so the session always terminates.
-        this.#player.endSession(generation);
+        const rawBoundaries = this.#applyRateToBoundaries(audio.boundaries);
+        const { perMark, startSec } = partitionBatch(batch, rawBoundaries);
+
+        for (let mi = 0; mi < batch.length; mi++) {
+          if (signal.aborted || this.#activeGeneration !== generation) break batchLoop;
+          const mark = batch[mi]!;
+          const { startSec: sliceStart, endSec: sliceEnd } = markSliceRangeSec(
+            batch,
+            startSec,
+            mi,
+            decoded.duration,
+          );
+          const sampleRate = decoded.sampleRate;
+          const startSample = Math.floor(sliceStart * sampleRate);
+          const endSample = Math.min(
+            decoded.length,
+            Math.max(startSample + 1, Math.ceil(sliceEnd * sampleRate)),
+          );
+          const slice = decoded.getChannelData(0).subarray(startSample, endSample);
+          const markBoundaries = rebaseBoundaries(perMark[mi] ?? [], sliceStart);
+
+          let prepared: {
+            buffer: TTSAudioBuffer;
+            boundaries: TTSWordBoundary[];
+            trimStartSec: number;
+            trimmedDurationSec: number;
+          };
+          try {
+            prepared = await this.#prepareSamplesBuffer(slice, sampleRate, markBoundaries, rate);
+          } catch (error) {
+            console.warn('Failed to prepare TTS audio for:', mark.text, error);
+            queue.push({ kind: 'chunk-skip', markName: mark.name });
+            continue;
+          }
+
+          const boundaries = this.#applyRateToBoundaries(prepared.boundaries);
+          this.#recordDurations(voiceId, mark.text, boundaries, prepared.trimmedDurationSec);
+
+          const ready = await this.#player.waitUntilReady(generation);
+          if (!ready || signal.aborted) break batchLoop;
+          chunkMeta.push({
+            mark,
+            boundaries,
+            trimStartSec: prepared.trimStartSec,
+            trimmedDurationSec: prepared.trimmedDurationSec,
+          });
+          const gapSec = mi < batch.length - 1 ? 0 : INTER_SENTENCE_GAP_SEC / rate;
+          this.#player.scheduleChunk(generation, prepared.buffer, {
+            trimStartSec: prepared.trimStartSec,
+            mediaScale: prepared.trimmedDurationSec / prepared.buffer.duration,
+            gapSec,
+          });
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       queue.push({ kind: 'error', message });
+    } finally {
+      // Always close the session when the scheduler exits — including when every
+      // mark was skipped (e.g. punctuation-only ellipsis) or the loop broke
+      // early — so auto-advance never dead-ends with controls stuck playing.
+      finishSession();
     }
   }
 
@@ -404,43 +440,85 @@ export class EdgeTTSClient implements TTSClient {
     data: ArrayBuffer,
     boundaries: TTSWordBoundary[],
     rate: number,
-  ): Promise<{ buffer: TTSAudioBuffer; trimStartSec: number; trimmedDurationSec: number }> {
-    // decodeAudioData resamples to the context rate (44.1/48kHz on real
-    // devices, not the stream's 24kHz) — all math below uses the decoded
-    // buffer's sampleRate. Speed is rendered server-side (Edge prosody rate,
-    // pitch-preserving), so there is no client-side time-stretch: the buffer
-    // already plays at `rate`. Trim offsets and duration are scaled back to
-    // rate-1.0 media time so word boundaries, the timeline, and mediaScale keep
-    // their rate-1.0 contract (mediaScale = rate-1.0 trimmed / output = rate).
+  ): Promise<{
+    buffer: TTSAudioBuffer;
+    boundaries: TTSWordBoundary[];
+    trimStartSec: number;
+    trimmedDurationSec: number;
+  }> {
     const decoded = await this.#player.decode(data);
-    const sampleRate = decoded.sampleRate;
-    const channel = decoded.getChannelData(0);
-    const bounds = findSpeechBounds(channel, sampleRate);
-    // Cap the trailing edge at the last word boundary: a sentence-final period
-    // renders as a long pause energy-trimming keeps, and cutting right after the
-    // last word is what makes periods flow (the long-句号-pause fix). These
-    // boundaries are in the server-rendered (rate) audio timeline, matching the
-    // decoded buffer.
-    let endSec = bounds.endSec;
-    const lastBoundary = boundaries[boundaries.length - 1];
-    if (lastBoundary) {
-      const speechEndSec =
-        (lastBoundary.offset + lastBoundary.duration) / TICKS_PER_SECOND + TRAILING_KEEP_SEC;
-      endSec = Math.min(endSec, speechEndSec);
-    }
-    const startSample = Math.floor(bounds.startSec * sampleRate);
-    const endSample = Math.min(
-      channel.length,
-      Math.max(startSample + 1, Math.ceil(endSec * sampleRate)),
+    return this.#prepareSamplesBuffer(
+      decoded.getChannelData(0),
+      decoded.sampleRate,
+      boundaries,
+      rate,
     );
-    // A subarray is a view; createMonoBuffer copies, so no mutation reaches the
-    // decoded buffer.
-    const trimmed = channel.subarray(startSample, endSample);
-    const buffer = await this.#player.createMonoBuffer(trimmed, sampleRate);
+  }
+
+  async #prepareSamplesBuffer(
+    channel: Float32Array,
+    sampleRate: number,
+    boundaries: TTSWordBoundary[],
+    rate: number,
+  ): Promise<{
+    buffer: TTSAudioBuffer;
+    boundaries: TTSWordBoundary[];
+    trimStartSec: number;
+    trimmedDurationSec: number;
+  }> {
+    if (boundaries.length === 0) {
+      const bounds = findSpeechBounds(channel, sampleRate);
+      const startSample = Math.floor(bounds.startSec * sampleRate);
+      const endSample = Math.min(
+        channel.length,
+        Math.max(startSample + 1, Math.ceil(bounds.endSec * sampleRate)),
+      );
+      const trimmed = channel.subarray(startSample, endSample);
+      const buffer = await this.#player.createMonoBuffer(trimmed, sampleRate);
+      return {
+        buffer,
+        boundaries,
+        trimStartSec: (startSample / sampleRate) * rate,
+        trimmedDurationSec: (trimmed.length / sampleRate) * rate,
+      };
+    }
+
+    const secToSamples = (sec: number) => Math.round(sec * sampleRate);
+    const wordStarts = boundaries.map((b) =>
+      Math.floor((b.offset / TICKS_PER_SECOND) * sampleRate),
+    );
+    const wordEnds = boundaries.map((b) =>
+      Math.ceil(((b.offset + b.duration) / TICKS_PER_SECOND) * sampleRate),
+    );
+    const plan = planSilenceCompression(
+      wordStarts,
+      wordEnds,
+      boundaries.map((b) => b.text),
+      channel.length,
+      secToSamples(EDGE_KEEP_SEC),
+      secToSamples(TRAILING_KEEP_SEC),
+      secToSamples(MIN_COMPRESS_GAP_SEC),
+      secToSamples(SHORT_PAUSE_SEC),
+      secToSamples(LONG_PAUSE_SEC),
+    );
+
+    const out = new Float32Array(plan.outLength);
+    let write = 0;
+    for (const [s, e] of plan.segments) {
+      const seg = channel.subarray(Math.max(0, s), Math.min(channel.length, e));
+      out.set(seg, write);
+      write += seg.length;
+    }
+    const buffer = await this.#player.createMonoBuffer(out, sampleRate);
+    const remapped = boundaries.map((b, i) => ({
+      ...b,
+      offset: (plan.wordStartsOut[i]! / sampleRate) * TICKS_PER_SECOND,
+    }));
     return {
       buffer,
-      trimStartSec: (startSample / sampleRate) * rate,
-      trimmedDurationSec: (trimmed.length / sampleRate) * rate,
+      boundaries: remapped,
+      trimStartSec: 0,
+      trimmedDurationSec: (plan.outLength / sampleRate) * rate,
     };
   }
 

@@ -115,10 +115,15 @@ describe('EdgeTTSClient Web Audio playback', () => {
     return client;
   };
 
-  const collectSpeak = (client: InstanceType<EdgeClientClass>, signal: AbortSignal) => {
+  const collectSpeak = (
+    client: InstanceType<EdgeClientClass>,
+    signal: AbortSignal,
+    options: { preload?: boolean; startup?: boolean } = {},
+  ) => {
+    const { preload = false, startup = false } = options;
     const events: TTSMessageEvent[] = [];
     const done = (async () => {
-      for await (const event of client.speak('<ssml/>', signal)) {
+      for await (const event of client.speak('<ssml/>', signal, preload, startup)) {
         events.push(event);
       }
     })();
@@ -126,6 +131,36 @@ describe('EdgeTTSClient Web Audio playback', () => {
   };
 
   const ctx = () => FakeAudioContext.instances[0]!;
+
+  test('ellipsis-only paragraph ends without audio so playback can advance', async () => {
+    parsedMarks = [{ name: '0', text: '……', language: 'zh' }];
+    const client = await startClient();
+    let fetchCount = 0;
+    createAudioDataBehavior = async () => {
+      fetchCount++;
+      return audioOf(1);
+    };
+    const { events, done } = collectSpeak(client, new AbortController().signal);
+    await done;
+    expect(fetchCount).toBe(0);
+    expect(FakeAudioContext.instances).toHaveLength(0);
+    expect(events.at(-1)?.code).toBe('end');
+  });
+
+  test('batches short marks into one Edge request', async () => {
+    const client = await startClient();
+    let fetchCount = 0;
+    createAudioDataBehavior = async () => {
+      fetchCount++;
+      return audioOf(1);
+    };
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await ctx().advanceTo(5);
+    await done;
+    expect(fetchCount).toBe(1);
+    expect(ctx().sources.length).toBe(2);
+  });
 
   test('plays marks gaplessly: boundary per audible chunk, one final end', async () => {
     const client = await startClient();
@@ -151,13 +186,17 @@ describe('EdgeTTSClient Web Audio playback', () => {
   });
 
   test('chunks are scheduled with a rate-scaled gap and no element restarts', async () => {
+    parsedMarks = [
+      { name: '0', text: 'a'.repeat(80), language: 'en' },
+      { name: '1', text: 'b'.repeat(80), language: 'en' },
+    ];
     const client = await startClient();
-    await client.setRate(1); // gap = 0.06 / 1
+    await client.setRate(1); // gap = LONG_PAUSE_SEC / 1
     const { done } = collectSpeak(client, new AbortController().signal);
     await flush();
     await flush();
     const [first, second] = ctx().sources;
-    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.06, 5);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.065, 5);
     await ctx().advanceTo(5);
     await done;
   });
@@ -213,12 +252,17 @@ describe('EdgeTTSClient Web Audio playback', () => {
   });
 
   test('a no-audio mark is skipped and the session continues', async () => {
+    parsedMarks = [
+      { name: '0', text: 'a'.repeat(80), language: 'en' },
+      { name: '1', text: 'Second sentence.', language: 'en' },
+    ];
     createAudioDataBehavior = async (text: string) => {
-      if (text === 'First sentence.') throw new Error('No audio data received.');
+      if (text.length === 80) throw new Error('No audio data received.');
       return audioOf(1);
     };
     const client = await startClient();
-    const { events, done } = collectSpeak(client, new AbortController().signal);
+    // startup splits into separate batches so the 80-char failure is isolated
+    const { events, done } = collectSpeak(client, new AbortController().signal, { startup: true });
     await flush();
     await flush();
     await ctx().advanceTo(5);
@@ -229,9 +273,13 @@ describe('EdgeTTSClient Web Audio playback', () => {
   });
 
   test('a decode failure is treated like no-audio: warn, skip, continue', async () => {
+    parsedMarks = [
+      { name: '0', text: 'a'.repeat(80), language: 'en' },
+      { name: '1', text: 'Second sentence.', language: 'en' },
+    ];
     // The context exists once the scheduler's first fetch runs (ensureContext
     // precedes it), so the first fetch installs a decoder that fails exactly
-    // once — the first mark's decode dies, the second succeeds.
+    // once — the first batch's decode dies, the second succeeds.
     let installed = false;
     createAudioDataBehavior = async () => {
       if (!installed) {
@@ -250,7 +298,8 @@ describe('EdgeTTSClient Web Audio playback', () => {
       return audioOf(1);
     };
     const client = await startClient();
-    const { events, done } = collectSpeak(client, new AbortController().signal);
+    // startup keeps marks in separate batches so a failed decode skips only mark 0
+    const { events, done } = collectSpeak(client, new AbortController().signal, { startup: true });
     await flush();
     await flush();
     await ctx().advanceTo(10);
