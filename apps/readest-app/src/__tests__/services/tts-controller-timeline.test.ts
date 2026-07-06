@@ -113,13 +113,17 @@ vi.mock('foliate-js/tts.js', () => ({
 
 vi.mock('foliate-js/text-walker.js', () => ({ textWalker: vi.fn() }));
 
-vi.mock('@/utils/ssml', () => ({
-  filterSSMLWithLang: vi.fn((ssml: string) => ssml),
-  parseSSMLMarks: vi.fn(() => ({
-    plainText: 'hello',
-    marks: [{ offset: 0, name: '0', text: 'hello', language: 'en' }],
-  })),
-}));
+vi.mock('@/utils/ssml', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/ssml')>();
+  return {
+    ...actual,
+    filterSSMLWithLang: vi.fn((ssml: string) => ssml),
+    parseSSMLMarks: vi.fn(() => ({
+      plainText: 'hello',
+      marks: [{ offset: 0, name: '0', text: 'hello', language: 'en' }],
+    })),
+  };
+});
 
 vi.mock('@/utils/node', () => ({ createRejectFilter: vi.fn(() => () => 1) }));
 vi.mock('@/utils/lang', () => ({
