@@ -152,12 +152,12 @@ describe('EdgeTTSClient Web Audio playback', () => {
 
   test('chunks are scheduled with a rate-scaled gap and no element restarts', async () => {
     const client = await startClient();
-    await client.setRate(1); // gap = 0.15 / 1
+    await client.setRate(1); // gap = 0.06 / 1
     const { done } = collectSpeak(client, new AbortController().signal);
     await flush();
     await flush();
     const [first, second] = ctx().sources;
-    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.15, 5);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.06, 5);
     await ctx().advanceTo(5);
     await done;
   });

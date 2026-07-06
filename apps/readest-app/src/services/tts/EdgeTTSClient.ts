@@ -9,7 +9,6 @@ import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
 import { findSpeechBounds } from './pcm';
-import { timeStretch } from './timeStretch';
 import {
   calibrateVoiceRate,
   recordMeasuredDuration,
@@ -17,17 +16,25 @@ import {
 } from './ttsDuration';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
 
-// Playback pipeline: fetch MP3 (cached at rate 1.0) -> decode -> trim silence
-// -> WSOLA time-stretch to the playback rate -> schedule gaplessly on the
-// shared AudioContext. Marks are dispatched when a chunk becomes AUDIBLE
+// Playback pipeline: fetch MP3 (rendered at the playback rate via Edge's
+// pitch-preserving prosody rate, cached per rate) -> decode -> trim silence
+// (trailing edge capped at the last word so periods stay tight) -> schedule
+// gaplessly on the shared AudioContext. Marks are dispatched when a chunk
+// becomes AUDIBLE
 // (player chunk-start events ride source onended, which keeps working with
 // the screen off), not when it is fetched — schedule-ahead would otherwise
 // run foliate's mark cursor ahead of the voice and break prev/next/resume.
 
-// Natural pause between sentences, replacing Edge's baked-in ~300ms trailing
-// silence. Divided by the playback rate so pauses shrink with speed (#2033's
-// "gaps don't scale" complaint).
-const INTER_SENTENCE_GAP_SEC = 0.15;
+// Small natural pause between sentences, replacing Edge's baked-in ~300ms
+// trailing silence. Kept short so periods (。/.) flow instead of dragging;
+// divided by the playback rate so pauses shrink with speed (#2033's "gaps
+// don't scale" complaint).
+const INTER_SENTENCE_GAP_SEC = 0.06;
+// When trimming the trailing edge, keep this much audio past the last word
+// boundary. A sentence-final period renders as a long pause (plus a little
+// breath) that energy-based trimming keeps; capping at the last word is what
+// keeps periods tight.
+const TRAILING_KEEP_SEC = 0.08;
 const TICKS_PER_SECOND = 10_000_000;
 
 interface ChunkMeta {
@@ -96,9 +103,22 @@ export class EdgeTTSClient implements TTSClient {
   }
 
   getPayload = (lang: string, text: string, voiceId: string) => {
-    // Rate stays 1.0 so the MP3 cache is rate-independent; the playback rate
-    // is applied client-side via time-stretch.
-    return { lang, text, voice: voiceId, rate: 1.0, pitch: this.#pitch } as EdgeTTSPayload;
+    // Speed is rendered server-side via Edge's prosody rate, which changes
+    // tempo while preserving pitch. Applying it here instead of via a
+    // client-side time-stretch avoids the "warble"/fan artifact that
+    // overlap-add resampling produces. The MP3 cache key includes rate, so
+    // each speed keeps its own cached audio.
+    return { lang, text, voice: voiceId, rate: this.#rate, pitch: this.#pitch } as EdgeTTSPayload;
+  };
+
+  // Edge renders the MP3 at the playback rate (prosody rate), so its word
+  // boundaries live in that sped-up timeline. Scale them back to rate-1.0 media
+  // time — the reference frame the player's mediaScale and the section timeline
+  // both use.
+  #applyRateToBoundaries = (boundaries: TTSWordBoundary[]): TTSWordBoundary[] => {
+    const rate = this.#rate;
+    if (rate === 1) return boundaries;
+    return boundaries.map((b) => ({ ...b, offset: b.offset * rate, duration: b.duration * rate }));
   };
 
   // Edge TTS websocket requests fail intermittently; retry a few times before
@@ -261,7 +281,9 @@ export class EdgeTTSClient implements TTSClient {
           this.getPayload(mark.language, mark.text, voiceId),
           signal,
         );
-        if (audio) this.#recordDurations(voiceId, mark.text, audio.boundaries);
+        if (audio) {
+          this.#recordDurations(voiceId, mark.text, this.#applyRateToBoundaries(audio.boundaries));
+        }
       } catch (err) {
         console.warn('Error preloading mark', i, err);
       }
@@ -277,7 +299,13 @@ export class EdgeTTSClient implements TTSClient {
               this.getPayload(mark.language, mark.text, voiceId),
               signal,
             );
-            if (audio) this.#recordDurations(voiceId, mark.text, audio.boundaries);
+            if (audio) {
+              this.#recordDurations(
+                voiceId,
+                mark.text,
+                this.#applyRateToBoundaries(audio.boundaries),
+              );
+            }
           } catch (err) {
             console.warn('Error preloading mark (bg)', i, err);
           }
@@ -327,7 +355,10 @@ export class EdgeTTSClient implements TTSClient {
           return;
         }
         if (!audio || signal.aborted || this.#activeGeneration !== generation) return;
-        this.#recordDurations(voiceId, mark.text, audio.boundaries);
+        // Server-rate boundaries feed the trailing-trim (they share the decoded
+        // buffer's timeline); the rate-1.0 copy feeds tracking + the timeline.
+        const boundaries = this.#applyRateToBoundaries(audio.boundaries);
+        this.#recordDurations(voiceId, mark.text, boundaries);
 
         let prepared: {
           buffer: TTSAudioBuffer;
@@ -335,20 +366,20 @@ export class EdgeTTSClient implements TTSClient {
           trimmedDurationSec: number;
         };
         try {
-          prepared = await this.#prepareChunkBuffer(audio.data, rate);
+          prepared = await this.#prepareChunkBuffer(audio.data, audio.boundaries, rate);
         } catch (error) {
           // Malformed MP3 must not dead-end the session: same UX as no-audio.
           console.warn('Failed to decode TTS audio for:', mark.text, error);
           queue.push({ kind: 'chunk-skip', markName: mark.name });
           continue;
         }
-        this.#recordDurations(voiceId, mark.text, audio.boundaries, prepared.trimmedDurationSec);
+        this.#recordDurations(voiceId, mark.text, boundaries, prepared.trimmedDurationSec);
 
         const ready = await this.#player.waitUntilReady(generation);
         if (!ready || signal.aborted) return;
         chunkMeta.push({
           mark,
-          boundaries: audio.boundaries,
+          boundaries,
           trimStartSec: prepared.trimStartSec,
           trimmedDurationSec: prepared.trimmedDurationSec,
         });
@@ -371,30 +402,52 @@ export class EdgeTTSClient implements TTSClient {
 
   async #prepareChunkBuffer(
     data: ArrayBuffer,
+    boundaries: TTSWordBoundary[],
     rate: number,
   ): Promise<{ buffer: TTSAudioBuffer; trimStartSec: number; trimmedDurationSec: number }> {
     // decodeAudioData resamples to the context rate (44.1/48kHz on real
-    // devices, not the stream's 24kHz) — all math below must use the decoded
-    // buffer's sampleRate.
+    // devices, not the stream's 24kHz) — all math below uses the decoded
+    // buffer's sampleRate. Speed is rendered server-side (Edge prosody rate,
+    // pitch-preserving), so there is no client-side time-stretch: the buffer
+    // already plays at `rate`. Trim offsets and duration are scaled back to
+    // rate-1.0 media time so word boundaries, the timeline, and mediaScale keep
+    // their rate-1.0 contract (mediaScale = rate-1.0 trimmed / output = rate).
     const decoded = await this.#player.decode(data);
     const sampleRate = decoded.sampleRate;
     const channel = decoded.getChannelData(0);
     const bounds = findSpeechBounds(channel, sampleRate);
+    // Cap the trailing edge at the last word boundary: a sentence-final period
+    // renders as a long pause energy-trimming keeps, and cutting right after the
+    // last word is what makes periods flow (the long-句号-pause fix). These
+    // boundaries are in the server-rendered (rate) audio timeline, matching the
+    // decoded buffer.
+    let endSec = bounds.endSec;
+    const lastBoundary = boundaries[boundaries.length - 1];
+    if (lastBoundary) {
+      const speechEndSec =
+        (lastBoundary.offset + lastBoundary.duration) / TICKS_PER_SECOND + TRAILING_KEEP_SEC;
+      endSec = Math.min(endSec, speechEndSec);
+    }
     const startSample = Math.floor(bounds.startSec * sampleRate);
-    const endSample = Math.min(channel.length, Math.ceil(bounds.endSec * sampleRate));
-    // A subarray is a view; timeStretch never writes its input and
-    // createMonoBuffer copies, so no mutation can reach the decoded buffer.
+    const endSample = Math.min(
+      channel.length,
+      Math.max(startSample + 1, Math.ceil(endSec * sampleRate)),
+    );
+    // A subarray is a view; createMonoBuffer copies, so no mutation reaches the
+    // decoded buffer.
     const trimmed = channel.subarray(startSample, endSample);
-    const trimmedDurationSec = trimmed.length / sampleRate;
-    const samples = rate !== 1 ? timeStretch(trimmed, sampleRate, rate) : trimmed;
-    const buffer = await this.#player.createMonoBuffer(samples, sampleRate);
-    return { buffer, trimStartSec: startSample / sampleRate, trimmedDurationSec };
+    const buffer = await this.#player.createMonoBuffer(trimmed, sampleRate);
+    return {
+      buffer,
+      trimStartSec: (startSample / sampleRate) * rate,
+      trimmedDurationSec: (trimmed.length / sampleRate) * rate,
+    };
   }
 
   // Poll the audio clock (visual concern only, so rAF throttling with the
   // screen off is fine) and tell the controller which word is being spoken.
-  // The player reports original (rate-1.0) media time, so Edge's boundary
-  // ticks need no rescaling for trim or rate.
+  // The player reports original (rate-1.0) media time; boundaries were scaled
+  // to that same frame at fetch, so no rescaling is needed here.
   #startWordTracking(generation: number, chunkIndex: number, meta: ChunkMeta): void {
     this.#stopWordTracking();
     const controller = this.controller;
@@ -473,7 +526,7 @@ export class EdgeTTSClient implements TTSClient {
   }
 
   async setRate(rate: number) {
-    // Applied client-side via WSOLA time-stretch at schedule time; takes
+    // Rendered server-side via Edge's prosody rate (pitch-preserving); takes
     // effect on the next speak() session (the controller restarts playback on
     // rate changes).
     this.#rate = rate;
