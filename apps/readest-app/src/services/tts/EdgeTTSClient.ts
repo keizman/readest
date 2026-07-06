@@ -14,7 +14,13 @@ import { hasSpeakableText, isNoAudioSynthesisError, parseSSMLMarks } from '@/uti
 import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
-import { findSpeechBounds } from './pcm';
+import {
+  findSpeechBounds,
+  LONG_PAUSE_SEC,
+  MIN_COMPRESS_GAP_SEC,
+  planSilenceCompression,
+  SHORT_PAUSE_SEC,
+} from './pcm';
 import {
   calibrateVoiceRate,
   recordMeasuredDuration,
@@ -24,10 +30,12 @@ import { buildBatches, partitionBatch } from './ttsBatch';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
 
 // One Edge request is one immutable Web Audio source. Sentence boundaries are
-// metadata on that source, never PCM cut points. This preserves Edge's native
-// pacing and gives highlighting, the scrubber, and audio one shared clock.
-// Only batch-edge padding is trimmed before sources are scheduled back-to-back.
+// metadata on that source, never PCM cut points — highlighting, the scrubber,
+// and audio share one clock. Edge's baked inter-sentence silences are removed
+// via planSilenceCompression before scheduling; chunk boundaries stay gapSec 0.
 const BATCH_EDGE_KEEP_SEC = 0.06;
+const EDGE_KEEP_SEC = 0.02;
+const TRAILING_KEEP_SEC = 0.01;
 const TICKS_PER_SECOND = 10_000_000;
 
 interface BatchMarkMeta {
@@ -467,17 +475,78 @@ export class EdgeTTSClient implements TTSClient {
       decoded.length,
       Math.max(startSample + 1, Math.ceil(trimEndRawSec * sampleRate)),
     );
-    trimStartRawSec = startSample / sampleRate;
-    trimEndRawSec = endSample / sampleRate;
-    const buffer = await this.#player.createMonoBuffer(
-      channel.subarray(startSample, endSample),
-      sampleRate,
+    const trimmed = channel.subarray(startSample, endSample);
+
+    if (rawBoundaries.length === 0) {
+      const buffer = await this.#player.createMonoBuffer(trimmed, sampleRate);
+      const trimmedDurationSec = (trimmed.length / sampleRate) * rate;
+      const totalChars = Math.max(
+        1,
+        batch.reduce((sum, mark) => sum + mark.text.length, 0),
+      );
+      let charsBefore = 0;
+      const starts = batch.map((mark) => {
+        const start = (trimmedDurationSec * charsBefore) / totalChars;
+        charsBefore += mark.text.length;
+        return start;
+      });
+      const marks = batch.map((mark, index): BatchMarkMeta => {
+        const startMediaSec = starts[index]!;
+        const endMediaSec = starts[index + 1] ?? trimmedDurationSec;
+        return {
+          mark,
+          boundaries: [],
+          startMediaSec,
+          durationMediaSec: Math.max(0, endMediaSec - startMediaSec),
+        };
+      });
+      return { buffer, marks, trimStartSec: 0, trimmedDurationSec };
+    }
+
+    const { perMark: perMarkRaw } = partitionBatch(batch, rawBoundaries);
+    const sentenceEndWordIndices = new Set<number>();
+    let wordIndex = 0;
+    for (let markIndex = 0; markIndex < batch.length - 1; markIndex++) {
+      const count = perMarkRaw[markIndex]!.length;
+      if (count > 0) sentenceEndWordIndices.add(wordIndex + count - 1);
+      wordIndex += count;
+    }
+
+    const secToSamples = (sec: number) => Math.round(sec * sampleRate);
+    const wordStarts = rawBoundaries.map(
+      (b) => Math.floor((b.offset / TICKS_PER_SECOND) * sampleRate) - startSample,
+    );
+    const wordEnds = rawBoundaries.map(
+      (b) => Math.ceil(((b.offset + b.duration) / TICKS_PER_SECOND) * sampleRate) - startSample,
+    );
+    const plan = planSilenceCompression(
+      wordStarts,
+      wordEnds,
+      rawBoundaries.map((b) => b.text),
+      trimmed.length,
+      secToSamples(EDGE_KEEP_SEC / rate),
+      secToSamples(TRAILING_KEEP_SEC / rate),
+      secToSamples(MIN_COMPRESS_GAP_SEC / rate),
+      secToSamples(SHORT_PAUSE_SEC / rate),
+      secToSamples(LONG_PAUSE_SEC / rate),
+      sentenceEndWordIndices,
     );
 
-    const trimStartSec = trimStartRawSec * rate;
-    const trimEndSec = trimEndRawSec * rate;
-    const trimmedDurationSec = trimEndSec - trimStartSec;
-    const { perMark } = partitionBatch(batch, rawBoundaries);
+    const out = new Float32Array(plan.outLength);
+    let write = 0;
+    for (const [s, e] of plan.segments) {
+      const seg = trimmed.subarray(Math.max(0, s), Math.min(trimmed.length, e));
+      out.set(seg, write);
+      write += seg.length;
+    }
+    const buffer = await this.#player.createMonoBuffer(out, sampleRate);
+    const trimmedDurationSec = (plan.outLength / sampleRate) * rate;
+
+    const remappedBoundaries = rawBoundaries.map((b, i) => ({
+      ...b,
+      offset: (plan.wordStartsOut[i]! / sampleRate) * TICKS_PER_SECOND,
+    }));
+    const { perMark } = partitionBatch(batch, remappedBoundaries);
     const totalChars = Math.max(
       1,
       batch.reduce((sum, mark) => sum + mark.text.length, 0),
@@ -485,10 +554,10 @@ export class EdgeTTSClient implements TTSClient {
     let charsBefore = 0;
     const starts = batch.map((mark, index) => {
       const exact = perMark[index]?.[0];
-      const fallback = trimStartSec + (trimmedDurationSec * charsBefore) / totalChars;
+      const fallback = (trimmedDurationSec * charsBefore) / totalChars;
       charsBefore += mark.text.length;
       const start = exact ? (exact.offset / TICKS_PER_SECOND) * rate : fallback;
-      return Math.min(Math.max(start, trimStartSec), trimEndSec);
+      return Math.min(Math.max(start, 0), trimmedDurationSec);
     });
     for (let i = 1; i < starts.length; i++) {
       starts[i] = Math.max(starts[i]!, starts[i - 1]!);
@@ -496,7 +565,7 @@ export class EdgeTTSClient implements TTSClient {
 
     const marks = batch.map((mark, index): BatchMarkMeta => {
       const startMediaSec = starts[index]!;
-      const endMediaSec = starts[index + 1] ?? trimEndSec;
+      const endMediaSec = starts[index + 1] ?? trimmedDurationSec;
       return {
         mark,
         boundaries: this.#applyRateToBoundaries(perMark[index] ?? []),
@@ -505,7 +574,7 @@ export class EdgeTTSClient implements TTSClient {
       };
     });
 
-    return { buffer, marks, trimStartSec, trimmedDurationSec };
+    return { buffer, marks, trimStartSec: 0, trimmedDurationSec };
   }
 
   #findMarkAtTime(

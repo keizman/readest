@@ -187,11 +187,12 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
 
     expect(ctx().sources).toHaveLength(1);
-    expect(ctx().sources[0]!.buffer!.duration).toBeCloseTo(1.52, 2);
+    // Baked 0.6s inter-sentence gap is removed; only speech + edge padding remains.
+    expect(ctx().sources[0]!.buffer!.duration).toBeCloseTo(0.83, 2);
     expect(client.getCurrentSpeakMark()?.name).toBe('0');
 
     const sourceStart = ctx().sources[0]!.startedAt!;
-    ctx().currentTime = sourceStart + 1.15;
+    ctx().currentTime = sourceStart + 0.55;
     runRaf();
 
     expect(client.getCurrentSpeakMark()?.name).toBe('1');
@@ -292,7 +293,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
     const sourceStart = ctx().sources[0]!.startedAt!;
     // Move only the audio clock. No source transition or onended callback is
     // involved: sentence progress is metadata on the continuous batch source.
-    ctx().currentTime = sourceStart + 1.15;
+    ctx().currentTime = sourceStart + 0.55;
     runRaf();
 
     expect(controller.dispatchSpeakMark).toHaveBeenLastCalledWith(parsedMarks[1]);
@@ -323,6 +324,22 @@ describe('EdgeTTSClient Web Audio playback', () => {
     ];
     const client = await startClient();
     await client.setRate(2);
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+    const [first, second] = ctx().sources;
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0, 5);
+    await ctx().advanceTo(5);
+    await done;
+  });
+
+  test('inter-batch scheduling stays gapless at 3.0x playback rate', async () => {
+    parsedMarks = [
+      { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
+      { name: '1', text: 'Second sentence.', language: 'en' },
+    ];
+    const client = await startClient();
+    await client.setRate(3);
     const { done } = collectSpeak(client, new AbortController().signal);
     await flush();
     await flush();

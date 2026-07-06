@@ -143,7 +143,7 @@ describe('planSilenceCompression', () => {
     expect(gapAfterCompression).toBe(shortKeep);
   });
 
-  test('uses the long pause after a period within the chunk', () => {
+  test('removes the pause after a period within the chunk', () => {
     const bakedGap = word1Start - word0End;
     const plan = planSilenceCompression(
       [word0Start, word1Start],
@@ -158,8 +158,28 @@ describe('planSilenceCompression', () => {
     );
     const gapAfterCompression =
       plan.wordStartsOut[1]! - (plan.wordStartsOut[0]! + (word0End - word0Start));
-    expect(gapAfterCompression).toBe(longKeep);
-    expect(bakedGap).toBeGreaterThan(longKeep);
+    expect(gapAfterCompression).toBe(0);
+    expect(bakedGap).toBeGreaterThan(0);
+  });
+
+  test('removes inter-mark gaps when sentenceEndWordIndices is set', () => {
+    const bakedGap = word1Start - word0End;
+    const plan = planSilenceCompression(
+      [word0Start, word1Start],
+      [word0End, word1End],
+      ['First', 'Second'],
+      total,
+      lead,
+      tail,
+      minGap,
+      shortKeep,
+      longKeep,
+      new Set([0]),
+    );
+    const gapAfterCompression =
+      plan.wordStartsOut[1]! - (plan.wordStartsOut[0]! + (word0End - word0Start));
+    expect(gapAfterCompression).toBe(0);
+    expect(bakedGap).toBeGreaterThan(0);
   });
 
   test('leaves natural short gaps untouched', () => {

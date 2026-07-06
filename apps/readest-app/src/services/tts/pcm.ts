@@ -58,8 +58,10 @@ export interface SilenceCompressionPlan {
 // comma/clause/sentence silences; the client normalizes them to these lengths.
 // EdgeTTSClient divides by the current playback rate when compressing decoded
 // buffers (prosody rate shrinks the MP3 timeline).
-export const SHORT_PAUSE_SEC = 0.009;
-export const LONG_PAUSE_SEC = 0.009;
+// Comma/clause pauses: minimal coarticulation only.
+export const SHORT_PAUSE_SEC = 0.003;
+// Sentence enders: no baked pause — next sentence should follow immediately.
+export const LONG_PAUSE_SEC = 0;
 // Gaps shorter than this are natural coarticulation between words.
 export const MIN_COMPRESS_GAP_SEC = 0.015;
 
@@ -92,6 +94,9 @@ export const planSilenceCompression = (
   minGapSamples: number,
   shortPauseSamples: number,
   longPauseSamples: number,
+  // Indices of words whose following gap is an inter-sentence boundary (mark tail),
+  // even when the boundary word text lacks trailing punctuation in Edge metadata.
+  sentenceEndWordIndices?: ReadonlySet<number>,
 ): SilenceCompressionPlan => {
   const n = wordStarts.length;
   if (n === 0) {
@@ -110,7 +115,9 @@ export const planSilenceCompression = (
     const gapLen = gapEnd - gapStart;
     // Only inter-word gaps are Edge punctuation pauses; trailing tail padding is kept.
     if (i + 1 >= n || gapLen <= minGapSamples) continue;
-    const kind = classifyWordTrailingPause(wordTexts[i] ?? '');
+    const kind = sentenceEndWordIndices?.has(i)
+      ? 'long'
+      : classifyWordTrailingPause(wordTexts[i] ?? '');
     if (kind === 'none' && gapLen <= minGapSamples * 4) continue;
     const target = kind === 'long' ? longPauseSamples : shortPauseSamples;
     const keep = Math.min(gapLen, target);
