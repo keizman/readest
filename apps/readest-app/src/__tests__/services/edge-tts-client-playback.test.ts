@@ -199,7 +199,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
     await flush();
     const [first, second] = ctx().sources;
-    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.032, 5);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.018, 5);
     await ctx().advanceTo(5);
     await done;
   });
@@ -215,7 +215,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
     await flush();
     const [first, second] = ctx().sources;
-    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.032 / 2, 5);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.018 / 2, 5);
     await ctx().advanceTo(5);
     await done;
   });
