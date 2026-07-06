@@ -41,13 +41,17 @@ vi.mock('foliate-js/overlayer.js', () => ({
   },
 }));
 
-vi.mock('@/utils/ssml', () => ({
-  filterSSMLWithLang: vi.fn((ssml: string) => ssml),
-  parseSSMLMarks: vi.fn((ssml: string) => ({
-    plainText: ssml ? 'hello' : '',
-    marks: ssml ? [{ offset: 0, name: '0', text: 'hello', language: 'en' }] : [],
-  })),
-}));
+vi.mock('@/utils/ssml', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/ssml')>();
+  return {
+    ...actual,
+    filterSSMLWithLang: vi.fn((ssml: string) => ssml),
+    parseSSMLMarks: vi.fn((ssml: string) => ({
+      plainText: ssml ? 'hello' : '',
+      marks: ssml ? [{ offset: 0, name: '0', text: 'hello', language: 'en' }] : [],
+    })),
+  };
+});
 
 vi.mock('@/utils/node', () => ({
   createRejectFilter: vi.fn(() => () => 1),
@@ -75,6 +79,8 @@ vi.mock('foliate-js/tts.js', () => ({
 vi.mock('foliate-js/text-walker.js', () => ({
   textWalker: vi.fn(),
 }));
+
+import { parseSSMLMarks } from '@/utils/ssml';
 
 // --- Helper: create mock TTS client ---
 
@@ -1223,6 +1229,16 @@ describe('TTSController', () => {
       await new Promise((r) => setTimeout(r, 150));
       expect(c.state).not.toBe('playing');
       expect(state.attempts).toBeLessThanOrEqual(10);
+    });
+  });
+
+  describe('unspeakable paragraphs', () => {
+    test('advances past a Chinese ellipsis paragraph', async () => {
+      vi.mocked(parseSSMLMarks).mockReturnValueOnce({ plainText: '……', marks: [] });
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+      controller.state = 'playing';
+      await controller.start();
+      await vi.waitFor(() => expect(forwardSpy).toHaveBeenCalled());
     });
   });
 

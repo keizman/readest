@@ -1,6 +1,6 @@
 import { FoliateView } from '@/types/view';
 import { AppService } from '@/types/system';
-import { filterSSMLWithLang, parseSSMLMarks } from '@/utils/ssml';
+import { filterSSMLWithLang, hasSpeakableText, parseSSMLMarks } from '@/utils/ssml';
 import { Overlayer } from 'foliate-js/overlayer.js';
 import {
   TTSGranularity,
@@ -754,14 +754,15 @@ export class TTSController extends EventTarget {
           this.#nossmlCnt = 0;
         }
 
-        const { plainText, marks } = parseSSMLMarks(ssml);
+        const { marks } = parseSSMLMarks(ssml);
+        const speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
         const startup = !oneTime && !this.#hasStartedPlayback;
         if (!oneTime) {
-          if (!plainText || marks.length === 0) {
+          if (speakableMarks.length === 0) {
             resolve();
             return await this.forward();
           } else {
-            this.dispatchSpeakMark(marks[0]);
+            this.dispatchSpeakMark(speakableMarks[0]);
           }
           await this.preloadSSML(ssml, signal, startup);
           this.#hasStartedPlayback = true;

@@ -48,7 +48,9 @@ export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
 
 /** True when text contains something a speech engine can pronounce. */
 export const hasSpeakableText = (text: string): boolean => {
-  const trimmed = text.trim();
+  // Strip zero-width/format chars that would defeat a punctuation-only test
+  // (e.g. U+200B before Chinese ellipsis) and strand auto-advance.
+  const trimmed = text.replace(/\p{Cf}/gu, '').trim();
   if (!trimmed || trimmed.length === 0) {
     return false;
   }

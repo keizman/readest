@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseSSMLMarks, parseSSMLLang } from '@/utils/ssml';
+import { hasSpeakableText, parseSSMLMarks, parseSSMLLang } from '@/utils/ssml';
 
 // SSML with xml:lang on speak element (typical output from TTS with lang)
 const ssmlWithLang = (lang: string, body: string) =>
@@ -179,6 +179,10 @@ describe('parseSSMLMarks', () => {
 
       expect(plainText).toBe('……');
       expect(marks).toHaveLength(0);
+    });
+
+    it('should skip zero-width-prefixed ellipsis', () => {
+      expect(hasSpeakableText('\u200b……')).toBe(false);
     });
 
     it('should handle empty SSML body', () => {
