@@ -33,6 +33,9 @@ vi.mock('@/libs/edgeTTS', () => {
       });
     },
     EDGE_TTS_PROTOCOL: 'wss',
+    TTS_AUDIO_CACHE_MAX_BYTES: 5 * 60 * 6 * 1024,
+    getTTSAudioCacheBytes: () => 0,
+    hasTTSPrefetchCapacity: () => true,
   };
 });
 
@@ -541,14 +544,26 @@ describe('EdgeTTSClient', () => {
       expect(createAudioDataPayloads.map((p) => p.text.length)).toEqual([30, 60]);
     });
 
-    test('splits marks that exceed the char budget', async () => {
+    test('merges marks past 120 chars when no punctuation boundary exists', async () => {
       await client.init();
       parsedMarks = [
         { name: '0', text: 'a'.repeat(80), language: 'en' },
         { name: '1', text: 'b'.repeat(80), language: 'en' },
       ];
       await consumePreload(client, new AbortController().signal);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+      expect(createAudioDataPayloads[0]!.text.length).toBe(160);
+    });
+
+    test('splits at punctuation after the 120-char budget is met', async () => {
+      await client.init();
+      parsedMarks = [
+        { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
+        { name: '1', text: 'Second sentence.', language: 'en' },
+      ];
+      await consumePreload(client, new AbortController().signal);
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
+      expect(createAudioDataPayloads[0]!.text.length).toBe(120);
     });
   });
 

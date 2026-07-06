@@ -1,7 +1,13 @@
 import { getUserLocale } from '@/utils/misc';
 import { isSameLang } from '@/utils/lang';
 import { TTSClient, TTSMessageEvent } from './TTSClient';
-import { EdgeSpeechTTS, EdgeTTSPayload, EDGE_TTS_PROTOCOL, TTSWordBoundary } from '@/libs/edgeTTS';
+import {
+  EdgeSpeechTTS,
+  EdgeTTSPayload,
+  EDGE_TTS_PROTOCOL,
+  hasTTSPrefetchCapacity,
+  TTSWordBoundary,
+} from '@/libs/edgeTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 import { AppService } from '@/types/system';
 import { hasSpeakableText, isNoAudioSynthesisError, parseSSMLMarks } from '@/utils/ssml';
@@ -274,9 +280,12 @@ export class EdgeTTSClient implements TTSClient {
   async *#preload(marks: TTSMark[], signal: AbortSignal, startup: boolean) {
     // Preload by batch so LRU keys match playback requests. On startup block on
     // one small batch; otherwise prefetch two batches before background fill.
+    // Stop once the shared LRU holds ~5 minutes of audio; playback resuming
+    // after a block will top it up again via preloadNextSSML.
     const batches = buildBatches(marks, startup);
     const maxImmediate = startup ? 1 : 2;
     const preloadBatch = async (batch: TTSMark[]) => {
+      if (!hasTTSPrefetchCapacity()) return;
       const voiceLang = batch[0]!.language;
       const voiceId = await this.getVoiceIdFromLang(voiceLang);
       this.#currentVoiceId = voiceId;
@@ -306,7 +315,7 @@ export class EdgeTTSClient implements TTSClient {
     if (batches.length > maxImmediate) {
       (async () => {
         for (let i = maxImmediate; i < batches.length; i++) {
-          if (signal.aborted) break;
+          if (signal.aborted || !hasTTSPrefetchCapacity()) break;
           try {
             await preloadBatch(batches[i]!);
           } catch (err) {

@@ -17,6 +17,7 @@ import {
 import { createRejectFilter } from '@/utils/node';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
+import { hasTTSPrefetchCapacity } from '@/libs/edgeTTS';
 import { EdgeTTSClient } from './EdgeTTSClient';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
@@ -638,7 +639,7 @@ export class TTSController extends EventTarget {
     maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
   ) {
     const tts = this.view.tts;
-    if (!tts) return;
+    if (!tts || !hasTTSPrefetchCapacity()) return;
 
     // Gather the next SSMLs and rewind synchronously to avoid a race condition:
     // tts.next() replaces TTS.#ranges (used by setMark() during playback).
@@ -664,6 +665,7 @@ export class TTSController extends EventTarget {
     // (gentler on the self-hosted TTS server). Callers don't await this, so the
     // sequential fill runs in the background without blocking playback.
     for (const raw of rawSsmls) {
+      if (!hasTTSPrefetchCapacity()) break;
       const ssml = await this.#preprocessSSML(raw);
       if (ssml) await this.preloadSSML(ssml, new AbortController().signal);
     }
@@ -692,7 +694,12 @@ export class TTSController extends EventTarget {
       }
       const sectionTTS = await this.#createTTS(doc, () => {});
       let raw = sectionTTS.start();
-      while (raw && paragraphCount < maxParagraphs && estimatedSeconds < targetSeconds) {
+      while (
+        raw &&
+        paragraphCount < maxParagraphs &&
+        estimatedSeconds < targetSeconds &&
+        hasTTSPrefetchCapacity()
+      ) {
         estimatedSeconds += estimateSpeechDuration(raw.replace(/<[^>]+>/g, ''), this.ttsRate);
         paragraphCount++;
         const ssml = await this.#preprocessSSML(raw);

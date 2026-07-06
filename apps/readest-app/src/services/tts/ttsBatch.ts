@@ -4,33 +4,61 @@ import { hasSpeakableText } from '@/utils/ssml';
 
 const TICKS_PER_SECOND = 10_000_000;
 
-// Group consecutive sentence-marks into one Edge request of up to this many
-// characters. Fewer round-trips and gapless audio within a batch.
+// Group consecutive sentence-marks into one Edge request. After the fast-start
+// batch, each request waits for at least this many characters and then extends
+// through the next trailing punctuation so Edge handles pauses server-side.
 export const BATCH_MAX_CHARS = 120;
 // First playback uses a smaller budget so one short sentence synthesizes fast.
 export const STARTUP_BATCH_MAX_CHARS = 40;
+
+// Trailing punctuation that ends a batch once BATCH_MAX_CHARS is met.
+const TRAILING_PUNCTUATION_RE = /[,.!?;:、，；：·•…\u2026\-–—。！？]["'»」』)\]""']*$/u;
+
+export const endsAtPunctuation = (text: string): boolean =>
+  TRAILING_PUNCTUATION_RE.test(text.trimEnd());
 
 export const buildBatches = (marks: TTSMark[], startup = false): TTSMark[][] => {
   const batches: TTSMark[][] = [];
   let current: TTSMark[] = [];
   let currentLen = 0;
   let currentLang: string | null = null;
+
+  const combinedText = () => current.map((m) => m.text).join('');
+  const flush = () => {
+    if (current.length === 0) return;
+    batches.push(current);
+    current = [];
+    currentLen = 0;
+    currentLang = null;
+  };
+
   for (const mark of marks) {
     if (!hasSpeakableText(mark.text)) continue;
     const len = mark.text.length;
     const sameLang = currentLang === null || mark.language === currentLang;
-    const maxChars = startup && batches.length === 0 ? STARTUP_BATCH_MAX_CHARS : BATCH_MAX_CHARS;
-    if (current.length > 0 && (!sameLang || currentLen + len > maxChars)) {
-      batches.push(current);
-      current = [];
-      currentLen = 0;
-      currentLang = null;
+
+    if (current.length > 0 && !sameLang) {
+      flush();
     }
+
+    const isFastStartBatch = startup && batches.length === 0;
+    if (isFastStartBatch) {
+      if (current.length > 0 && currentLen + len > STARTUP_BATCH_MAX_CHARS) {
+        flush();
+      }
+    } else if (
+      current.length > 0 &&
+      currentLen >= BATCH_MAX_CHARS &&
+      endsAtPunctuation(combinedText())
+    ) {
+      flush();
+    }
+
     current.push(mark);
     currentLen += len;
     currentLang = mark.language;
   }
-  if (current.length > 0) batches.push(current);
+  flush();
   return batches;
 };
 

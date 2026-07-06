@@ -23,6 +23,9 @@ vi.mock('@/libs/edgeTTS', () => {
         .mockImplementation((payload: { text: string }) => createAudioDataBehavior(payload.text));
     },
     EDGE_TTS_PROTOCOL: 'wss',
+    TTS_AUDIO_CACHE_MAX_BYTES: 5 * 60 * 6 * 1024,
+    getTTSAudioCacheBytes: () => 0,
+    hasTTSPrefetchCapacity: () => true,
   };
 });
 
@@ -187,8 +190,8 @@ describe('EdgeTTSClient Web Audio playback', () => {
 
   test('chunks are scheduled with a rate-scaled gap and no element restarts', async () => {
     parsedMarks = [
-      { name: '0', text: 'a'.repeat(80), language: 'en' },
-      { name: '1', text: 'b'.repeat(80), language: 'en' },
+      { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
+      { name: '1', text: 'Second sentence.', language: 'en' },
     ];
     const client = await startClient();
     await client.setRate(1); // gap = LONG_PAUSE_SEC / 1
@@ -203,8 +206,8 @@ describe('EdgeTTSClient Web Audio playback', () => {
 
   test('inter-batch gap shrinks when playback rate increases', async () => {
     parsedMarks = [
-      { name: '0', text: 'a'.repeat(80), language: 'en' },
-      { name: '1', text: 'b'.repeat(80), language: 'en' },
+      { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
+      { name: '1', text: 'Second sentence.', language: 'en' },
     ];
     const client = await startClient();
     await client.setRate(2);

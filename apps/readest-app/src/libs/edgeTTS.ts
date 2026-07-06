@@ -352,9 +352,18 @@ export type EDGE_TTS_PROTOCOL = 'wss' | 'https';
 // 48 kbit/s mono mp3 ≈ 6 KiB/s — retain ~5 minutes of synthesized audio.
 export const TTS_AUDIO_CACHE_MAX_BYTES = 5 * 60 * 6 * 1024;
 
+export const getTTSAudioCacheBytes = (): number => EdgeSpeechTTS.getAudioCacheBytes();
+
+export const hasTTSPrefetchCapacity = (): boolean =>
+  EdgeSpeechTTS.getAudioCacheBytes() < TTS_AUDIO_CACHE_MAX_BYTES;
+
 export class EdgeSpeechTTS {
   static voices = genVoiceList(EDGE_TTS_VOICES);
   private static audioCacheBytes = 0;
+
+  static getAudioCacheBytes(): number {
+    return EdgeSpeechTTS.audioCacheBytes;
+  }
   private static onAudioCacheEvict = (key: string, blob: Blob) => {
     EdgeSpeechTTS.audioCacheBytes = Math.max(0, EdgeSpeechTTS.audioCacheBytes - blob.size);
     EdgeSpeechTTS.boundariesCache.delete(key);

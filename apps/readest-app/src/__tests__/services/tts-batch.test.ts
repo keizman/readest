@@ -4,6 +4,7 @@ import {
   BATCH_MAX_CHARS,
   STARTUP_BATCH_MAX_CHARS,
   buildBatches,
+  endsAtPunctuation,
   partitionBatch,
 } from '@/services/tts/ttsBatch';
 import { TTSMark } from '@/services/tts/types';
@@ -22,9 +23,21 @@ describe('buildBatches', () => {
     expect(batches[0]!.map((m) => m.text).join('').length).toBe(100);
   });
 
-  test('splits when the char budget is exceeded', () => {
+  test('keeps growing past 120 chars until trailing punctuation', () => {
     const batches = buildBatches([mark('0', 'a'.repeat(80)), mark('1', 'b'.repeat(80))]);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.map((m) => m.text).join('').length).toBe(160);
+  });
+
+  test('closes a batch once it reaches 120 chars at punctuation', () => {
+    const batches = buildBatches([
+      mark('0', `${'a'.repeat(119)},`),
+      mark('1', 'Next sentence.'),
+      mark('2', 'Another one.'),
+    ]);
     expect(batches).toHaveLength(2);
+    expect(batches[0]!.map((m) => m.text).join('').length).toBe(120);
+    expect(endsAtPunctuation(batches[0]!.map((m) => m.text).join(''))).toBe(true);
   });
 
   test('uses a smaller first batch on startup', () => {
