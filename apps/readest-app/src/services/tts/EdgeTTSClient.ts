@@ -26,17 +26,23 @@ import {
   recordMeasuredDuration,
   recordProvisionalDuration,
 } from './ttsDuration';
-import { buildBatches, markSliceRangeSec, partitionBatch, rebaseBoundaries } from './ttsBatch';
+import {
+  buildBatches,
+  markSliceRangeSec,
+  markSpeechEndSec,
+  partitionBatch,
+  rebaseBoundaries,
+} from './ttsBatch';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
 
 // Playback pipeline: group sentence marks into Edge requests of up to ~120
 // chars (first request smaller for fast startup) -> fetch MP3 (rendered at the
 // playback rate via Edge's prosody rate, cached per combined text) -> decode
 // once per batch -> per-mark slice -> compress inter-word silences -> schedule
-// gaplessly on the shared AudioContext. Marks within a batch share one mp3 and
-// play with no inserted gap; a fixed pause is inserted after the last mark of
-// each batch. Marks dispatch when a chunk becomes AUDIBLE (chunk-start rides
-// source onended), not at fetch time.
+// gaplessly on the shared AudioContext. Marks within a batch share one mp3;
+// each sentence chunk gets a fixed client-side gap after its trimmed speech
+// (Edge's variable inter-sentence tail is cut off the slice). Marks dispatch
+// when a chunk becomes AUDIBLE (chunk-start rides source onended), not at fetch.
 
 // Fixed pause at every sentence/line chunk boundary (foliate splits at 。？！
 // and block/line breaks). Matches LONG_PAUSE_SEC so period/newline pacing
@@ -401,11 +407,17 @@ export class EdgeTTSClient implements TTSClient {
         for (let mi = 0; mi < batch.length; mi++) {
           if (signal.aborted || this.#activeGeneration !== generation) break batchLoop;
           const mark = batch[mi]!;
-          const { startSec: sliceStart, endSec: sliceEnd } = markSliceRangeSec(
+          const { startSec: sliceStart, endSec: sliceEndRaw } = markSliceRangeSec(
             batch,
             startSec,
             mi,
             decoded.duration,
+          );
+          const markBoundariesRaw = perMark[mi] ?? [];
+          const sliceEnd = markSpeechEndSec(
+            markBoundariesRaw,
+            sliceEndRaw,
+            TRAILING_KEEP_SEC / rate,
           );
           const sampleRate = decoded.sampleRate;
           const startSample = Math.floor(sliceStart * sampleRate);
@@ -414,7 +426,7 @@ export class EdgeTTSClient implements TTSClient {
             Math.max(startSample + 1, Math.ceil(sliceEnd * sampleRate)),
           );
           const slice = decoded.getChannelData(0).subarray(startSample, endSample);
-          const markBoundaries = rebaseBoundaries(perMark[mi] ?? [], sliceStart);
+          const markBoundaries = rebaseBoundaries(markBoundariesRaw, sliceStart);
 
           let prepared: {
             buffer: TTSAudioBuffer;
@@ -441,7 +453,7 @@ export class EdgeTTSClient implements TTSClient {
             trimStartSec: prepared.trimStartSec,
             trimmedDurationSec: prepared.trimmedDurationSec,
           });
-          const gapSec = mi < batch.length - 1 ? 0 : INTER_SENTENCE_GAP_SEC / rate;
+          const gapSec = INTER_SENTENCE_GAP_SEC / rate;
           this.#player.scheduleChunk(generation, prepared.buffer, {
             trimStartSec: prepared.trimStartSec,
             mediaScale: prepared.trimmedDurationSec / prepared.buffer.duration,

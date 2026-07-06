@@ -28,4 +28,7 @@ export type TTSMark = {
   name: string;
   text: string;
   language: string;
+  // Foliate range captured while the TTS iterator points at this mark's
+  // paragraph. Required when marks span multiple paragraphs in one batch.
+  range?: Range;
 };

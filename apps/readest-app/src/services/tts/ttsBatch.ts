@@ -17,26 +17,66 @@ const TRAILING_PUNCTUATION_RE = /[,.!?;:、，；：·•…\u2026\-–—。！
 export const endsAtPunctuation = (text: string): boolean =>
   TRAILING_PUNCTUATION_RE.test(text.trimEnd());
 
-// Pull more foliate paragraphs while the trailing Edge batch is still shorter
-// than BATCH_MAX_CHARS or lacks a closing punctuation boundary.
+const combinedText = (marks: TTSMark[]) => marks.map((m) => m.text).join('');
+
+const appendMarks = (batches: TTSMark[][], marks: TTSMark[], startup: boolean): void => {
+  if (marks.length === 0) return;
+  batches.push(...buildBatches(marks, startup));
+};
+
+// Peel the latency-sensitive first batch, then batch the remainder at >=120.
+const peelStartupBatch = (marks: TTSMark[]): { first: TTSMark[]; rest: TTSMark[] } => {
+  const speakable = marks.filter((m) => hasSpeakableText(m.text));
+  if (speakable.length === 0) return { first: [], rest: [] };
+
+  const first: TTSMark[] = [];
+  let len = 0;
+  let i = 0;
+  for (; i < speakable.length; i++) {
+    const mark = speakable[i]!;
+    const markLen = mark.text.length;
+    if (first.length > 0 && len + markLen > STARTUP_BATCH_MAX_CHARS) break;
+    first.push(mark);
+    len += markLen;
+  }
+  return { first, rest: speakable.slice(i) };
+};
+
+// True when any post-startup batch is still under BATCH_MAX_CHARS (except EOF).
 export const shouldCollectMoreParagraphs = (batches: TTSMark[][], startup: boolean): boolean => {
   if (batches.length === 0) return false;
+
+  const startIdx = startup && batches.length > 0 ? 1 : 0;
+  for (let i = startIdx; i < batches.length; i++) {
+    const text = combinedText(batches[i]!);
+    if (text.length < BATCH_MAX_CHARS) return true;
+    if (!endsAtPunctuation(text)) return true;
+  }
+
   const last = batches[batches.length - 1]!;
-  const lastText = last.map((m) => m.text).join('');
-  const lastLen = lastText.length;
-  if (startup && batches.length === 1 && lastLen < BATCH_MAX_CHARS) return true;
-  if (lastLen < BATCH_MAX_CHARS) return true;
+  const lastText = combinedText(last);
+  if (lastText.length < BATCH_MAX_CHARS) return true;
   if (!endsAtPunctuation(lastText)) return true;
   return false;
 };
 
 export const buildBatches = (marks: TTSMark[], startup = false): TTSMark[][] => {
+  const speakable = marks.filter((m) => hasSpeakableText(m.text));
+  if (speakable.length === 0) return [];
+
+  if (startup) {
+    const { first, rest } = peelStartupBatch(speakable);
+    const batches: TTSMark[][] = [];
+    if (first.length > 0) batches.push(first);
+    appendMarks(batches, rest, false);
+    return batches;
+  }
+
   const batches: TTSMark[][] = [];
   let current: TTSMark[] = [];
   let currentLen = 0;
   let currentLang: string | null = null;
 
-  const combinedText = () => current.map((m) => m.text).join('');
   const flush = () => {
     if (current.length === 0) return;
     batches.push(current);
@@ -45,8 +85,7 @@ export const buildBatches = (marks: TTSMark[], startup = false): TTSMark[][] => 
     currentLang = null;
   };
 
-  for (const mark of marks) {
-    if (!hasSpeakableText(mark.text)) continue;
+  for (const mark of speakable) {
     const len = mark.text.length;
     const sameLang = currentLang === null || mark.language === currentLang;
 
@@ -54,15 +93,10 @@ export const buildBatches = (marks: TTSMark[], startup = false): TTSMark[][] => 
       flush();
     }
 
-    const isFastStartBatch = startup && batches.length === 0;
-    if (isFastStartBatch) {
-      if (current.length > 0 && currentLen + len > STARTUP_BATCH_MAX_CHARS) {
-        flush();
-      }
-    } else if (
+    if (
       current.length > 0 &&
       currentLen >= BATCH_MAX_CHARS &&
-      endsAtPunctuation(combinedText())
+      endsAtPunctuation(combinedText(current))
     ) {
       flush();
     }
@@ -118,6 +152,17 @@ export const markSliceRangeSec = (
       ? (startSec[markIndex + 1] ?? bufferDurationSec)
       : bufferDurationSec;
   return { startSec: start, endSec: Math.min(end, bufferDurationSec) };
+};
+
+// End of spoken content for a mark (excludes Edge's baked inter-sentence tail).
+export const markSpeechEndSec = (
+  perMarkBoundaries: TTSWordBoundary[],
+  sliceEndSec: number,
+  trailingKeepSec: number,
+): number => {
+  if (perMarkBoundaries.length === 0) return sliceEndSec;
+  const last = perMarkBoundaries[perMarkBoundaries.length - 1]!;
+  return Math.min(sliceEndSec, (last.offset + last.duration) / TICKS_PER_SECOND + trailingKeepSec);
 };
 
 export const rebaseBoundaries = (

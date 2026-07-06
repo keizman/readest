@@ -5,6 +5,7 @@ import {
   STARTUP_BATCH_MAX_CHARS,
   buildBatches,
   endsAtPunctuation,
+  markSpeechEndSec,
   partitionBatch,
   shouldCollectMoreParagraphs,
 } from '@/services/tts/ttsBatch';
@@ -52,6 +53,18 @@ describe('buildBatches', () => {
     expect(BATCH_MAX_CHARS).toBe(120);
   });
 
+  test('startup peels the first batch then requires 120+ chars for later requests', () => {
+    const marks = Array.from({ length: 4 }, (_, i) =>
+      mark(String(i), `${'句'.repeat(48)}。`, 'zh'),
+    );
+    const batches = buildBatches(marks, true);
+    expect(batches).toHaveLength(2);
+    expect(batches[0]!.map((m) => m.text).join('').length).toBeLessThanOrEqual(
+      STARTUP_BATCH_MAX_CHARS + 10,
+    );
+    expect(batches[1]!.map((m) => m.text).join('').length).toBeGreaterThanOrEqual(BATCH_MAX_CHARS);
+  });
+
   test('never mixes languages in one batch', () => {
     const batches = buildBatches([mark('0', 'hello', 'en'), mark('1', 'bonjour', 'fr')]);
     expect(batches).toHaveLength(2);
@@ -86,6 +99,21 @@ describe('shouldCollectMoreParagraphs', () => {
   test('startup keeps collecting after the fast-start batch', () => {
     const batches = buildBatches([mark('0', 'a'.repeat(30))], true);
     expect(shouldCollectMoreParagraphs(batches, true)).toBe(true);
+  });
+
+  test('startup keeps collecting while post-startup batches stay under 120 chars', () => {
+    const marks = Array.from({ length: 3 }, (_, i) =>
+      mark(String(i), `${'段'.repeat(48)}。`, 'zh'),
+    );
+    const batches = buildBatches(marks, true);
+    expect(shouldCollectMoreParagraphs(batches, true)).toBe(true);
+  });
+});
+
+describe('markSpeechEndSec', () => {
+  test('ends at the last word boundary instead of the next mark start', () => {
+    const boundaries = [{ offset: 10_000_000, duration: 5_000_000, text: 'done.' }];
+    expect(markSpeechEndSec(boundaries, 2.5, 0.01)).toBeCloseTo(1.51, 2);
   });
 });
 

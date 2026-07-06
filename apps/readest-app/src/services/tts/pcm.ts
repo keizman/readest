@@ -58,8 +58,8 @@ export interface SilenceCompressionPlan {
 // comma/clause/sentence silences; the client normalizes them to these lengths.
 // EdgeTTSClient divides by the current playback rate when compressing decoded
 // buffers (prosody rate shrinks the MP3 timeline).
-export const SHORT_PAUSE_SEC = 0.018;
-export const LONG_PAUSE_SEC = 0.018;
+export const SHORT_PAUSE_SEC = 0.009;
+export const LONG_PAUSE_SEC = 0.009;
 // Gaps shorter than this are natural coarticulation between words.
 export const MIN_COMPRESS_GAP_SEC = 0.015;
 

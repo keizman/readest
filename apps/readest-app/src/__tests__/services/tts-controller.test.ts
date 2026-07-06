@@ -824,6 +824,27 @@ describe('TTSController', () => {
       expect(typeof ev.detail.sequence).toBe('number');
     });
 
+    test('dispatchSpeakMark uses a captured range without calling setMark', async () => {
+      await controller.initViewTTS(0);
+      const captured = new Range();
+      mockView.tts = {
+        setMark: vi.fn(),
+        getLastRange: vi.fn(),
+      } as unknown as FoliateView['tts'];
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-captured');
+
+      controller.dispatchSpeakMark({
+        offset: 0,
+        name: '0',
+        text: 'later paragraph',
+        language: 'zh',
+        range: captured,
+      });
+
+      expect(mockView.tts!.setMark).not.toHaveBeenCalled();
+      expect(mockView.getCFI).toHaveBeenCalledWith(0, captured);
+    });
+
     test('dispatchSpeakWord emits tts-position with kind word', async () => {
       await armWithSentence(makeSentenceRange());
       controller.prepareSpeakWords(['Hello', 'brave', 'world']);

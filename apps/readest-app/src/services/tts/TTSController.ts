@@ -653,10 +653,13 @@ export class TTSController extends EventTarget {
     for await (const _ of iter);
   }
 
-  #appendSpeakableMarksFromSSML = (marks: TTSMark[], ssml: string) => {
+  #appendSpeakableMarksFromSSML = (marks: TTSMark[], ssml: string, captureRange = false) => {
     const parsed = parseSSMLMarks(ssml, this.ttsLang);
+    const tts = captureRange ? this.#getTts() : null;
     for (const mark of parsed.marks) {
-      if (hasSpeakableText(mark.text)) marks.push(mark);
+      if (!hasSpeakableText(mark.text)) continue;
+      const range = tts?.setMark(mark.name) ?? undefined;
+      marks.push(range ? { ...mark, range } : mark);
     }
   };
 
@@ -665,7 +668,7 @@ export class TTSController extends EventTarget {
     startup: boolean,
   ): Promise<{ marks: TTSMark[]; paragraphsConsumed: number }> {
     const marks: TTSMark[] = [];
-    this.#appendSpeakableMarksFromSSML(marks, initialSsml);
+    this.#appendSpeakableMarksFromSSML(marks, initialSsml, true);
     const tts = this.#getTts();
     let peekCount = 0;
 
@@ -677,7 +680,7 @@ export class TTSController extends EventTarget {
       if (!nextRaw) break;
       peekCount++;
       const nextSsml = await this.#preprocessSSML(nextRaw);
-      if (nextSsml) this.#appendSpeakableMarksFromSSML(marks, nextSsml);
+      if (nextSsml) this.#appendSpeakableMarksFromSSML(marks, nextSsml, true);
     }
 
     for (let i = 0; i < peekCount; i++) {
@@ -1130,7 +1133,7 @@ export class TTSController extends EventTarget {
         // suppress it.
         this.#suppressMarkHighlight =
           this.ttsClient.supportsWordBoundaries() && this.#highlightGranularity === 'word';
-        const range = this.#getTts()?.setMark(mark.name);
+        const range = mark.range ?? this.#getTts()?.setMark(mark.name);
         this.#suppressMarkHighlight = false;
         this.#speakWordsArmed = !!range;
         if (this.#sectionTimeline && range) {
