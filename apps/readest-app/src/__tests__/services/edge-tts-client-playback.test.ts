@@ -196,7 +196,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
     await flush();
     const [first, second] = ctx().sources;
-    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.065, 5);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.032, 5);
     await ctx().advanceTo(5);
     await done;
   });

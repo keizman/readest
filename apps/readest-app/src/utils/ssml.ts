@@ -46,18 +46,32 @@ export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
   return inferLangFromScript(textWithoutLangTags, lang);
 };
 
+const normalizeForSpeakability = (text: string): string =>
+  text
+    .replace(/\p{Cf}/gu, '')
+    .replace(/\p{Z}/gu, '')
+    .trim();
+
 /** True when text contains something a speech engine can pronounce. */
 export const hasSpeakableText = (text: string): boolean => {
-  // Strip zero-width/format chars that would defeat a punctuation-only test
-  // (e.g. U+200B before Chinese ellipsis) and strand auto-advance.
-  const trimmed = text.replace(/\p{Cf}/gu, '').trim();
-  if (!trimmed || trimmed.length === 0) {
-    return false;
-  }
-  if (/^[\p{P}\p{S}]+$/u.test(trimmed)) {
-    return false;
-  }
+  const trimmed = normalizeForSpeakability(text);
+  if (!trimmed) return false;
+  if (/^[\p{P}\p{S}]+$/u.test(trimmed)) return false;
   return true;
+};
+
+// Edge / self-hosted proxies reject punctuation-only input. Treat these as
+// permanent per-utterance failures so the client skips instead of halting.
+export const isNoAudioSynthesisError = (error: unknown, text?: string): boolean => {
+  if (!(error instanceof Error)) return false;
+  const m = error.message.toLowerCase();
+  if (m.includes('no audio data received') || m.includes('no audio was received')) {
+    return true;
+  }
+  if (text && !hasSpeakableText(text) && /edge tts http request failed: 5/.test(m)) {
+    return true;
+  }
+  return false;
 };
 
 export const parseSSMLMarks = (ssml: string, primaryLang?: string) => {

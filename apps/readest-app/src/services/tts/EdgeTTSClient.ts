@@ -4,7 +4,7 @@ import { TTSClient, TTSMessageEvent } from './TTSClient';
 import { EdgeSpeechTTS, EdgeTTSPayload, EDGE_TTS_PROTOCOL, TTSWordBoundary } from '@/libs/edgeTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 import { AppService } from '@/types/system';
-import { hasSpeakableText, parseSSMLMarks } from '@/utils/ssml';
+import { hasSpeakableText, isNoAudioSynthesisError, parseSSMLMarks } from '@/utils/ssml';
 import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
@@ -39,7 +39,7 @@ const INTER_SENTENCE_GAP_SEC = LONG_PAUSE_SEC;
 // Keep this much audio past the first/last word when trimming a chunk's edges,
 // so word onsets/releases are not clipped (not Edge's baked sentence tail).
 const EDGE_KEEP_SEC = 0.02;
-const TRAILING_KEEP_SEC = 0.02;
+const TRAILING_KEEP_SEC = 0.01;
 const TICKS_PER_SECOND = 10_000_000;
 
 interface ChunkMeta {
@@ -141,7 +141,7 @@ export class EdgeTTSClient implements TTSClient {
       try {
         return await this.#edgeTTS?.createAudioData(payload);
       } catch (err) {
-        if (err instanceof Error && err.message === 'No audio data received.') throw err;
+        if (isNoAudioSynthesisError(err)) throw err;
         lastError = err;
         console.warn(`Edge TTS fetch attempt ${attempt}/${maxAttempts} failed`, err);
         if (attempt < maxAttempts && !signal.aborted) {
@@ -344,13 +344,17 @@ export class EdgeTTSClient implements TTSClient {
         this.#speakingLang = voiceLang;
         this.#currentVoiceId = voiceId;
         const batchText = batch.map((m) => m.text).join('');
+        if (!hasSpeakableText(batchText)) {
+          for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
+          continue;
+        }
         const payload = this.getPayload(voiceLang, batchText, voiceId);
 
         let audio: { data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined;
         try {
           audio = await this.#createAudioDataWithRetry(payload, signal);
         } catch (error) {
-          if (error instanceof Error && error.message === 'No audio data received.') {
+          if (isNoAudioSynthesisError(error, batchText)) {
             console.warn('No audio data received for:', batchText);
             for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
             continue;

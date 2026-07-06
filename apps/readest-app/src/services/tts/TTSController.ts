@@ -1,6 +1,11 @@
 import { FoliateView } from '@/types/view';
 import { AppService } from '@/types/system';
-import { filterSSMLWithLang, hasSpeakableText, parseSSMLMarks } from '@/utils/ssml';
+import {
+  filterSSMLWithLang,
+  hasSpeakableText,
+  isNoAudioSynthesisError,
+  parseSSMLMarks,
+} from '@/utils/ssml';
 import { Overlayer } from 'foliate-js/overlayer.js';
 import {
   TTSGranularity,
@@ -703,8 +708,10 @@ export class TTSController extends EventTarget {
       .replace(/<emphasis[^>]*>([^<]+)<\/emphasis>/g, '$1')
       .replace(/[–—]/g, ',')
       .replace('<break/>', ' ')
-      .replace(/\.{3,}/g, '   ')
-      .replace(/……/g, '  ')
+      .replace(/\.{2,}/g, ' ')
+      .replace(/。{2,}/g, ' ')
+      .replace(/…+/g, ' ')
+      .replace(/……/g, ' ')
       .replace(/\*/g, ' ')
       .replace(/·/g, ' ');
 
@@ -772,13 +779,20 @@ export class TTSController extends EventTarget {
         const canSkipOnError = this.ttsClient === this.ttsNativeClient;
         const iter = await this.ttsClient.speak(ssml, signal, false, startup);
         let lastCode;
-        for await (const { code } of iter) {
+        let lastMessage: string | undefined;
+        for await (const { code, message } of iter) {
           if (signal.aborted) {
             resolve();
             return;
           }
           lastCode = code;
+          lastMessage = message;
         }
+
+        const canSkipEdgeNoAudio =
+          this.ttsClient === this.ttsEdgeClient &&
+          lastCode === 'error' &&
+          isNoAudioSynthesisError(new Error(lastMessage ?? ''));
 
         if (lastCode === 'end' && this.state === 'playing' && !oneTime) {
           this.#consecutiveSpeakErrors = 0;
@@ -786,7 +800,7 @@ export class TTSController extends EventTarget {
           await this.forward();
         } else if (
           lastCode === 'error' &&
-          canSkipOnError &&
+          (canSkipOnError || canSkipEdgeNoAudio) &&
           !signal.aborted &&
           this.state === 'playing' &&
           !oneTime

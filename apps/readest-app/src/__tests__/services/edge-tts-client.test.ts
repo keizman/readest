@@ -497,6 +497,19 @@ describe('EdgeTTSClient', () => {
       expect(createAudioDataBehavior).not.toHaveBeenCalled();
       expect(events).toEqual([{ code: 'end', message: 'Nothing to speak' }]);
     });
+
+    test('skips an ellipsis mark and synthesizes the next sentence', async () => {
+      await client.init();
+      parsedMarks = [
+        { name: '0', text: '……', language: 'zh' },
+        { name: '1', text: 'Hello world.', language: 'zh' },
+      ];
+      for await (const _ of client.speak('<ssml/>', new AbortController().signal, true, true)) {
+        void _;
+      }
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+      expect(createAudioDataPayloads[0]!.text).toBe('Hello world.');
+    });
   });
 
   describe('char batching preload', () => {

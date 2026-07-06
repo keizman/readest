@@ -13,7 +13,7 @@ export interface SpeechBounds {
 const DEFAULT_SILENCE_THRESHOLD = 0.005;
 // Pads keep a natural attack/release around the detected speech.
 const HEAD_PAD_SEC = 0.02;
-const TAIL_PAD_SEC = 0.05;
+const TAIL_PAD_SEC = 0.02;
 
 export const findSpeechBounds = (
   samples: Float32Array,
@@ -56,8 +56,8 @@ export interface SilenceCompressionPlan {
 
 // Fixed replacement pauses (rate-1.0 seconds). Edge TTS bakes in variable
 // comma/clause/sentence silences; the client normalizes them to these lengths.
-export const SHORT_PAUSE_SEC = 0.035;
-export const LONG_PAUSE_SEC = 0.065;
+export const SHORT_PAUSE_SEC = 0.018;
+export const LONG_PAUSE_SEC = 0.032;
 // Gaps shorter than this are natural coarticulation between words.
 export const MIN_COMPRESS_GAP_SEC = 0.015;
 

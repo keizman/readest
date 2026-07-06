@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { hasSpeakableText, parseSSMLMarks, parseSSMLLang } from '@/utils/ssml';
+import {
+  hasSpeakableText,
+  isNoAudioSynthesisError,
+  parseSSMLMarks,
+  parseSSMLLang,
+} from '@/utils/ssml';
 
 // SSML with xml:lang on speak element (typical output from TTS with lang)
 const ssmlWithLang = (lang: string, body: string) =>
@@ -185,6 +190,29 @@ describe('parseSSMLMarks', () => {
       expect(hasSpeakableText('\u200b……')).toBe(false);
     });
 
+    it('should skip nbsp-only text', () => {
+      expect(hasSpeakableText('\u00a0\u00a0')).toBe(false);
+    });
+
+    it('should treat single ellipsis as unspeakable', () => {
+      expect(hasSpeakableText('…')).toBe(false);
+    });
+  });
+
+  describe('isNoAudioSynthesisError', () => {
+    it('matches websocket no-audio errors', () => {
+      expect(isNoAudioSynthesisError(new Error('No audio data received.'))).toBe(true);
+      expect(isNoAudioSynthesisError(new Error('No audio was received'))).toBe(true);
+    });
+
+    it('matches HTTP 500 only for unspeakable text', () => {
+      const err = new Error('Edge TTS HTTP request failed: 500 Internal Server Error');
+      expect(isNoAudioSynthesisError(err, '……')).toBe(true);
+      expect(isNoAudioSynthesisError(err, 'hello')).toBe(false);
+    });
+  });
+
+  describe('more edge cases', () => {
     it('should handle empty SSML body', () => {
       const ssml = ssmlWithLang('en', '');
       const { plainText, marks } = parseSSMLMarks(ssml);
