@@ -436,25 +436,6 @@ export class EdgeTTSClient implements TTSClient {
     }
   }
 
-  async #prepareChunkBuffer(
-    data: ArrayBuffer,
-    boundaries: TTSWordBoundary[],
-    rate: number,
-  ): Promise<{
-    buffer: TTSAudioBuffer;
-    boundaries: TTSWordBoundary[];
-    trimStartSec: number;
-    trimmedDurationSec: number;
-  }> {
-    const decoded = await this.#player.decode(data);
-    return this.#prepareSamplesBuffer(
-      decoded.getChannelData(0),
-      decoded.sampleRate,
-      boundaries,
-      rate,
-    );
-  }
-
   async #prepareSamplesBuffer(
     channel: Float32Array,
     sampleRate: number,
