@@ -18,6 +18,7 @@ export const LibrarySortByType = {
   Size: 'size',
   Format: 'format',
   Published: 'published',
+  Progress: 'progress',
 } as const;
 
 export type LibrarySortByType = (typeof LibrarySortByType)[keyof typeof LibrarySortByType];
@@ -235,6 +236,17 @@ export interface SystemSettings {
    * settings backups via `BACKUP_SETTINGS_BLACKLIST`.
    */
   externalLibraryFolders?: string[];
+  /**
+   * Absolute paths of the external library folders the user has opted into
+   * auto-import for. On library open and whenever the app regains focus,
+   * Readest re-scans each of these and imports any newly-added book files.
+   * A subset of {@link externalLibraryFolders} (auto-import requires the
+   * folder to be read in place). Set per-folder from the Import-from-Folder
+   * dialog. Desktop + Android only. Device-local (paths are meaningful only
+   * on this filesystem) and excluded from cloud settings backups via
+   * `BACKUP_SETTINGS_BLACKLIST`.
+   */
+  autoImportFolders?: string[];
 
   keepLogin: boolean;
   autoUpload: boolean;

@@ -14,6 +14,7 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { useCustomFontStore } from '@/store/customFontStore';
 import { useParallelViewStore } from '@/store/parallelViewStore';
 import { useMouseEvent, useTouchEvent, useOpenMediaEvent } from '../hooks/useIframeEvents';
+import { useCapturedTurn, applyPageTurnAttributes } from '../hooks/useCapturedTurn';
 import { useBrightnessGesture } from '../hooks/useBrightnessGesture';
 import BrightnessOverlay from './BrightnessOverlay';
 import { usePagination, viewPagination } from '../hooks/usePagination';
@@ -50,6 +51,8 @@ import {
   handleKeyup,
   handleMousedown,
   handleMouseup,
+  handleMousemove,
+  handleAuxclick,
   handleClick,
   handleWheel,
   handleTouchStart,
@@ -75,7 +78,9 @@ import { isMetered } from '@/utils/network';
 import { eventDispatcher } from '@/utils/event';
 import { isFontType } from '@/utils/font';
 import { getScrollGapAttr } from '@/utils/webtoon';
+import { useMiddleClickAutoscroll } from '../hooks/useMiddleClickAutoscroll';
 import { ParagraphControl } from './paragraph';
+import AutoscrollIndicator from './AutoscrollIndicator';
 import Spinner from '@/components/Spinner';
 import KOSyncConflictResolver from './KOSyncResolver';
 import ImageViewer from './ImageViewer';
@@ -402,6 +407,8 @@ const FoliateViewer: React.FC<{
         detail.doc.addEventListener('keyup', handleKeyup.bind(null, bookKey));
         detail.doc.addEventListener('mousedown', handleMousedown.bind(null, bookKey));
         detail.doc.addEventListener('mouseup', handleMouseup.bind(null, bookKey));
+        detail.doc.addEventListener('mousemove', handleMousemove.bind(null, bookKey));
+        detail.doc.addEventListener('auxclick', handleAuxclick.bind(null, bookKey));
         detail.doc.addEventListener(
           'click',
           handleClick.bind(null, bookKey, doubleClickDisabled, !!bookData?.isFixedLayout),
@@ -512,6 +519,7 @@ const FoliateViewer: React.FC<{
   const { handlePageFlip } = usePagination(bookKey, viewRef, containerRef);
   const mouseHandlers = useMouseEvent(bookKey, handlePageFlip);
   const touchHandlers = useTouchEvent(bookKey);
+  const autoscrollAnchor = useMiddleClickAutoscroll(bookKey, viewRef, containerRef);
 
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [selectedTableHtml, setSelectedTableHtml] = useState<string | null>(null);
@@ -611,6 +619,8 @@ const FoliateViewer: React.FC<{
 
   useOpenMediaEvent(bookKey, handleImagePress, handleTablePress);
 
+  useCapturedTurn(bookKey, viewRef);
+
   useFoliateEvents(viewRef.current, {
     onLoad: docLoadHandler,
     onStabilized: stabilizedHandler,
@@ -706,6 +716,7 @@ const FoliateViewer: React.FC<{
       } else {
         view.renderer.removeAttribute('animated');
       }
+      applyPageTurnAttributes(view, viewSettings, bookDoc.rendition?.layout === 'pre-paginated');
       // iOS WebKit composites large/persistent page layers without the Android
       // high-DPR Blink freeze, so opt this renderer into the GPU-accelerated
       // page-turn path (persistent compositor layers + no main-thread
@@ -713,11 +724,6 @@ const FoliateViewer: React.FC<{
       // (readest#4768).
       if (appService?.isIOSApp) {
         view.renderer.setAttribute('gpu-composite', '');
-      }
-      if (viewSettings.disableSwipe) {
-        view.renderer.setAttribute('no-swipe', '');
-      } else {
-        view.renderer.removeAttribute('no-swipe');
       }
       if (appService?.isAndroidApp) {
         if (eink) {
@@ -972,6 +978,7 @@ const FoliateViewer: React.FC<{
         {...mouseHandlers}
         {...touchHandlers}
       />
+      {autoscrollAnchor && <AutoscrollIndicator anchor={autoscrollAnchor} />}
       <BrightnessOverlay visible={overlayVisible} level={overlayLevel} />
       <ParagraphControl bookKey={bookKey} viewRef={viewRef} gridInsets={gridInsets} />
       {((!docLoaded.current && loading) || viewState?.loading) && (

@@ -557,7 +557,10 @@ export class NativeAppService extends BaseAppService {
   override hasWindow = !(OS_TYPE === 'ios' || OS_TYPE === 'android');
   override hasWindowBar = !(OS_TYPE === 'ios' || OS_TYPE === 'android');
   override hasContextMenu = !(OS_TYPE === 'ios' || OS_TYPE === 'android');
-  override hasRoundedWindow = OS_TYPE === 'linux';
+  // No desktop platform draws a rounded, transparent window anymore: the Linux
+  // window is opaque with square corners to avoid the WebKitGTK "turns
+  // invisible while busy" bug (#3682).
+  override hasRoundedWindow = false;
   override hasSafeAreaInset = OS_TYPE === 'ios' || OS_TYPE === 'android';
   override hasHaptics = OS_TYPE === 'ios' || OS_TYPE === 'android';
   override hasUpdater =
@@ -592,6 +595,25 @@ export class NativeAppService extends BaseAppService {
   override async init() {
     const execDir = await invoke<string>('get_executable_dir');
     this.execDir = execDir;
+    // Report the WebView User-Agent so Sentry can tag crashes with the
+    // engine/version (the injected browser SDK's UA context isn't forwarded).
+    try {
+      await invoke('set_webview_info', { userAgent: navigator.userAgent });
+    } catch (err) {
+      console.warn('[nativeAppService] set_webview_info failed:', err);
+    }
+    // Ask Rust whether the in-app updater must stay hidden (READEST_DISABLE_UPDATER,
+    // Flatpak, or a Linux deb/rpm/pacman install that Tauri can't self-update). The
+    // command is the reliable source of truth; the `__READEST_UPDATER_DISABLED`
+    // init-script global isn't dependable on every Linux/WebKitGTK setup (#4874).
+    if (this.isDesktopApp) {
+      try {
+        const updaterDisabled = await invoke<boolean>('is_updater_disabled');
+        this.hasUpdater = this.hasUpdater && !updaterDisabled;
+      } catch (err) {
+        console.warn('[nativeAppService] is_updater_disabled failed:', err);
+      }
+    }
     if (
       process.env['NEXT_PUBLIC_PORTABLE_APP'] ||
       (await this.fs.exists(`${execDir}/${SETTINGS_FILENAME}`, 'None'))

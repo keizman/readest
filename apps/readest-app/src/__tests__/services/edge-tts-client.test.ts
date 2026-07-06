@@ -3,23 +3,14 @@ import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 // Shared mock control: tests can override createBehavior to change how create() behaves
 let createBehavior: () => Promise<undefined> = () => Promise.resolve(undefined);
 
-// Shared mock control for createAudioUrl() and parsed SSML marks
-let createAudioUrlBehavior = vi.fn<() => Promise<string>>(() => Promise.resolve('blob:mock-url'));
-type MockAudioResult = {
-  url: string;
-  boundaries: Array<{ offset: number; duration: number; text: string }>;
-};
-let createAudioBehavior = vi.fn<() => Promise<MockAudioResult>>(() =>
-  Promise.resolve({ url: 'blob:mock-url', boundaries: [] }),
-);
-type MockAudioDataResult = {
+// Shared mock control for createAudioData() and parsed SSML marks
+type MockAudioData = {
   data: ArrayBuffer;
   boundaries: Array<{ offset: number; duration: number; text: string }>;
 };
-let createAudioDataBehavior = vi.fn<() => Promise<MockAudioDataResult>>(() =>
-  Promise.resolve({ data: new ArrayBuffer(0), boundaries: [] }),
+let createAudioDataBehavior = vi.fn<() => Promise<MockAudioData>>(() =>
+  Promise.resolve({ data: new ArrayBuffer(8), boundaries: [] }),
 );
-let createAudioDataPayloads: Array<{ text: string }> = [];
 let parsedMarks: Array<{ name: string; text: string; language: string }> = [];
 
 // --- Mocks ---
@@ -35,12 +26,7 @@ vi.mock('@/libs/edgeTTS', () => {
     EdgeSpeechTTS: class MockEdgeSpeechTTS {
       static voices = voices;
       create = vi.fn().mockImplementation(() => createBehavior());
-      createAudioUrl = vi.fn().mockImplementation(() => createAudioUrlBehavior());
-      createAudio = vi.fn().mockImplementation(() => createAudioBehavior());
-      createAudioData = vi.fn().mockImplementation((payload: { text: string }) => {
-        createAudioDataPayloads.push(payload);
-        return createAudioDataBehavior();
-      });
+      createAudioData = vi.fn().mockImplementation(() => createAudioDataBehavior());
     },
     EDGE_TTS_PROTOCOL: 'wss',
   };
@@ -86,14 +72,9 @@ describe('EdgeTTSClient', () => {
 
   beforeEach(() => {
     createBehavior = () => Promise.resolve(undefined);
-    createAudioUrlBehavior = vi.fn<() => Promise<string>>(() => Promise.resolve('blob:mock-url'));
-    createAudioBehavior = vi.fn<() => Promise<MockAudioResult>>(() =>
-      Promise.resolve({ url: 'blob:mock-url', boundaries: [] }),
+    createAudioDataBehavior = vi.fn<() => Promise<MockAudioData>>(() =>
+      Promise.resolve({ data: new ArrayBuffer(8), boundaries: [] }),
     );
-    createAudioDataBehavior = vi.fn<() => Promise<MockAudioDataResult>>(() =>
-      Promise.resolve({ data: new ArrayBuffer(0), boundaries: [] }),
-    );
-    createAudioDataPayloads = [];
     parsedMarks = [];
     client = new EdgeTTSClient();
   });
@@ -139,38 +120,11 @@ describe('EdgeTTSClient', () => {
       expect(voices.map((v) => v.id)).toContain('en-US-AriaNeural');
     });
 
-    test('init does not prompt for auth (self-hosted, no wss fallback)', async () => {
-      const dispatchEvent = vi.fn();
-      const mockController = {
-        isAuthenticated: false,
-        dispatchEvent,
-      } as unknown as TTSController;
-      const c = new EdgeTTSClient(mockController);
+    test('does not require a live probe or auth for the self-hosted service', async () => {
+      createBehavior = vi.fn(() => Promise.reject(new Error('probe should not run')));
 
-      const result = await c.init();
-      expect(result).toBe(true);
-      expect(dispatchEvent).not.toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'tts-need-auth' }),
-      );
-    });
-
-    test('init is optimistic: stays initialized even if a probe would fail', async () => {
-      // The self-hosted server needs no auth and the voice list is static, so
-      // init must not gate voice selection on a live network probe (a transient
-      // server hiccup previously disabled every voice in the picker).
-      const mockController = {
-        isAuthenticated: false,
-        dispatchEvent: vi.fn(),
-      } as unknown as TTSController;
-      const c = new EdgeTTSClient(mockController);
-
-      createBehavior = () => Promise.reject(new Error('server unreachable'));
-
-      const result = await c.init();
-      expect(result).toBe(true);
-      expect(c.initialized).toBe(true);
-      const voices = await c.getAllVoices();
-      expect(voices.every((v) => !v.disabled)).toBe(true);
+      await expect(client.init()).resolves.toBe(true);
+      expect(createBehavior).not.toHaveBeenCalled();
     });
   });
 
@@ -184,13 +138,6 @@ describe('EdgeTTSClient', () => {
     test('accepts boundary values', async () => {
       await expect(client.setRate(0.5)).resolves.toBeUndefined();
       await expect(client.setRate(2.0)).resolves.toBeUndefined();
-    });
-
-    test('renders speed server-side via the payload rate (pitch-preserving)', async () => {
-      await client.setRate(1.5);
-      // Speed must be baked into the synthesis request, not applied as a Web
-      // Audio playbackRate (which would shift pitch / "chipmunk").
-      expect(client.getPayload('en-US', 'hello', 'voice-1').rate).toBe(1.5);
     });
   });
 
@@ -438,14 +385,14 @@ describe('EdgeTTSClient', () => {
       }
     };
 
-    test('retries createAudioUrl up to 3 times when preload fails', async () => {
+    test('retries createAudioData up to 3 times when preload fails', async () => {
       await client.init();
       parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];
-      createAudioUrlBehavior = vi.fn(() => Promise.reject(new Error('network error')));
+      createAudioDataBehavior = vi.fn(() => Promise.reject(new Error('network error')));
 
       await consumePreload(client, new AbortController().signal);
 
-      expect(createAudioUrlBehavior).toHaveBeenCalledTimes(3);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(3);
     });
 
     test('does not retry when the first preload attempt succeeds', async () => {
@@ -454,37 +401,85 @@ describe('EdgeTTSClient', () => {
 
       await consumePreload(client, new AbortController().signal);
 
-      expect(createAudioUrlBehavior).toHaveBeenCalledTimes(1);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
     });
 
     test('stops retrying once an attempt succeeds', async () => {
       await client.init();
       parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];
       let calls = 0;
-      createAudioUrlBehavior = vi.fn(() => {
+      createAudioDataBehavior = vi.fn(() => {
         calls++;
         return calls < 2
           ? Promise.reject(new Error('network error'))
-          : Promise.resolve('blob:mock-url');
+          : Promise.resolve({ data: new ArrayBuffer(8), boundaries: [] });
       });
 
       await consumePreload(client, new AbortController().signal);
 
-      expect(createAudioUrlBehavior).toHaveBeenCalledTimes(2);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
+    });
+
+    test('does not retry a permanent no-audio failure', async () => {
+      await client.init();
+      parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];
+      createAudioDataBehavior = vi.fn(() => Promise.reject(new Error('No audio data received.')));
+
+      await consumePreload(client, new AbortController().signal);
+
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
     });
 
     test('stops retrying once the signal is aborted', async () => {
       await client.init();
       parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];
       const controller = new AbortController();
-      createAudioUrlBehavior = vi.fn(() => {
+      createAudioDataBehavior = vi.fn(() => {
         controller.abort();
         return Promise.reject(new Error('network error'));
       });
 
       await consumePreload(client, controller.signal);
 
-      expect(createAudioUrlBehavior).toHaveBeenCalledTimes(1);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+    });
+
+    test('blocks startup on only the first speakable mark', async () => {
+      await client.init();
+      parsedMarks = [
+        { name: '0', text: 'first', language: 'en' },
+        { name: '1', text: 'second', language: 'en' },
+        { name: '2', text: 'third', language: 'en' },
+      ];
+      let resolveFirst: (value: MockAudioData) => void = () => {
+        throw new Error('First audio request was not started');
+      };
+      let hasFirstResolver = false;
+      createAudioDataBehavior = vi.fn(
+        () =>
+          new Promise<MockAudioData>((resolve) => {
+            if (!hasFirstResolver) {
+              resolveFirst = resolve;
+              hasFirstResolver = true;
+            }
+          }),
+      );
+
+      const iterator = client.speak('<ssml/>', new AbortController().signal, true, true);
+      const pending = iterator.next();
+
+      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(1));
+      resolveFirst({ data: new ArrayBuffer(8), boundaries: [] });
+      await pending;
+    });
+
+    test('skips pure Chinese ellipsis without requesting Edge audio', async () => {
+      await client.init();
+      parsedMarks = [{ name: '0', text: '……', language: 'zh' }];
+
+      await consumePreload(client, new AbortController().signal);
+
+      expect(createAudioDataBehavior).not.toHaveBeenCalled();
     });
   });
 
@@ -501,378 +496,6 @@ describe('EdgeTTSClient', () => {
 
     test('stop resolves without error when no audio element exists', async () => {
       await expect(client.stop()).resolves.toBeUndefined();
-    });
-  });
-
-  describe('word boundary tracking during playback', () => {
-    class MockBufferSource {
-      static instances: MockBufferSource[] = [];
-      buffer: unknown = null;
-      playbackRate = { value: 1 };
-      onended: (() => void) | null = null;
-      constructor() {
-        MockBufferSource.instances.push(this);
-      }
-      connect() {}
-      disconnect() {}
-      start() {}
-      stop() {}
-    }
-    class MockAudioContext {
-      static instances: MockAudioContext[] = [];
-      currentTime = 0;
-      state = 'running';
-      sampleRate = 48000;
-      destination = {};
-      constructor() {
-        MockAudioContext.instances.push(this);
-      }
-      createGain() {
-        return { connect: () => {}, gain: { value: 1 } };
-      }
-      createBufferSource() {
-        return new MockBufferSource();
-      }
-      decodeAudioData() {
-        return Promise.resolve({ duration: 100, sampleRate: 48000 });
-      }
-      resume() {
-        this.state = 'running';
-        return Promise.resolve();
-      }
-      suspend() {
-        this.state = 'suspended';
-        return Promise.resolve();
-      }
-      close() {
-        return Promise.resolve();
-      }
-    }
-
-    let rafCallbacks: Map<number, FrameRequestCallback>;
-    let rafId = 0;
-    const runRaf = () => {
-      const cbs = [...rafCallbacks.values()];
-      rafCallbacks.clear();
-      for (const cb of cbs) cb(0);
-    };
-    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-    let mockController: {
-      dispatchSpeakMark: ReturnType<typeof vi.fn>;
-      prepareSpeakWords: ReturnType<typeof vi.fn>;
-      dispatchSpeakWord: ReturnType<typeof vi.fn>;
-    };
-
-    beforeEach(() => {
-      MockBufferSource.instances = [];
-      MockAudioContext.instances = [];
-      rafCallbacks = new Map();
-      vi.stubGlobal('AudioContext', MockAudioContext);
-      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
-        rafCallbacks.set(++rafId, cb);
-        return rafId;
-      });
-      vi.stubGlobal('cancelAnimationFrame', (id: number) => {
-        rafCallbacks.delete(id);
-      });
-      mockController = {
-        dispatchSpeakMark: vi.fn(),
-        prepareSpeakWords: vi.fn(),
-        dispatchSpeakWord: vi.fn(),
-      };
-      client = new EdgeTTSClient(mockController as unknown as TTSController);
-      parsedMarks = [{ name: '0', text: 'Hello brave world', language: 'en' }];
-      createAudioDataBehavior = vi.fn(() =>
-        Promise.resolve({
-          data: new ArrayBuffer(0),
-          boundaries: [
-            { offset: 1_000_000, duration: 4_000_000, text: 'Hello' },
-            { offset: 6_000_000, duration: 4_000_000, text: 'brave' },
-            { offset: 11_000_000, duration: 4_000_000, text: 'world' },
-          ],
-        }),
-      );
-    });
-
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
-    const startSpeak = async () => {
-      await client.init();
-      const it = client.speak('<ssml/>', new AbortController().signal);
-      const first = await it.next();
-      expect((first.value as { code: string }).code).toBe('boundary');
-      const resultPromise = it.next();
-      await flush();
-      const ctx = MockAudioContext.instances.at(-1)!;
-      const source = MockBufferSource.instances.at(-1)!;
-      return { it, resultPromise, ctx, source };
-    };
-
-    test('prepares speak words and dispatches word indexes as playback advances', async () => {
-      const { resultPromise, ctx, source } = await startSpeak();
-
-      expect(mockController.prepareSpeakWords).toHaveBeenCalledWith(['Hello', 'brave', 'world']);
-
-      // Media time within the batch is (ctx.currentTime - batchCtxStart) where
-      // batchCtxStart = schedule time (0) + the small lead.
-      ctx.currentTime = 0.13;
-      runRaf();
-      expect(mockController.dispatchSpeakWord).toHaveBeenCalledWith(0);
-
-      ctx.currentTime = 0.65;
-      runRaf();
-      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(1);
-
-      // Same word index is not re-dispatched on subsequent frames.
-      const callCount = mockController.dispatchSpeakWord.mock.calls.length;
-      runRaf();
-      expect(mockController.dispatchSpeakWord.mock.calls.length).toBe(callCount);
-
-      source.onended?.();
-      const result = await resultPromise;
-      expect((result.value as { code: string }).code).toBe('end');
-    });
-
-    test('stops dispatching after the chunk ends', async () => {
-      const { resultPromise, ctx, source } = await startSpeak();
-
-      ctx.currentTime = 0.13;
-      runRaf();
-      const callCount = mockController.dispatchSpeakWord.mock.calls.length;
-
-      source.onended?.();
-      await resultPromise;
-
-      ctx.currentTime = 1.2;
-      runRaf();
-      expect(mockController.dispatchSpeakWord.mock.calls.length).toBe(callCount);
-    });
-
-    test('hands empty words to the controller and does not track when no boundaries', async () => {
-      createAudioDataBehavior = vi.fn(() =>
-        Promise.resolve({ data: new ArrayBuffer(0), boundaries: [] }),
-      );
-      const { resultPromise, ctx, source } = await startSpeak();
-
-      // Empty words are still forwarded so the controller can draw the
-      // sentence-highlight fallback; no per-word tracking is started.
-      expect(mockController.prepareSpeakWords).toHaveBeenCalledWith([]);
-      ctx.currentTime = 0.5;
-      runRaf();
-      expect(mockController.dispatchSpeakWord).not.toHaveBeenCalled();
-
-      source.onended?.();
-      await resultPromise;
-    });
-  });
-
-  describe('char batching', () => {
-    class MockBufferSource {
-      static instances: MockBufferSource[] = [];
-      buffer: unknown = null;
-      playbackRate = { value: 1 };
-      onended: (() => void) | null = null;
-      constructor() {
-        MockBufferSource.instances.push(this);
-      }
-      connect() {}
-      disconnect() {}
-      start() {}
-      stop() {}
-    }
-    class MockAudioContext {
-      static instances: MockAudioContext[] = [];
-      currentTime = 0;
-      state = 'running';
-      sampleRate = 48000;
-      destination = {};
-      constructor() {
-        MockAudioContext.instances.push(this);
-      }
-      createGain() {
-        return { connect: () => {}, gain: { value: 1 } };
-      }
-      createBufferSource() {
-        return new MockBufferSource();
-      }
-      decodeAudioData() {
-        return Promise.resolve({ duration: 100, sampleRate: 48000 });
-      }
-      resume() {
-        this.state = 'running';
-        return Promise.resolve();
-      }
-      suspend() {
-        this.state = 'suspended';
-        return Promise.resolve();
-      }
-      close() {
-        return Promise.resolve();
-      }
-    }
-
-    let rafCallbacks: Map<number, FrameRequestCallback>;
-    let rafId = 0;
-    const runRaf = () => {
-      const cbs = [...rafCallbacks.values()];
-      rafCallbacks.clear();
-      for (const cb of cbs) cb(0);
-    };
-    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-    let mockController: {
-      dispatchSpeakMark: ReturnType<typeof vi.fn>;
-      prepareSpeakWords: ReturnType<typeof vi.fn>;
-      dispatchSpeakWord: ReturnType<typeof vi.fn>;
-    };
-
-    beforeEach(() => {
-      MockBufferSource.instances = [];
-      MockAudioContext.instances = [];
-      rafCallbacks = new Map();
-      vi.stubGlobal('AudioContext', MockAudioContext);
-      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
-        rafCallbacks.set(++rafId, cb);
-        return rafId;
-      });
-      vi.stubGlobal('cancelAnimationFrame', (id: number) => {
-        rafCallbacks.delete(id);
-      });
-      mockController = {
-        dispatchSpeakMark: vi.fn(),
-        prepareSpeakWords: vi.fn(),
-        dispatchSpeakWord: vi.fn(),
-      };
-      client = new EdgeTTSClient(mockController as unknown as TTSController);
-    });
-
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
-    // A paragraph's batches are all scheduled in one generator run, so it yields
-    // a single 'boundary' then 'end' once the last scheduled source finishes.
-    const consumeParagraph = async (it: AsyncGenerator<unknown>) => {
-      const first = await it.next();
-      expect((first.value as { code: string }).code).toBe('boundary');
-      const endPromise = it.next();
-      await flush();
-      MockBufferSource.instances.at(-1)!.onended?.();
-      await endPromise;
-      await it.next();
-    };
-
-    test('merges consecutive marks under the char budget into one request', async () => {
-      parsedMarks = [
-        { name: '0', text: 'a'.repeat(20), language: 'en', offset: 0 },
-        { name: '1', text: 'b'.repeat(20), language: 'en', offset: 20 },
-      ] as never;
-      await client.init();
-      await consumeParagraph(client.speak('<ssml/>', new AbortController().signal));
-      // 40 chars fit even the reduced startup request budget.
-      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
-    });
-
-    test('uses a small first request, then returns to the normal batch budget', async () => {
-      parsedMarks = [
-        { name: '0', text: 'a'.repeat(30), language: 'en', offset: 0 },
-        { name: '1', text: 'b'.repeat(30), language: 'en', offset: 30 },
-        { name: '2', text: 'c'.repeat(30), language: 'en', offset: 60 },
-      ] as never;
-      await client.init();
-
-      await consumeParagraph(client.speak('<first/>', new AbortController().signal, false, true));
-      expect(createAudioDataPayloads.map((payload) => payload.text.length)).toEqual([30, 60]);
-
-      createAudioDataPayloads = [];
-      await consumeParagraph(client.speak('<next/>', new AbortController().signal));
-      expect(createAudioDataPayloads.map((payload) => payload.text.length)).toEqual([90]);
-    });
-
-    test('skips a punctuation-only ellipsis mark without calling the Edge server', async () => {
-      parsedMarks = [{ name: '0', text: '……', language: 'zh', offset: 0 }] as never;
-      await client.init();
-
-      const it = client.speak('<ellipsis/>', new AbortController().signal);
-      const result = await it.next();
-
-      expect(result.value).toMatchObject({ code: 'end', message: 'Nothing to speak' });
-      expect(createAudioDataBehavior).not.toHaveBeenCalled();
-    });
-
-    test('splits marks that exceed the char budget into multiple requests', async () => {
-      parsedMarks = [
-        { name: '0', text: 'a'.repeat(80), language: 'en', offset: 0 },
-        { name: '1', text: 'b'.repeat(80), language: 'en', offset: 80 },
-      ] as never;
-      await client.init();
-      await consumeParagraph(client.speak('<ssml/>', new AbortController().signal));
-      // 160 chars > 120 => two requests.
-      expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
-    });
-
-    test('never merges marks of different languages into one request', async () => {
-      parsedMarks = [
-        { name: '0', text: 'hello', language: 'en', offset: 0 },
-        { name: '1', text: 'bonjour', language: 'fr', offset: 5 },
-      ] as never;
-      await client.init();
-      await consumeParagraph(client.speak('<ssml/>', new AbortController().signal));
-      expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
-    });
-
-    test('remaps combined boundaries back to each mark for per-sentence highlighting', async () => {
-      parsedMarks = [
-        { name: '0', text: 'Hello world', language: 'en', offset: 0 },
-        { name: '1', text: 'Bye now', language: 'en', offset: 11 },
-      ] as never;
-      createAudioDataBehavior = vi.fn(() =>
-        Promise.resolve({
-          data: new ArrayBuffer(0),
-          boundaries: [
-            { offset: 1_000_000, duration: 4_000_000, text: 'Hello' },
-            { offset: 6_000_000, duration: 4_000_000, text: 'world' },
-            { offset: 16_000_000, duration: 4_000_000, text: 'Bye' },
-            { offset: 21_000_000, duration: 4_000_000, text: 'now' },
-          ],
-        }),
-      );
-      await client.init();
-      const it = client.speak('<ssml/>', new AbortController().signal);
-      const first = await it.next();
-      expect((first.value as { code: string }).code).toBe('boundary');
-      const resultPromise = it.next();
-      await flush();
-      const ctx = MockAudioContext.instances.at(-1)!;
-      const source = MockBufferSource.instances.at(-1)!;
-
-      // First sentence set up synchronously with only its own words.
-      expect(mockController.dispatchSpeakMark).toHaveBeenNthCalledWith(1, parsedMarks[0]);
-      expect(mockController.prepareSpeakWords).toHaveBeenNthCalledWith(1, ['Hello', 'world']);
-
-      ctx.currentTime = 0.13;
-      runRaf();
-      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(0);
-      ctx.currentTime = 0.65;
-      runRaf();
-      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(1);
-
-      // Crossing into the second sentence dispatches its mark + word list, and
-      // word indexes restart at 0 within that sentence.
-      ctx.currentTime = 1.65;
-      runRaf();
-      expect(mockController.dispatchSpeakMark).toHaveBeenNthCalledWith(2, parsedMarks[1]);
-      expect(mockController.prepareSpeakWords).toHaveBeenNthCalledWith(2, ['Bye', 'now']);
-      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(0);
-      ctx.currentTime = 2.15;
-      runRaf();
-      expect(mockController.dispatchSpeakWord).toHaveBeenLastCalledWith(1);
-
-      source.onended?.();
-      await resultPromise;
     });
   });
 });

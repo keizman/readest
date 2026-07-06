@@ -5,46 +5,29 @@ import { useThemeStore } from '@/store/themeStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useBookProgress } from '@/store/readerProgressStore';
-import { useNowPlayingStore } from '@/store/nowPlayingStore';
 import { useProofreadStore } from '@/store/proofreadStore';
 import { TransformContext } from '@/services/transformers/types';
 import { proofreadTransformer } from '@/services/transformers/proofread';
 import { useTranslation } from '@/hooks/useTranslation';
-import { TTSController, TTSMark, TTSHighlightOptions, TTSVoicesGroup } from '@/services/tts';
-import { TauriMediaSession } from '@/libs/mediaSession';
+import {
+  ensureSharedAudioContext,
+  TTSController,
+  TTSHighlightOptions,
+  TTSVoicesGroup,
+} from '@/services/tts';
 import { eventDispatcher } from '@/utils/event';
 import { genSSMLRaw, parseSSMLLang } from '@/utils/ssml';
 import { throttle } from '@/utils/throttle';
 import { isCfiInLocation } from '@/utils/cfi';
 import { getLocale } from '@/utils/misc';
-import { buildTTSMediaMetadata } from '@/utils/ttsMetadata';
-import { getBookDisplayTitle, isBookMasked, isLibraryPrivacyModeEnabled } from '@/utils/privacy';
-import { useSettingsStore } from '@/store/settingsStore';
 import { invokeUseBackgroundAudio } from '@/utils/bridge';
 import { estimateTTSTime } from '@/utils/ttsTime';
-import { useTTSMediaSession } from './useTTSMediaSession';
+import { releaseUnblockAudio, ttsMediaBridge, unblockAudio } from '@/services/tts/ttsMediaBridge';
+import { getBookHashFromKey, ttsSessionManager } from '@/services/tts/TTSSessionManager';
 
 interface UseTTSControlProps {
   bookKey: string;
   onRequestHidePanel?: () => void;
-}
-
-// Module-level: holds the TTS controller that keeps playing after reader unmounts.
-// Allows audio to continue when navigating to the shelf and seamless reclaim on return.
-let detachedController: TTSController | null = null;
-let detachedBookKey: string | null = null;
-let detachedCleanup: (() => void) | null = null;
-
-export function stopDetachedTTS() {
-  if (detachedController) {
-    detachedController.shutdown();
-    detachedController = null;
-  }
-  if (detachedCleanup) {
-    detachedCleanup();
-    detachedCleanup = null;
-  }
-  detachedBookKey = null;
 }
 
 export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProps) => {
@@ -69,7 +52,6 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
 
   const [timeoutOption, setTimeoutOption] = useState(0);
   const [timeoutTimestamp, setTimeoutTimestamp] = useState(0);
-  const [timeoutFunc, setTimeoutFunc] = useState<ReturnType<typeof setTimeout> | null>(null);
 
   const followingTTSLocationRef = useRef(true);
   const sectionChangingTimestampRef = useRef(0);
@@ -82,29 +64,11 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const [ttsController, setTtsController] = useState<TTSController | null>(null);
   const [ttsClientsInited, setTtsClientsInitialized] = useState(false);
 
-  const {
-    mediaSessionRef,
-    unblockAudio,
-    releaseUnblockAudio,
-    initMediaSession,
-    deinitMediaSession,
-  } = useTTSMediaSession({ bookKey });
-
   // Broadcast playback transitions on the app-wide bus so consumers that
   // can't read the hook-local isPlaying flag (RSVP, paragraph mode) can react.
   const emitPlaybackState = (state: 'playing' | 'paused' | 'stopped') => {
     playbackStateRef.current = state;
     eventDispatcher.dispatch('tts-playback-state', { bookKey, state });
-    // Keep the cross-route "now playing" bar in sync with this session so the
-    // library reflects the current book, progress, and play/pause state.
-    const store = useNowPlayingStore.getState();
-    const hash = getBookData(bookKey)?.book?.hash;
-    if (store.nowPlaying && hash && store.nowPlaying.bookId === hash) {
-      store.updateNowPlaying({
-        isPlaying: state === 'playing',
-        fraction: getProgress(bookKey)?.fraction ?? store.nowPlaying.fraction,
-      });
-    }
   };
 
   // A follower (paragraph / RSVP mode) that engages mid-session asks the
@@ -194,6 +158,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   useEffect(() => {
     eventDispatcher.on('tts-speak', handleTTSSpeak);
     eventDispatcher.on('tts-stop', handleTTSStop);
+    eventDispatcher.on('tts-close-book', handleTTSCloseBook);
     eventDispatcher.on('tts-forward', handleTTSForward);
     eventDispatcher.on('tts-backward', handleTTSBackward);
     eventDispatcher.on('tts-toggle-play', handleTTSTogglePlay);
@@ -203,63 +168,25 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     return () => {
       eventDispatcher.off('tts-speak', handleTTSSpeak);
       eventDispatcher.off('tts-stop', handleTTSStop);
+      eventDispatcher.off('tts-close-book', handleTTSCloseBook);
       eventDispatcher.off('tts-forward', handleTTSForward);
       eventDispatcher.off('tts-backward', handleTTSBackward);
       eventDispatcher.off('tts-toggle-play', handleTTSTogglePlay);
       eventDispatcher.off('tts-set-rate', handleTTSSetRate);
       eventDispatcher.off('tts-highlight-sentence', handleTTSHighlightSentence);
       eventDispatcher.off('tts-sync-request', handleTTSSyncRequest);
-      const controller = ttsControllerRef.current;
-      if (controller) {
-        if (playbackStateRef.current === 'playing' || playbackStateRef.current === 'paused') {
-          // Detach: let audio keep playing while user browses the shelf.
-          // Disable view-dependent navigation (renderer is going away).
-          controller.onSectionChange = async () => {};
-          detachedController = controller;
-          detachedBookKey = bookKey;
-          const detachedView = controller.view;
-          const detachedBookId = getBookData(bookKey)?.book?.hash;
-          // Track position so resume picks up from the correct spot.
-          const handleDetachedMark = (e: Event) => {
-            const { cfi } = (e as CustomEvent<{ cfi: string }>).detail;
-            if (!cfi) return;
-            try {
-              const vs = useReaderStore.getState().getViewSettings(bookKey);
-              if (vs) {
-                vs.ttsLocation = cfi;
-                useReaderStore.getState().setViewSettings(bookKey, vs);
-              }
-            } catch {
-              /* best-effort */
-            }
-            // The reader progress subscription unmounts with the route, but the
-            // shelf bar remains visible while detached TTS keeps advancing.
-            // Resolve the spoken CFI through the retained book view and update
-            // only the matching now-playing session (the user may have started
-            // another book before this async lookup finishes).
-            if (detachedBookId) {
-              void detachedView
-                .getCFIProgress(cfi)
-                .then((resolved) => {
-                  const fraction = resolved?.fraction;
-                  const store = useNowPlayingStore.getState();
-                  if (
-                    typeof fraction === 'number' &&
-                    Number.isFinite(fraction) &&
-                    store.nowPlaying?.bookId === detachedBookId
-                  ) {
-                    store.updateNowPlaying({ fraction });
-                  }
-                })
-                .catch(() => {});
-            }
-          };
-          controller.addEventListener('tts-highlight-mark', handleDetachedMark);
-          detachedCleanup = () => {
-            controller.removeEventListener('tts-highlight-mark', handleDetachedMark);
-          };
+      if (ttsControllerRef.current) {
+        const controller = ttsControllerRef.current;
+        const bookHash = getBookHashFromKey(bookKey);
+        const session = ttsSessionManager.getSessionByHash(bookHash);
+        if (session?.controller === controller && !controller.terminated) {
+          // Ownership transfers to the manager: the session keeps playing
+          // headless (route unmount, deep-link book switch, split-view pane
+          // close all funnel through this cleanup).
+          ttsSessionManager.detach(bookHash);
         } else {
           controller.shutdown();
+          ttsSessionManager.release(bookHash);
         }
         ttsControllerRef.current = null;
       }
@@ -267,78 +194,125 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Manager-driven stops (sleep timer, end of book, headless error, replaced
+  // by another book) must reconcile this reader's UI when it is mounted.
+  useEffect(() => {
+    const onSessionChanged = (e: Event) => {
+      const { reason } = (e as CustomEvent<{ reason: string }>).detail;
+      if (reason !== 'stopped' || !ttsControllerRef.current) return;
+      ttsControllerRef.current = null;
+      setTtsController(null);
+      setIsPlaying(false);
+      setIsPaused(false);
+      setShowIndicator(false);
+      setShowBackToCurrentTTSLocation(false);
+      setTTSEnabled(bookKey, false);
+      setTimeoutOption(0);
+      setTimeoutTimestamp(0);
+      onRequestHidePanel?.();
+    };
+    ttsSessionManager.addEventListener('session-changed', onSessionChanged);
+    return () => ttsSessionManager.removeEventListener('session-changed', onSessionChanged);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey]);
+
+  // Opening a book whose hash doesn't match the active session stops it —
+  // unless that session's book is still mounted elsewhere (split view).
+  useEffect(() => {
+    const active = ttsSessionManager.getActiveSession();
+    if (!active) return;
+    const mountedHashes = useReaderStore.getState().bookKeys.map(getBookHashFromKey);
+    if (!mountedHashes.includes(active.bookHash)) {
+      void ttsSessionManager.stopActive('replaced');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey]);
+
+  // Seamless reattach: adopt a live background session for this book (same
+  // hash, fresh bookKey) once its view is ready. Audio never stops; the view
+  // catches up. Adoption runs only in the primary pane for the hash.
+  useEffect(() => {
+    const bookHash = getBookHashFromKey(bookKey);
+    const session = ttsSessionManager.getSessionByHash(bookHash);
+    if (!session || session.controller.terminated) return;
+    if (ttsControllerRef.current === session.controller) return;
+    const primaryKey = useReaderStore
+      .getState()
+      .bookKeys.find((k) => getBookHashFromKey(k) === bookHash);
+    if (primaryKey !== bookKey) return;
+
+    let cancelled = false;
+    const tryAdopt = async (): Promise<boolean> => {
+      if (cancelled || isStartingTTSRef.current) return false;
+      const view = getView(bookKey);
+      if (!view) return false;
+      isStartingTTSRef.current = true;
+      try {
+        const controller = session.controller;
+        ttsControllerRef.current = controller;
+        setTtsController(controller);
+        // Indicator on at adoption START so it never flickers in after the
+        // async attach resolves.
+        setShowIndicator(true);
+        setTtsClientsInitialized(true);
+        setTTSEnabled(bookKey, true);
+        const paused = controller.state.includes('paused');
+        setIsPlaying(!paused);
+        setIsPaused(paused);
+        emitPlaybackState(paused ? 'paused' : 'playing');
+        const timer = ttsSessionManager.getSleepTimer();
+        setTimeoutOption(timer?.timeoutSec ?? 0);
+        setTimeoutTimestamp(timer?.firesAt ?? 0);
+        const bookData = getBookData(bookKey);
+        if (bookData?.book) {
+          ttsSessionManager.adopt(bookKey, {
+            bookKey,
+            title: bookData.book.title,
+            author: bookData.book.author,
+            coverImageUrl: bookData.book.coverImageUrl || null,
+            metadataMode: getViewSettings(bookKey)?.ttsMediaMetadata ?? 'sentence',
+            getSectionLabel: () => getProgress(bookKey)?.sectionLabel,
+          });
+        }
+        await controller.attachView(view, {
+          bookKey,
+          preprocessCallback: preprocessSSMLForTTS,
+          onSectionChange: handleSectionChange,
+        });
+        const speakingLang = controller.getSpeakingLang();
+        if (speakingLang) setTtsLang(speakingLang);
+      } catch (err) {
+        console.warn('TTS session adoption failed:', err);
+      } finally {
+        isStartingTTSRef.current = false;
+      }
+      return true;
+    };
+
+    const interval = setInterval(() => {
+      void tryAdopt().then((done) => {
+        if (done) clearInterval(interval);
+      });
+    }, 300);
+    void tryAdopt().then((done) => {
+      if (done) clearInterval(interval);
+    });
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey]);
+
   // Controller event listeners (re-registered when ttsController changes)
   useEffect(() => {
     if (!ttsController || !bookKey) return;
-    const bookData = getBookData(bookKey);
-    if (!bookData || !bookData.book) return;
-    const { title, author, coverImageUrl, hash: bookHash } = bookData.book;
-
     const handleNeedAuth = () => {
       eventDispatcher.dispatch('toast', {
         message: _('Please log in to use advanced TTS features'),
         type: 'error',
         timeout: 5000,
       });
-    };
-
-    const handleSpeakMark = (e: Event) => {
-      const progress = getProgress(bookKey);
-      const viewSettings = getViewSettings(bookKey);
-      const { sectionLabel } = progress || {};
-      const mark = (e as CustomEvent<TTSMark>).detail;
-      const ttsMediaMetadata = viewSettings?.ttsMediaMetadata ?? 'sentence';
-
-      // For private (masked) books, never surface the spoken sentence in the OS
-      // now-playing/media metadata — fall back to the book title so lock-screen
-      // and notification shade don't leak the content being read.
-      const currentSettings = useSettingsStore.getState().settings;
-      const masked = isBookMasked(currentSettings, bookHash);
-      const privacyTitle = isLibraryPrivacyModeEnabled(currentSettings)
-        ? getBookDisplayTitle(currentSettings, { hash: bookHash, title })
-        : null;
-      const metadata =
-        masked && !privacyTitle
-          ? { title, artist: author, album: title, shouldUpdate: true }
-          : buildTTSMediaMetadata({
-              markText: mark?.text || '',
-              markName: mark?.name || '',
-              sectionLabel: sectionLabel || '',
-              title,
-              author,
-              ttsMediaMetadata,
-              previousSectionLabel: previousSectionLabelRef.current,
-              privacyTitle,
-            });
-
-      if (ttsMediaMetadata === 'chapter') {
-        previousSectionLabelRef.current = sectionLabel;
-      }
-
-      if (metadata.shouldUpdate && mediaSessionRef.current) {
-        const mediaSession = mediaSessionRef.current;
-        if (mediaSession instanceof TauriMediaSession) {
-          mediaSession.updateMetadata({
-            title: metadata.title,
-            artist: metadata.artist,
-            album: metadata.album,
-            artwork: '',
-          });
-        } else {
-          mediaSession.metadata = new MediaMetadata({
-            title: metadata.title,
-            artist: metadata.artist,
-            album: metadata.album,
-            artwork: [
-              {
-                src: privacyTitle ? '/icon.png' : coverImageUrl || '/icon.png',
-                sizes: '512x512',
-                type: 'image/png',
-              },
-            ],
-          });
-        }
-      }
     };
 
     const handleHighlightMark = (e: Event) => {
@@ -460,17 +434,34 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       });
     };
 
+    // Lock-screen play/pause acts on the controller through the media
+    // bridge; the panel derives its state from the controller, not from
+    // local optimistic taps. Transit 'stopped' (every paragraph advance) is
+    // ignored; terminal stops arrive via explicit stop paths.
+    const handleStateChange = (e: Event) => {
+      const { state } = (e as CustomEvent<{ state: string }>).detail;
+      if (state === 'playing') {
+        setIsPlaying(true);
+        setIsPaused(false);
+        playbackStateRef.current = 'playing';
+      } else if (state.includes('paused')) {
+        setIsPlaying(false);
+        setIsPaused(true);
+        playbackStateRef.current = 'paused';
+      }
+    };
+
     ttsController.addEventListener('tts-need-auth', handleNeedAuth);
-    ttsController.addEventListener('tts-speak-mark', handleSpeakMark);
     ttsController.addEventListener('tts-highlight-mark', handleHighlightMark);
     ttsController.addEventListener('tts-highlight-word', handleHighlightWord);
     ttsController.addEventListener('tts-position', handlePosition);
+    ttsController.addEventListener('tts-state-change', handleStateChange);
     return () => {
       ttsController.removeEventListener('tts-need-auth', handleNeedAuth);
-      ttsController.removeEventListener('tts-speak-mark', handleSpeakMark);
       ttsController.removeEventListener('tts-highlight-mark', handleHighlightMark);
       ttsController.removeEventListener('tts-highlight-word', handleHighlightWord);
       ttsController.removeEventListener('tts-position', handlePosition);
+      ttsController.removeEventListener('tts-state-change', handleStateChange);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ttsController, bookKey]);
@@ -479,56 +470,6 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   // Reactive subscription via readerProgressStore so the effect below
   // re-runs on page turns without dragging in the whole readerStore.
   const progress = useBookProgress(bookKey);
-
-  // Auto-resume TTS when the book was opened from the library "now playing" bar,
-  // OR reclaim the detached controller that kept playing while on the shelf.
-  // Wait until progress exists (the view is positioned) before starting so
-  // handleTTSSpeak resumes from the saved ttsLocation. Runs at most once.
-  const autoResumedRef = useRef(false);
-  useEffect(() => {
-    if (autoResumedRef.current || !progress) return;
-    const hash = getBookData(bookKey)?.book?.hash;
-    if (!hash) return;
-
-    // If a detached controller is still running for this book, reclaim it
-    // seamlessly (no audio interruption).
-    if (
-      detachedController &&
-      detachedBookKey === bookKey &&
-      detachedController.state !== 'stopped'
-    ) {
-      autoResumedRef.current = true;
-      const controller = detachedController;
-      detachedController = null;
-      detachedBookKey = null;
-      if (detachedCleanup) {
-        detachedCleanup();
-        detachedCleanup = null;
-      }
-
-      const view = getView(bookKey);
-      if (view) {
-        controller.view = view;
-        controller.onSectionChange = handleSectionChange;
-      }
-      ttsControllerRef.current = controller;
-      setTtsController(controller);
-      setIsPlaying(controller.state === 'playing');
-      setIsPaused(controller.state.includes('paused'));
-      setShowIndicator(true);
-      emitPlaybackState(controller.state === 'playing' ? 'playing' : 'paused');
-      setTTSEnabled(bookKey, true);
-      // Consume any pending resume request so it doesn't fire again.
-      useNowPlayingStore.getState().consumeResume(hash);
-      return;
-    }
-
-    if (useNowPlayingStore.getState().consumeResume(hash)) {
-      autoResumedRef.current = true;
-      eventDispatcher.dispatch('tts-speak', { bookKey });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress, bookKey]);
   useEffect(() => {
     const ttsController = ttsControllerRef.current;
     if (!ttsController) return;
@@ -694,8 +635,6 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const handleStop = useCallback(
     async (bookKey: string) => {
       const ttsController = ttsControllerRef.current;
-      // Also stop any lingering detached controller.
-      stopDetachedTTS();
       // Reset all UI/session state up front — including the TTS toggle
       // (ttsEnabled) and indicator that color the TTS icon — so disabling TTS
       // always takes effect immediately. The teardown below is best-effort and
@@ -728,8 +667,11 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         appService?.isIOSApp
           ? invokeUseBackgroundAudio({ enabled: false }).catch(() => {})
           : Promise.resolve(),
-        deinitMediaSession().catch(() => {}),
+        Promise.resolve()
+          .then(() => ttsMediaBridge.unbind())
+          .catch(() => {}),
       ]);
+      ttsSessionManager.release(getBookHashFromKey(bookKey));
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [appService],
@@ -787,24 +729,23 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
 
       const primaryLang = bookData.book.primaryLanguage;
 
-      // Stop any detached controller from a prior navigation.
-      stopDetachedTTS();
-
       if (ttsControllerRef.current) {
         ttsControllerRef.current.stop();
         ttsControllerRef.current = null;
       }
 
       try {
+        // Gesture-path audio unlocks, BEFORE any network/plugin await: WebKit
+        // rejects AudioContext.resume() outside the user-gesture window, and
+        // speak() itself only runs after preprocessing and preload fetches.
+        // The silent keep-alive element runs on ALL platforms — desktop
+        // Chromium only surfaces hardware media keys while an
+        // HTMLMediaElement is playing, and Edge playback no longer has one.
+        unblockAudio();
+        void ensureSharedAudioContext();
         if (appService?.isIOSApp) {
           await invokeUseBackgroundAudio({ enabled: true });
         }
-        // The silent keep-alive element anchors navigator.mediaSession. Edge TTS
-        // plays through the Web Audio API (no media element), so run it on every
-        // platform — otherwise desktop web would lose the OS media controls that
-        // the Edge <audio> element used to provide.
-        unblockAudio();
-        await initMediaSession();
         setTtsClientsInitialized(false);
 
         setShowIndicator(true);
@@ -817,6 +758,15 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         );
         ttsControllerRef.current = ttsController;
         setTtsController(ttsController);
+        ttsSessionManager.claim(bookKey, ttsController, {
+          bookKey,
+          bookHash: bookData.book.hash,
+          title: bookData.book.title,
+          author: bookData.book.author,
+          coverImageUrl: bookData.book.coverImageUrl || null,
+          metadataMode: viewSettings.ttsMediaMetadata ?? 'sentence',
+          getSectionLabel: () => getProgress(bookKey)?.sectionLabel,
+        });
 
         await ttsController.init();
         await ttsController.initViewTTS(ttsFromIndex);
@@ -843,16 +793,6 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         }
         setTtsClientsInitialized(true);
         setTTSEnabled(bookKey, true);
-        const { title, author, coverImageUrl, hash } = bookData.book;
-        useNowPlayingStore.getState().setNowPlaying({
-          bookHash: hash,
-          bookId: hash,
-          title,
-          author,
-          coverImageUrl,
-          fraction: getProgress(bookKey)?.fraction ?? 0,
-          isPlaying: true,
-        });
       } catch (error) {
         eventDispatcher.dispatch('toast', {
           message: _('TTS not supported for this document'),
@@ -871,6 +811,42 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       handleStop(bookKey);
     }
   };
+
+  // Book close (back to library): a live session goes headless instead of
+  // dying. Gate on `terminated`, NOT the state value — chapter transitions
+  // sit in transit 'stopped' for seconds and closing during one must detach.
+  const handleTTSCloseBook = async (event: CustomEvent) => {
+    const { bookKey: closingKey } = event.detail;
+    if (bookKey !== closingKey) return;
+    const controller = ttsControllerRef.current;
+    if (!controller) return;
+    if (!controller.terminated) {
+      ttsSessionManager.detach(getBookHashFromKey(bookKey));
+    } else {
+      await handleStop(bookKey);
+    }
+  };
+
+  // Sentence-snapped seek used by the lock-screen scrubber and the panel.
+  const handleSeekTo = useCallback(async (seconds: number) => {
+    const ttsController = ttsControllerRef.current;
+    if (!ttsController) return;
+    await ttsController.seekToTime(seconds);
+  }, []);
+
+  const handleGetPlaybackInfo = useCallback(() => {
+    const ttsController = ttsControllerRef.current;
+    if (!ttsController) return null;
+    // Kick the lazy timeline build (off the playback critical path); the
+    // first polls return null until it lands and the UI shows a
+    // disabled/reserved row for that state.
+    void ttsController.ensureTimeline();
+    return ttsController.getPlaybackInfo();
+  }, []);
+
+  const handleSupportsPlaybackInfo = useCallback(() => {
+    return ttsControllerRef.current?.supportsPlaybackInfo() ?? false;
+  }, []);
 
   // Playback callbacks
   const handleTogglePlay = useCallback(async () => {
@@ -894,16 +870,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
         await ttsController.start();
       }
     }
-
-    if (mediaSessionRef.current) {
-      const mediaSession = mediaSessionRef.current;
-      if (mediaSession instanceof TauriMediaSession) {
-        await mediaSession.updatePlaybackState({ playing: !isPlaying });
-      } else {
-        mediaSession.playbackState = isPlaying ? 'paused' : 'playing';
-      }
-    }
-  }, [isPlaying, isPaused, mediaSessionRef]);
+  }, [isPlaying, isPaused]);
 
   const handleBackward = useCallback(async (byMark = false) => {
     const ttsController = ttsControllerRef.current;
@@ -931,9 +898,8 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   }, []);
 
   // Rate/voice/timeout/bar controls
-  // Apply the new rate to subsequent speech without stopping/restarting the
-  // current utterance. This keeps playback controls stable and avoids a fresh
-  // synthesis wait; the active utterance finishes at its existing rate.
+  // Update the rate without stopping/restarting the active sentence. The new
+  // client-side time stretch applies to subsequently scheduled speech.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleSetRate = useCallback(
     throttle(async (rate: number) => {
@@ -978,21 +944,13 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     return '';
   };
 
-  const handleSelectTimeout = (bookKey: string, value: number) => {
+  // The timer lives in the session manager so it survives reader unmount and
+  // stops a background session (a hook-local timer would fire into a dead
+  // closure and orphan the audio).
+  const handleSelectTimeout = (_bookKey: string, value: number) => {
     setTimeoutOption(value);
-    if (timeoutFunc) {
-      clearTimeout(timeoutFunc);
-    }
-    if (value > 0) {
-      setTimeoutFunc(
-        setTimeout(() => {
-          handleStop(bookKey);
-        }, value * 1000),
-      );
-      setTimeoutTimestamp(Date.now() + value * 1000);
-    } else {
-      setTimeoutTimestamp(0);
-    }
+    ttsSessionManager.setSleepTimer(value);
+    setTimeoutTimestamp(value > 0 ? Date.now() + value * 1000 : 0);
   };
 
   const handleToggleTTSBar = () => {
@@ -1011,40 +969,6 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       setTtsLang(speakingLang);
     }
   }, []);
-
-  // Media session action handler effect
-  useEffect(() => {
-    const { current: mediaSession } = mediaSessionRef;
-    if (mediaSession) {
-      mediaSession.setActionHandler('play', () => {
-        handleTogglePlay();
-      });
-
-      mediaSession.setActionHandler('pause', () => {
-        handleTogglePlay();
-      });
-
-      mediaSession.setActionHandler('stop', () => {
-        handlePause();
-      });
-
-      mediaSession.setActionHandler('seekforward', () => {
-        handleForward(true);
-      });
-
-      mediaSession.setActionHandler('seekbackward', () => {
-        handleBackward(true);
-      });
-
-      mediaSession.setActionHandler('nexttrack', () => {
-        handleForward();
-      });
-
-      mediaSession.setActionHandler('previoustrack', () => {
-        handleBackward();
-      });
-    }
-  }, [handleTogglePlay, handlePause, handleForward, handleBackward, mediaSessionRef]);
 
   return {
     isPlaying,
@@ -1071,6 +995,9 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     handleSelectTimeout,
     handleToggleTTSBar,
     handleBackToCurrentTTSLocation,
+    handleSeekTo,
+    handleGetPlaybackInfo,
+    handleSupportsPlaybackInfo,
     refreshTtsLang,
   };
 };

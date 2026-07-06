@@ -13,18 +13,16 @@ import { useThemeStore } from '@/store/themeStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
-import { useNowPlayingStore } from '@/store/nowPlayingStore';
 import { useTrafficLight } from '@/hooks/useTrafficLight';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { debounce } from '@/utils/debounce';
 import useShortcuts from '@/hooks/useShortcuts';
 import {
   ensureBookTitleAliases,
-  getBookDisplayTitle,
   isLibraryPrivacyModeEnabled,
   setLibraryPrivacyMode,
 } from '@/utils/privacy';
-import { getMediaSession, TauriMediaSession } from '@/libs/mediaSession';
+import { ttsMediaBridge } from '@/services/tts/ttsMediaBridge';
 import WindowButtons from '@/components/WindowButtons';
 import Dropdown from '@/components/Dropdown';
 import SettingsMenu from './SettingsMenu';
@@ -120,37 +118,9 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
     setSettings(nextSettings);
     await saveSettings(envConfig, nextSettings);
 
-    // Scrub an already-visible lock-screen card immediately, including while
-    // its TTS controller is detached and continuing from the library route.
-    const nowPlaying = useNowPlayingStore.getState().nowPlaying;
-    const mediaSession = getMediaSession();
-    if (!nowPlaying || !mediaSession) return;
-    const displayTitle = getBookDisplayTitle(nextSettings, {
-      hash: nowPlaying.bookHash,
-      title: nowPlaying.title,
-    });
-    const metadata = {
-      title: displayTitle,
-      artist: enabled ? displayTitle : nowPlaying.author,
-      album: displayTitle,
-      artwork: enabled ? '' : nowPlaying.coverImageUrl || '/icon.png',
-    };
-    if (mediaSession instanceof TauriMediaSession) {
-      await mediaSession.updateMetadata(metadata);
-    } else {
-      mediaSession.metadata = new MediaMetadata({
-        ...metadata,
-        artwork: enabled
-          ? [{ src: '/icon.png', sizes: '512x512', type: 'image/png' }]
-          : [
-              {
-                src: nowPlaying.coverImageUrl || '/icon.png',
-                sizes: '512x512',
-                type: 'image/png',
-              },
-            ],
-      });
-    }
+    // Scrub or restore an already-visible lock-screen card immediately,
+    // including while TTS is detached and continuing from the library route.
+    await ttsMediaBridge.refreshMetadata();
   };
 
   if (!insets) return null;
