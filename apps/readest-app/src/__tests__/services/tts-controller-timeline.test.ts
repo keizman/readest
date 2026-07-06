@@ -33,6 +33,7 @@ const makeMockClient = (name: string): TTSClient => {
     getVoiceId: vi.fn().mockReturnValue('timeline-ctrl-voice'),
     getSpeakingLang: vi.fn().mockReturnValue('en'),
     getChunkPosition: vi.fn().mockReturnValue(0.5),
+    getCurrentSpeakMark: vi.fn().mockReturnValue(null),
   };
 };
 
@@ -179,6 +180,22 @@ describe('TTSController section timeline', () => {
     expect(info!.position).toBeCloseTo(0.5, 5);
     expect(info!.duration).toBeGreaterThan(10);
     expect(info!.measuredFraction).toBeGreaterThan(0);
+  });
+
+  test('getPlaybackInfo follows the audibly playing mark instead of a stale foliate range', async () => {
+    recordMeasuredDuration('timeline-ctrl-voice', S0, 4);
+    recordMeasuredDuration('timeline-ctrl-voice', S1, 6);
+    await controller.ensureTimeline();
+    vi.mocked(controller.ttsEdgeClient.getCurrentSpeakMark).mockReturnValue({
+      offset: 0,
+      name: '1',
+      text: S1,
+      language: 'en',
+      range: sentenceRanges[1]!.cloneRange(),
+    });
+    vi.mocked(controller.ttsEdgeClient.getChunkPosition).mockReturnValue(2);
+    const info = controller.getPlaybackInfo();
+    expect(info!.position).toBeCloseTo(6, 5);
   });
 
   test('getPlaybackInfo is null before the timeline is built (reserved-slot state)', () => {

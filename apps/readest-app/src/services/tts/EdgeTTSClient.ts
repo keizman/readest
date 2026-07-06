@@ -607,6 +607,15 @@ export class EdgeTTSClient implements TTSClient {
     }
   }
 
+  // Mark whose audio chunk is currently playing (for timeline scrubber sync).
+  getCurrentSpeakMark(): TTSMark | null {
+    const generation = this.#activeGeneration;
+    if (generation === null) return null;
+    const pos = this.#player.getPlaybackPosition(generation);
+    if (!pos) return null;
+    return this.#chunkMeta[pos.chunkIndex]?.mark ?? null;
+  }
+
   getChunkPosition(): number | null {
     const generation = this.#activeGeneration;
     if (generation === null) return null;

@@ -133,6 +133,7 @@ export class TTSController extends EventTarget {
   #sectionTimeline: SectionTimeline | null = null;
   #timelineSectionIndex: number = -1;
   #currentSentenceIndex: number = -1;
+  #currentSpeakRange: Range | null = null;
   #ttsDoc: Document | null = null;
   #ttsGranularity: TTSGranularity = 'sentence';
 
@@ -549,7 +550,16 @@ export class TTSController extends EventTarget {
     if (!timeline || this.#timelineSectionIndex !== this.#ttsSectionIndex) return null;
     const duration = timeline.getDuration();
     if (!Number.isFinite(duration) || duration <= 0) return null;
-    let index = this.#currentSentenceIndex;
+    let index = -1;
+    const activeMark =
+      this.ttsClient === this.ttsEdgeClient ? this.ttsEdgeClient.getCurrentSpeakMark() : null;
+    if (activeMark) {
+      index = timeline.indexOfMark(activeMark);
+    }
+    if (index < 0) index = this.#currentSentenceIndex;
+    if (index < 0 && this.#currentSpeakRange) {
+      index = timeline.indexOfRange(this.#currentSpeakRange);
+    }
     if (index < 0) {
       const range = this.#getTts()?.getLastRange();
       index = range ? timeline.indexOfRange(range) : -1;
@@ -1136,11 +1146,15 @@ export class TTSController extends EventTarget {
         const range = mark.range ?? this.#getTts()?.setMark(mark.name);
         this.#suppressMarkHighlight = false;
         this.#speakWordsArmed = !!range;
-        if (this.#sectionTimeline && range) {
+        this.#currentSpeakRange = range ?? null;
+        if (this.#sectionTimeline) {
           // Keep the timeline honest as measurements land, then locate the
           // audible sentence for position reporting.
           this.#sectionTimeline.refresh();
-          this.#currentSentenceIndex = this.#sectionTimeline.indexOfRange(range);
+          this.#currentSentenceIndex = this.#sectionTimeline.indexOfMark(mark);
+          if (this.#currentSentenceIndex < 0 && range) {
+            this.#currentSentenceIndex = this.#sectionTimeline.indexOfRange(range);
+          }
         }
         const cfi = this.view.getCFI(this.#ttsSectionIndex, range);
         this.dispatchEvent(new CustomEvent('tts-highlight-mark', { detail: { cfi } }));

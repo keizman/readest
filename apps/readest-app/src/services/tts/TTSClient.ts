@@ -46,4 +46,6 @@ export interface TTSClient {
   // clients with a real audio clock (Edge via Web Audio) implement it; the
   // section timeline treats absence as sentence-granularity positions.
   getChunkPosition?(): number | null;
+  // Edge-only: mark whose audio chunk is currently audible (timeline scrubber).
+  getCurrentSpeakMark?(): TTSMark | null;
 }

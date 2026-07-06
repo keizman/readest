@@ -12,6 +12,7 @@
 // document-ordered and 1:1 with the marks playback produces.
 
 import { estimateSentenceSeconds, getMeasuredDuration } from './ttsDuration';
+import type { TTSMark } from './types';
 
 export interface TimelineSentence {
   blockIndex: number;
@@ -125,6 +126,21 @@ export class SectionTimeline {
   // Locate the timeline sentence containing (or last starting at or before)
   // the given range. Returns -1 for ranges from another document (stale
   // timeline) or ranges before the first sentence.
+  // Resolve a speak mark to a timeline index. Prefer the captured foliate
+  // range (cross-paragraph batches); fall back to exact sentence text.
+  indexOfMark(mark: Pick<TTSMark, 'text' | 'range'>): number {
+    if (mark.range) {
+      const byRange = this.indexOfRange(mark.range);
+      if (byRange >= 0) return byRange;
+    }
+    const target = mark.text.trim();
+    if (!target) return -1;
+    for (let i = 0; i < this.#sentences.length; i++) {
+      if (this.#sentences[i]!.text.trim() === target) return i;
+    }
+    return -1;
+  }
+
   indexOfRange(range: Range): number {
     const n = this.#sentences.length;
     if (n === 0) return -1;

@@ -115,6 +115,19 @@ describe('SectionTimeline', () => {
     expect(timeline.getDuration()).toBe(0);
   });
 
+  test('indexOfMark resolves by captured range or sentence text', () => {
+    const doc = makeDoc();
+    const sentences = enumerate(doc);
+    const timeline = new SectionTimeline(sentences, 'en', 'timeline-voice-mark');
+    expect(
+      timeline.indexOfMark({
+        text: SENTENCE_B0,
+        range: sentences[2]!.range.cloneRange(),
+      }),
+    ).toBe(2);
+    expect(timeline.indexOfMark({ text: SENTENCE_A1 })).toBe(1);
+  });
+
   test('indexOfRange finds exact ranges, sub-ranges, and rejects foreign docs', () => {
     const doc = makeDoc();
     const sentences = enumerate(doc);
