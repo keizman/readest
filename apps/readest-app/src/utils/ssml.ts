@@ -46,8 +46,9 @@ export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
   return inferLangFromScript(textWithoutLangTags, lang);
 };
 
-const isValidMark = (mark: string) => {
-  const trimmed = mark.trim();
+/** True when text contains something a speech engine can pronounce. */
+export const hasSpeakableText = (text: string): boolean => {
+  const trimmed = text.trim();
   if (!trimmed || trimmed.length === 0) {
     return false;
   }
@@ -75,7 +76,7 @@ export const parseSSMLMarks = (ssml: string, primaryLang?: string) => {
     if (match[4]) {
       const rawText = match[4];
       const text = cleanTextContent(rawText);
-      if (text && activeMark && isValidMark(text)) {
+      if (text && activeMark && hasSpeakableText(text)) {
         const offset = plainText.length;
         plainText += text;
         marks.push({

@@ -1240,6 +1240,17 @@ describe('TTSController', () => {
         true,
       );
     });
+
+    test('passes the startup hint only for the latency-sensitive first preload', async () => {
+      await controller.preloadSSML('<speak>first</speak>', new AbortController().signal, true);
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledWith(
+        '<speak>first</speak>',
+        expect.anything(),
+        true,
+        true,
+      );
+    });
   });
 
   describe('preloadNextSSML', () => {

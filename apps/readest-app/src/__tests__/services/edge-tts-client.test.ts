@@ -19,6 +19,7 @@ type MockAudioDataResult = {
 let createAudioDataBehavior = vi.fn<() => Promise<MockAudioDataResult>>(() =>
   Promise.resolve({ data: new ArrayBuffer(0), boundaries: [] }),
 );
+let createAudioDataPayloads: Array<{ text: string }> = [];
 let parsedMarks: Array<{ name: string; text: string; language: string }> = [];
 
 // --- Mocks ---
@@ -36,15 +37,22 @@ vi.mock('@/libs/edgeTTS', () => {
       create = vi.fn().mockImplementation(() => createBehavior());
       createAudioUrl = vi.fn().mockImplementation(() => createAudioUrlBehavior());
       createAudio = vi.fn().mockImplementation(() => createAudioBehavior());
-      createAudioData = vi.fn().mockImplementation(() => createAudioDataBehavior());
+      createAudioData = vi.fn().mockImplementation((payload: { text: string }) => {
+        createAudioDataPayloads.push(payload);
+        return createAudioDataBehavior();
+      });
     },
     EDGE_TTS_PROTOCOL: 'wss',
   };
 });
 
-vi.mock('@/utils/ssml', () => ({
-  parseSSMLMarks: vi.fn(() => ({ marks: parsedMarks })),
-}));
+vi.mock('@/utils/ssml', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/ssml')>();
+  return {
+    ...actual,
+    parseSSMLMarks: vi.fn(() => ({ marks: parsedMarks })),
+  };
+});
 
 vi.mock('@/utils/misc', () => ({
   getUserLocale: vi.fn((lang: string) => (lang === 'en' ? 'en-US' : lang)),
@@ -85,6 +93,7 @@ describe('EdgeTTSClient', () => {
     createAudioDataBehavior = vi.fn<() => Promise<MockAudioDataResult>>(() =>
       Promise.resolve({ data: new ArrayBuffer(0), boundaries: [] }),
     );
+    createAudioDataPayloads = [];
     parsedMarks = [];
     client = new EdgeTTSClient();
   });
@@ -758,13 +767,40 @@ describe('EdgeTTSClient', () => {
 
     test('merges consecutive marks under the char budget into one request', async () => {
       parsedMarks = [
-        { name: '0', text: 'a'.repeat(40), language: 'en', offset: 0 },
-        { name: '1', text: 'b'.repeat(40), language: 'en', offset: 40 },
+        { name: '0', text: 'a'.repeat(20), language: 'en', offset: 0 },
+        { name: '1', text: 'b'.repeat(20), language: 'en', offset: 20 },
       ] as never;
       await client.init();
       await consumeParagraph(client.speak('<ssml/>', new AbortController().signal));
-      // 80 chars <= 120 => a single Edge request for both sentences.
+      // 40 chars fit even the reduced startup request budget.
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+    });
+
+    test('uses a small first request, then returns to the normal batch budget', async () => {
+      parsedMarks = [
+        { name: '0', text: 'a'.repeat(30), language: 'en', offset: 0 },
+        { name: '1', text: 'b'.repeat(30), language: 'en', offset: 30 },
+        { name: '2', text: 'c'.repeat(30), language: 'en', offset: 60 },
+      ] as never;
+      await client.init();
+
+      await consumeParagraph(client.speak('<first/>', new AbortController().signal, false, true));
+      expect(createAudioDataPayloads.map((payload) => payload.text.length)).toEqual([30, 60]);
+
+      createAudioDataPayloads = [];
+      await consumeParagraph(client.speak('<next/>', new AbortController().signal));
+      expect(createAudioDataPayloads.map((payload) => payload.text.length)).toEqual([90]);
+    });
+
+    test('skips a punctuation-only ellipsis mark without calling the Edge server', async () => {
+      parsedMarks = [{ name: '0', text: '……', language: 'zh', offset: 0 }] as never;
+      await client.init();
+
+      const it = client.speak('<ellipsis/>', new AbortController().signal);
+      const result = await it.next();
+
+      expect(result.value).toMatchObject({ code: 'end', message: 'Nothing to speak' });
+      expect(createAudioDataBehavior).not.toHaveBeenCalled();
     });
 
     test('splits marks that exceed the char budget into multiple requests', async () => {

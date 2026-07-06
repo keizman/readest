@@ -5,7 +5,7 @@ import { TTSClient, TTSMessageEvent } from './TTSClient';
 import { EdgeSpeechTTS, EdgeTTSPayload, EDGE_TTS_PROTOCOL, TTSWordBoundary } from '@/libs/edgeTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 import { AppService } from '@/types/system';
-import { parseSSMLMarks } from '@/utils/ssml';
+import { hasSpeakableText, parseSSMLMarks } from '@/utils/ssml';
 import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
@@ -57,6 +57,10 @@ interface MarkEntry {
 // highlighting is preserved by remapping the combined word-boundaries back to
 // each mark. Marks are never split, and a batch never mixes languages.
 const BATCH_MAX_CHARS = 120;
+// The first request should contain roughly one short sentence so playback can
+// begin after a single small synthesis response. Remaining batches keep the
+// normal budget and continue filling the existing look-ahead cache.
+const STARTUP_BATCH_MAX_CHARS = 40;
 
 export class EdgeTTSClient implements TTSClient {
   name = 'edge-tts';
@@ -147,7 +151,7 @@ export class EdgeTTSClient implements TTSClient {
     return defaultVoice?.id || this.#currentVoiceId || 'en-US-AriaNeural';
   };
 
-  async *speak(ssml: string, signal: AbortSignal, preload = false) {
+  async *speak(ssml: string, signal: AbortSignal, preload = false, startup = false) {
     const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
 
     if (preload) {
@@ -155,8 +159,8 @@ export class EdgeTTSClient implements TTSClient {
       // exact combined text that playback will request — otherwise the cache
       // would miss and playback would re-fetch mid-play. First couple of
       // batches immediately, the rest in the background.
-      const batches = this.#buildBatches(marks);
-      const maxImmediate = 2;
+      const batches = this.#buildBatches(marks, startup);
+      const maxImmediate = startup ? 1 : 2;
       const preloadBatch = async (batch: TTSMark[]) => {
         const voiceLang = batch[0]!.language;
         const voiceId = await this.getVoiceIdFromLang(voiceLang);
@@ -195,7 +199,7 @@ export class EdgeTTSClient implements TTSClient {
 
     await this.stopInternal();
 
-    const batches = this.#buildBatches(marks);
+    const batches = this.#buildBatches(marks, startup);
     if (batches.length === 0) {
       yield { code: 'end', message: 'Nothing to speak' } as TTSMessageEvent;
       return;
@@ -380,15 +384,21 @@ export class EdgeTTSClient implements TTSClient {
   // characters. Consecutive marks are merged until adding the next would exceed
   // the budget; a single over-long mark stands alone. A batch never mixes
   // languages so each Edge request has one voice/lang.
-  #buildBatches(marks: TTSMark[]): TTSMark[][] {
+  #buildBatches(marks: TTSMark[], startup = false): TTSMark[][] {
     const batches: TTSMark[][] = [];
     let current: TTSMark[] = [];
     let currentLen = 0;
     let currentLang: string | null = null;
     for (const mark of marks) {
+      // The hosted Edge service returns HTTP 500 / "No audio was received" for
+      // punctuation-only input such as `……`. Normally parseSSMLMarks removes
+      // it; keep this client-boundary guard so callbacks or future parsers can
+      // never send an unsynthesizable batch and strand auto-advance.
+      if (!hasSpeakableText(mark.text)) continue;
       const len = mark.text.length;
       const sameLang = currentLang === null || mark.language === currentLang;
-      if (current.length > 0 && (!sameLang || currentLen + len > BATCH_MAX_CHARS)) {
+      const maxChars = startup && batches.length === 0 ? STARTUP_BATCH_MAX_CHARS : BATCH_MAX_CHARS;
+      if (current.length > 0 && (!sameLang || currentLen + len > maxChars)) {
         batches.push(current);
         current = [];
         currentLen = 0;

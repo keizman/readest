@@ -173,6 +173,14 @@ describe('parseSSMLMarks', () => {
       expect(names).toContain('2');
     });
 
+    it('should skip a Chinese ellipsis-only mark', () => {
+      const ssml = ssmlWithLang('zh', '<mark name="0"/>……');
+      const { plainText, marks } = parseSSMLMarks(ssml);
+
+      expect(plainText).toBe('……');
+      expect(marks).toHaveLength(0);
+    });
+
     it('should handle empty SSML body', () => {
       const ssml = ssmlWithLang('en', '');
       const { plainText, marks } = parseSSMLMarks(ssml);

@@ -78,6 +78,7 @@ export class TTSController extends EventTarget {
   #consecutiveSpeakErrors: number = 0;
   #currentSpeakAbortController: AbortController | null = null;
   #currentSpeakPromise: Promise<void> | null = null;
+  #hasStartedPlayback = false;
 
   #ttsSectionIndex: number = -1;
 
@@ -347,9 +348,11 @@ export class TTSController extends EventTarget {
     }
   }
 
-  async preloadSSML(ssml: string | undefined, signal: AbortSignal) {
+  async preloadSSML(ssml: string | undefined, signal: AbortSignal, startup = false) {
     if (!ssml) return;
-    const iter = await this.ttsClient.speak(ssml, signal, true);
+    const iter = startup
+      ? await this.ttsClient.speak(ssml, signal, true, true)
+      : await this.ttsClient.speak(ssml, signal, true);
     for await (const _ of iter);
   }
 
@@ -477,6 +480,7 @@ export class TTSController extends EventTarget {
         }
 
         const { plainText, marks } = parseSSMLMarks(ssml);
+        const startup = !oneTime && !this.#hasStartedPlayback;
         if (!oneTime) {
           if (!plainText || marks.length === 0) {
             resolve();
@@ -484,12 +488,13 @@ export class TTSController extends EventTarget {
           } else {
             this.dispatchSpeakMark(marks[0]);
           }
-          await this.preloadSSML(ssml, signal);
+          await this.preloadSSML(ssml, signal, startup);
+          this.#hasStartedPlayback = true;
         }
         // Only the native client surfaces an offline engine failure as a
         // terminal 'error' code (Edge/Web throw, which the catch below handles).
         const canSkipOnError = this.ttsClient === this.ttsNativeClient;
-        const iter = await this.ttsClient.speak(ssml, signal);
+        const iter = await this.ttsClient.speak(ssml, signal, false, startup);
         let lastCode;
         for await (const { code } of iter) {
           if (signal.aborted) {

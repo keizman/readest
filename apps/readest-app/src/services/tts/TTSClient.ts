@@ -13,7 +13,12 @@ export interface TTSClient {
   initialized: boolean;
   init(): Promise<boolean>;
   shutdown(): Promise<void>;
-  speak(ssml: string, signal: AbortSignal, preload?: boolean): AsyncIterable<TTSMessageEvent>;
+  speak(
+    ssml: string,
+    signal: AbortSignal,
+    preload?: boolean,
+    startup?: boolean,
+  ): AsyncIterable<TTSMessageEvent>;
   pause(): Promise<boolean>;
   resume(): Promise<boolean>;
   stop(): Promise<void>;
