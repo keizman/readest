@@ -44,10 +44,10 @@ import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioP
 // (Edge's variable inter-sentence tail is cut off the slice). Marks dispatch
 // when a chunk becomes AUDIBLE (chunk-start rides source onended), not at fetch.
 
-// Fixed pause at every sentence/line chunk boundary (foliate splits at 。？！
-// and block/line breaks). Matches LONG_PAUSE_SEC so period/newline pacing
-// equals in-chunk sentence enders; scaled by playback rate (#2033).
-const INTER_SENTENCE_GAP_SEC = LONG_PAUSE_SEC;
+// Gap scheduled after each sentence chunk. Zero = gapless handoff to the next
+// chunk on the shared AudioContext timeline (punctuation pacing stays inside
+// the trimmed audio via planSilenceCompression).
+const INTER_SENTENCE_GAP_SEC = 0;
 // Keep this much audio past the first/last word when trimming a chunk's edges,
 // so word onsets/releases are not clipped (not Edge's baked sentence tail).
 const EDGE_KEEP_SEC = 0.02;

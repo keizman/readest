@@ -188,23 +188,23 @@ describe('EdgeTTSClient Web Audio playback', () => {
     expect(events[1]!.mark).toBe('1');
   });
 
-  test('chunks are scheduled with a rate-scaled gap and no element restarts', async () => {
+  test('chunks are scheduled gaplessly with no element restarts', async () => {
     parsedMarks = [
       { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
       { name: '1', text: 'Second sentence.', language: 'en' },
     ];
     const client = await startClient();
-    await client.setRate(1); // gap = LONG_PAUSE_SEC / 1
+    await client.setRate(1);
     const { done } = collectSpeak(client, new AbortController().signal);
     await flush();
     await flush();
     const [first, second] = ctx().sources;
-    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.009, 5);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0, 5);
     await ctx().advanceTo(5);
     await done;
   });
 
-  test('inter-batch gap shrinks when playback rate increases', async () => {
+  test('inter-batch scheduling stays gapless when playback rate increases', async () => {
     parsedMarks = [
       { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
       { name: '1', text: 'Second sentence.', language: 'en' },
@@ -215,7 +215,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
     await flush();
     const [first, second] = ctx().sources;
-    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0.009 / 2, 5);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0, 5);
     await ctx().advanceTo(5);
     await done;
   });
