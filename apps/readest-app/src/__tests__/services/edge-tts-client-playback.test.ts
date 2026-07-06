@@ -10,7 +10,7 @@ type MockAudioData = {
   boundaries: Array<{ offset: number; duration: number; text: string }>;
 };
 let createAudioDataBehavior: (payloadText: string) => Promise<MockAudioData>;
-let parsedMarks: Array<{ name: string; text: string; language: string }> = [];
+let parsedMarks: Array<{ offset?: number; name: string; text: string; language: string }> = [];
 
 vi.mock('@/libs/edgeTTS', () => {
   const voices = [{ id: 'en-US-AriaNeural', name: 'Aria', lang: 'en-US' }];
@@ -186,6 +186,36 @@ describe('EdgeTTSClient Web Audio playback', () => {
     expect(events.map((e) => e.code)).toEqual(['boundary', 'boundary', 'end']);
     expect(events[0]!.mark).toBe('0');
     expect(events[1]!.mark).toBe('1');
+  });
+
+  test('visual progress follows the audio clock before a delayed onended callback', async () => {
+    const firstText = 'First sentence.';
+    const secondText = 'Second sentence.';
+    parsedMarks = [
+      { offset: 0, name: '0', text: firstText, language: 'en' },
+      { offset: firstText.length, name: '1', text: secondText, language: 'en' },
+    ];
+    createAudioDataBehavior = async () => ({
+      data: new ArrayBuffer(48000),
+      boundaries: [
+        { offset: 1_000_000, duration: 5_000_000, text: 'First' },
+        { offset: 11_000_000, duration: 5_000_000, text: 'Second' },
+      ],
+    });
+    const client = await startClient();
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    const secondStart = ctx().sources[1]!.startedAt!;
+    // Move only the audio clock. Deliberately do not call advanceTo(), so the
+    // first source's onended callback remains delayed like a busy WebView.
+    ctx().currentTime = secondStart + 0.05;
+    runRaf();
+
+    expect(controller.dispatchSpeakMark).toHaveBeenLastCalledWith(parsedMarks[1]);
+    await ctx().advanceTo(5);
+    await done;
   });
 
   test('chunks are scheduled gaplessly with no element restarts', async () => {

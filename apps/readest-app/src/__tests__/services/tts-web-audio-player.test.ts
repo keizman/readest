@@ -61,12 +61,24 @@ describe('WebAudioPlayer scheduling', () => {
 });
 
 describe('WebAudioPlayer backpressure', () => {
-  test('third chunk waits until the first finishes while visible', async () => {
+  test('keeps at least five chunks queued while visible despite delayed onended callbacks', async () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    for (let i = 0; i < 5; i++) {
+      expect(await player.waitUntilReady(gen)).toBe(true);
+      player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    }
+    expect(ctx.sources).toHaveLength(5);
+  });
+
+  test('ninth chunk waits until the first finishes while visible', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    for (let i = 0; i < 8; i++) {
+      player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    }
     let resolved: boolean | null = null;
     const wait = player.waitUntilReady(gen).then((r) => {
       resolved = r;
@@ -78,7 +90,7 @@ describe('WebAudioPlayer backpressure', () => {
     expect(await wait).toBe(true);
   });
 
-  test('hidden visibility deepens the pending-chunk budget to 5', async () => {
+  test('hidden visibility deepens the pending-chunk budget to 16', async () => {
     setVisibility('hidden');
     const { player, onEvent } = setup();
     await player.ensureContext();
@@ -165,7 +177,7 @@ describe('WebAudioPlayer abort', () => {
     const { ctx, player, events, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 8; i++) {
       player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     }
     const wait = player.waitUntilReady(gen);

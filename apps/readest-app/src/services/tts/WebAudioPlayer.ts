@@ -83,10 +83,11 @@ interface PlayerSession {
 // Small offset so start() never lands in the past between the read of
 // currentTime and the schedule call.
 const SCHEDULE_SAFETY_SEC = 0.03;
-// Screen-off JS throttling must not starve the queue between onended and the
-// next schedule, so the pending budget deepens when the page is hidden.
-const MAX_PENDING_VISIBLE = 2;
-const MAX_PENDING_HIDDEN = 5;
+// Keep enough decoded chunks scheduled that delayed main-thread `onended`
+// delivery cannot drain the audio timeline. The page-hidden budget is deeper
+// because Android/WebKit may throttle JS callbacks aggressively after lock.
+const MAX_PENDING_VISIBLE = 8;
+const MAX_PENDING_HIDDEN = 16;
 // Bounds decoded PCM at slow rates (0.2x stretches a 30s sentence to 150s).
 const MAX_AHEAD_SEC = 60;
 

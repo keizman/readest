@@ -452,33 +452,27 @@ describe('EdgeTTSClient', () => {
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
     });
 
-    test('blocks startup on only the first speakable mark', async () => {
+    test('starts the next startup batch in parallel but waits only for the first batch', async () => {
       await client.init();
       parsedMarks = [
-        { name: '0', text: 'first', language: 'en' },
-        { name: '1', text: 'second', language: 'en' },
-        { name: '2', text: 'third', language: 'en' },
+        { name: '0', text: 'a'.repeat(30), language: 'en' },
+        { name: '1', text: 'b'.repeat(30), language: 'en' },
       ];
-      let resolveFirst: (value: MockAudioData) => void = () => {
-        throw new Error('First audio request was not started');
-      };
-      let hasFirstResolver = false;
+      const resolvers: Array<(value: MockAudioData) => void> = [];
       createAudioDataBehavior = vi.fn(
         () =>
           new Promise<MockAudioData>((resolve) => {
-            if (!hasFirstResolver) {
-              resolveFirst = resolve;
-              hasFirstResolver = true;
-            }
+            resolvers.push(resolve);
           }),
       );
 
       const iterator = client.speak('<ssml/>', new AbortController().signal, true, true);
       const pending = iterator.next();
 
-      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(1));
-      resolveFirst({ data: new ArrayBuffer(8), boundaries: [] });
+      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(2));
+      resolvers[0]!({ data: new ArrayBuffer(8), boundaries: [] });
       await pending;
+      resolvers[1]!({ data: new ArrayBuffer(8), boundaries: [] });
     });
 
     test('skips pure Chinese ellipsis without requesting Edge audio', async () => {

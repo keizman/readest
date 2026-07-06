@@ -104,6 +104,8 @@ export class EdgeTTSClient implements TTSClient {
   #chunkMeta: ChunkMeta[] = [];
   #isPlaying = false;
   #wordTrackingRafId: number | null = null;
+  #activeVisualChunkIndex = -1;
+  #activeWordIndex = -1;
 
   constructor(controller?: TTSController, appService?: AppService | null) {
     this.controller = controller;
@@ -238,6 +240,7 @@ export class EdgeTTSClient implements TTSClient {
     this.#activeGeneration = generation;
     await this.#player.ensureContext();
     this.#isPlaying = true;
+    this.#startPlaybackTracking(generation);
 
     this.#runScheduler(speakableMarks, signal, generation, queue, chunkMeta, startup);
 
@@ -255,8 +258,10 @@ export class EdgeTTSClient implements TTSClient {
         if (event.kind === 'chunk-start') {
           const meta = chunkMeta[event.index];
           if (!meta) continue;
-          this.controller?.dispatchSpeakMark(meta.mark);
-          this.#startWordTracking(generation, event.index, meta);
+          // onended is a background-safe fallback, but it can arrive after the
+          // audio clock has already crossed the boundary. The rAF tracker uses
+          // the same idempotent activation path for foreground accuracy.
+          this.#activateVisualChunk(generation, event.index);
           yield {
             code: 'boundary',
             message: `Start chunk: ${meta.mark.name}`,
@@ -316,26 +321,31 @@ export class EdgeTTSClient implements TTSClient {
         );
       }
     };
-    for (let i = 0; i < Math.min(maxImmediate, batches.length); i++) {
-      if (signal.aborted) break;
+    // Invoke immediate batches first (preserving batch-0 priority), then start
+    // later batches before awaiting them. Playback can therefore begin as soon
+    // as batch 0 is ready while batch 1 has already spent that synthesis time
+    // in flight, avoiding a startup sentence followed by a network-sized gap.
+    const immediatePromises = batches.slice(0, maxImmediate).map(async (batch, index) => {
+      if (signal.aborted) return;
       try {
-        await preloadBatch(batches[i]!);
+        await preloadBatch(batch);
       } catch (err) {
-        console.warn('Error preloading batch', i, err);
+        console.warn('Error preloading batch', index, err);
       }
-    }
-    if (batches.length > maxImmediate) {
-      (async () => {
-        for (let i = maxImmediate; i < batches.length; i++) {
-          if (signal.aborted || !hasTTSPrefetchCapacity()) break;
-          try {
-            await preloadBatch(batches[i]!);
-          } catch (err) {
-            console.warn('Error preloading batch (bg)', i, err);
-          }
+    });
+    const preloadRemaining = async () => {
+      for (let i = maxImmediate; i < batches.length; i++) {
+        if (signal.aborted || !hasTTSPrefetchCapacity()) break;
+        try {
+          await preloadBatch(batches[i]!);
+        } catch (err) {
+          console.warn('Error preloading batch (bg)', i, err);
         }
-      })();
-    }
+      }
+    };
+    const remainingPromise = batches.length > maxImmediate ? preloadRemaining() : null;
+    await Promise.all(immediatePromises);
+    void remainingPromise;
 
     yield {
       code: 'end',
@@ -363,7 +373,7 @@ export class EdgeTTSClient implements TTSClient {
     try {
       const batches = buildBatches(marks, startup);
       batchLoop: for (const batch of batches) {
-        if (signal.aborted || this.#activeGeneration !== generation) break batchLoop;
+        if (signal.aborted || this.#activeGeneration !== generation) break;
         const voiceLang = batch[0]!.language;
         const voiceId = await this.getVoiceIdFromLang(voiceLang);
         this.#speakingLang = voiceLang;
@@ -389,7 +399,7 @@ export class EdgeTTSClient implements TTSClient {
           queue.push({ kind: 'error', message });
           return;
         }
-        if (!audio || signal.aborted || this.#activeGeneration !== generation) break batchLoop;
+        if (!audio || signal.aborted || this.#activeGeneration !== generation) break;
 
         let decoded: TTSAudioBuffer;
         try {
@@ -539,29 +549,39 @@ export class EdgeTTSClient implements TTSClient {
     };
   }
 
-  // Poll the audio clock (visual concern only, so rAF throttling with the
-  // screen off is fine) and tell the controller which word is being spoken.
-  // The player reports original (rate-1.0) media time; boundaries were scaled
-  // to that same frame at fetch, so no rescaling is needed here.
-  #startWordTracking(generation: number, chunkIndex: number, meta: ChunkMeta): void {
+  #activateVisualChunk(generation: number, chunkIndex: number): ChunkMeta | null {
+    if (this.#activeGeneration !== generation) return null;
+    const meta = this.#chunkMeta[chunkIndex];
+    if (!meta) return null;
+    if (this.#activeVisualChunkIndex !== chunkIndex) {
+      this.#activeVisualChunkIndex = chunkIndex;
+      this.#activeWordIndex = -1;
+      this.controller?.dispatchSpeakMark(meta.mark);
+      this.controller?.prepareSpeakWords(meta.boundaries.map((boundary) => boundary.text));
+    }
+    return meta;
+  }
+
+  // Poll the authoritative audio clock for both sentence and word progress.
+  // `AudioBufferSourceNode.onended` remains the fallback when rAF is throttled,
+  // but foreground UI no longer waits for a delayed callback after the next
+  // already-scheduled chunk has become audible.
+  #startPlaybackTracking(generation: number): void {
     this.#stopWordTracking();
+    this.#activeVisualChunkIndex = -1;
+    this.#activeWordIndex = -1;
     const controller = this.controller;
-    if (!controller) return;
-    // Always hand the words to the controller — with boundaries it highlights
-    // word-by-word; with none it draws the sentence highlight that was
-    // suppressed at mark dispatch (see TTSController.prepareSpeakWords).
-    controller.prepareSpeakWords(meta.boundaries.map((boundary) => boundary.text));
-    if (!meta.boundaries.length) return;
-    let lastIndex = -1;
     const tick = () => {
+      if (this.#activeGeneration !== generation) return;
       const pos = this.#player.getPlaybackPosition(generation);
-      // Guard the one-frame window around a transition where this tick still
-      // holds the previous chunk's boundaries.
-      if (pos && pos.chunkIndex === chunkIndex) {
-        const index = findBoundaryIndexAtTime(meta.boundaries, pos.mediaTimeSec);
-        if (index !== lastIndex && index >= 0) {
-          lastIndex = index;
-          controller.dispatchSpeakWord(index);
+      if (pos) {
+        const meta = this.#activateVisualChunk(generation, pos.chunkIndex);
+        if (controller && meta?.boundaries.length) {
+          const index = findBoundaryIndexAtTime(meta.boundaries, pos.mediaTimeSec);
+          if (index !== this.#activeWordIndex && index >= 0) {
+            this.#activeWordIndex = index;
+            controller.dispatchSpeakWord(index);
+          }
         }
       }
       this.#wordTrackingRafId = requestAnimationFrame(tick);
@@ -596,6 +616,8 @@ export class EdgeTTSClient implements TTSClient {
 
   private async stopInternal() {
     this.#stopWordTracking();
+    this.#activeVisualChunkIndex = -1;
+    this.#activeWordIndex = -1;
     this.#isPlaying = false;
     if (this.#activeGeneration !== null) {
       this.#activeGeneration = null;

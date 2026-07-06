@@ -25,6 +25,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.media.MediaBrowserServiceCompat
 import androidx.media.session.MediaButtonReceiver
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -92,7 +93,13 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         instance = this
 
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        player = ExoPlayer.Builder(this).build()
+        player = ExoPlayer.Builder(this).build().apply {
+            // The player loops the silent media-session keep-alive while the
+            // WebView/Android TTS engine produces audible speech. Media3 owns
+            // and releases this CPU wake lock with playback, preventing Doze
+            // from suspending audio after the app is backgrounded then locked.
+            setWakeMode(C.WAKE_MODE_LOCAL)
+        }
 
         mediaSession = MediaSessionCompat(baseContext, "ReadestMediaSession").apply {
             stateBuilder = PlaybackStateCompat.Builder().setActions(
