@@ -17,6 +17,19 @@ const TRAILING_PUNCTUATION_RE = /[,.!?;:、，；：·•…\u2026\-–—。！
 export const endsAtPunctuation = (text: string): boolean =>
   TRAILING_PUNCTUATION_RE.test(text.trimEnd());
 
+// Pull more foliate paragraphs while the trailing Edge batch is still shorter
+// than BATCH_MAX_CHARS or lacks a closing punctuation boundary.
+export const shouldCollectMoreParagraphs = (batches: TTSMark[][], startup: boolean): boolean => {
+  if (batches.length === 0) return false;
+  const last = batches[batches.length - 1]!;
+  const lastText = last.map((m) => m.text).join('');
+  const lastLen = lastText.length;
+  if (startup && batches.length === 1 && lastLen < BATCH_MAX_CHARS) return true;
+  if (lastLen < BATCH_MAX_CHARS) return true;
+  if (!endsAtPunctuation(lastText)) return true;
+  return false;
+};
+
 export const buildBatches = (marks: TTSMark[], startup = false): TTSMark[][] => {
   const batches: TTSMark[][] = [];
   let current: TTSMark[] = [];

@@ -1,4 +1,4 @@
-import { TTSGranularity, TTSVoice, TTSVoicesGroup } from './types';
+import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 
 type TTSMessageCode = 'boundary' | 'error' | 'end';
 
@@ -15,6 +15,13 @@ export interface TTSClient {
   shutdown(): Promise<void>;
   speak(
     ssml: string,
+    signal: AbortSignal,
+    preload?: boolean,
+    startup?: boolean,
+  ): AsyncIterable<TTSMessageEvent>;
+  // Edge-only: synthesize an explicit mark list (possibly spanning paragraphs).
+  speakMarks?(
+    marks: TTSMark[],
     signal: AbortSignal,
     preload?: boolean,
     startup?: boolean,

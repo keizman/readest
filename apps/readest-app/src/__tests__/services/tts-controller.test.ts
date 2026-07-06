@@ -85,14 +85,16 @@ import { parseSSMLMarks } from '@/utils/ssml';
 // --- Helper: create mock TTS client ---
 
 function createMockTTSClient(name: string): TTSClient {
+  const speakImpl = async function* (): AsyncGenerator<TTSMessageEvent> {
+    yield { code: 'end' };
+  };
   return {
     name,
     initialized: false,
     init: vi.fn().mockResolvedValue(true),
     shutdown: vi.fn().mockResolvedValue(undefined),
-    speak: vi.fn().mockImplementation(async function* (): AsyncGenerator<TTSMessageEvent> {
-      yield { code: 'end' };
-    }),
+    speak: vi.fn().mockImplementation(speakImpl),
+    ...(name === 'edge' ? { speakMarks: vi.fn().mockImplementation(speakImpl) } : {}),
     pause: vi.fn().mockResolvedValue(true),
     resume: vi.fn().mockResolvedValue(true),
     stop: vi.fn().mockResolvedValue(undefined),
@@ -1319,6 +1321,7 @@ describe('TTSController', () => {
     });
 
     test('buffers at least five minutes even when the text has many short paragraphs', async () => {
+      await controller.init();
       const paragraph = Array.from({ length: 20 }, () => 'word').join(' ');
       const paragraphs = Array.from({ length: 50 }, () => `<speak>${paragraph}</speak>`);
       let index = 0;
@@ -1327,30 +1330,40 @@ describe('TTSController', () => {
         prev: vi.fn(),
         doc: {},
       } as unknown as FoliateView['tts'];
-      const preloadSpy = vi.spyOn(controller, 'preloadSSML').mockResolvedValue();
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {});
 
       await controller.preloadNextSSML();
 
       // 20 words is ~6.7 seconds at 180 wpm, so a five-minute buffer needs
-      // about 45 paragraphs. The previous 16-paragraph cap only held ~107s.
-      expect(preloadSpy.mock.calls.length).toBeGreaterThanOrEqual(45);
-      expect(mockView.tts!.prev).toHaveBeenCalledTimes(preloadSpy.mock.calls.length);
+      // about 45 paragraphs. Edge now batches them into one cross-paragraph
+      // preload instead of one HTTP request per paragraph.
+      expect(speakMarksSpy).toHaveBeenCalledOnce();
+      const marksArg = speakMarksSpy.mock.calls[0]?.[0];
+      expect(marksArg).toBeDefined();
+      expect(marksArg!.length).toBeGreaterThanOrEqual(45);
+      expect(mockView.tts!.prev).toHaveBeenCalledTimes(marksArg!.length);
     });
 
     test('continues prefetching into the next section when the current one is too short', async () => {
+      await controller.init();
       await controller.initViewTTS(0);
       mockView.tts = {
         next: vi.fn().mockReturnValue(undefined),
         prev: vi.fn(),
         doc: {},
       } as unknown as FoliateView['tts'];
-      const preloadSpy = vi.spyOn(controller, 'preloadSSML').mockResolvedValue();
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {});
       const nextSection = mockView.book.sections![1]!;
 
       await controller.preloadNextSSML(1, 2);
 
       expect(nextSection.createDocument).toHaveBeenCalledOnce();
-      expect(preloadSpy).toHaveBeenCalledTimes(2);
+      expect(speakMarksSpy).toHaveBeenCalledOnce();
+      expect(speakMarksSpy.mock.calls[0]?.[0]).toHaveLength(2);
     });
   });
 

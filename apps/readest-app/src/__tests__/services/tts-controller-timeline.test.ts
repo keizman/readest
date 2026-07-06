@@ -8,29 +8,33 @@ import { FoliateView } from '@/types/view';
 // controller suite); foliate tts.js provides a REAL-shaped getSentences fake
 // that yields ranges from a jsdom document.
 
-const makeMockClient = (name: string): TTSClient => ({
-  name,
-  initialized: true,
-  init: vi.fn().mockResolvedValue(true),
-  shutdown: vi.fn().mockResolvedValue(undefined),
-  speak: vi.fn().mockImplementation(async function* (): AsyncIterable<TTSMessageEvent> {
+const makeMockClient = (name: string): TTSClient => {
+  const speakImpl = async function* (): AsyncIterable<TTSMessageEvent> {
     yield { code: 'end', message: 'done' };
-  }),
-  pause: vi.fn().mockResolvedValue(true),
-  resume: vi.fn().mockResolvedValue(true),
-  stop: vi.fn().mockResolvedValue(undefined),
-  setPrimaryLang: vi.fn(),
-  setRate: vi.fn().mockResolvedValue(undefined),
-  setPitch: vi.fn().mockResolvedValue(undefined),
-  setVoice: vi.fn().mockResolvedValue(undefined),
-  getAllVoices: vi.fn().mockResolvedValue([]),
-  getVoices: vi.fn().mockResolvedValue([]),
-  getGranularities: vi.fn().mockReturnValue(['sentence']),
-  supportsWordBoundaries: vi.fn().mockReturnValue(true),
-  getVoiceId: vi.fn().mockReturnValue('timeline-ctrl-voice'),
-  getSpeakingLang: vi.fn().mockReturnValue('en'),
-  getChunkPosition: vi.fn().mockReturnValue(0.5),
-});
+  };
+  return {
+    name,
+    initialized: true,
+    init: vi.fn().mockResolvedValue(true),
+    shutdown: vi.fn().mockResolvedValue(undefined),
+    speak: vi.fn().mockImplementation(speakImpl),
+    ...(name === 'edge-tts' ? { speakMarks: vi.fn().mockImplementation(speakImpl) } : {}),
+    pause: vi.fn().mockResolvedValue(true),
+    resume: vi.fn().mockResolvedValue(true),
+    stop: vi.fn().mockResolvedValue(undefined),
+    setPrimaryLang: vi.fn(),
+    setRate: vi.fn().mockResolvedValue(undefined),
+    setPitch: vi.fn().mockResolvedValue(undefined),
+    setVoice: vi.fn().mockResolvedValue(undefined),
+    getAllVoices: vi.fn().mockResolvedValue([]),
+    getVoices: vi.fn().mockResolvedValue([]),
+    getGranularities: vi.fn().mockReturnValue(['sentence']),
+    supportsWordBoundaries: vi.fn().mockReturnValue(true),
+    getVoiceId: vi.fn().mockReturnValue('timeline-ctrl-voice'),
+    getSpeakingLang: vi.fn().mockReturnValue('en'),
+    getChunkPosition: vi.fn().mockReturnValue(0.5),
+  };
+};
 
 vi.mock('@/services/tts/WebSpeechClient', () => ({
   WebSpeechClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {

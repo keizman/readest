@@ -6,6 +6,7 @@ import {
   buildBatches,
   endsAtPunctuation,
   partitionBatch,
+  shouldCollectMoreParagraphs,
 } from '@/services/tts/ttsBatch';
 import { TTSMark } from '@/services/tts/types';
 
@@ -59,6 +60,32 @@ describe('buildBatches', () => {
   test('skips punctuation-only marks', () => {
     const batches = buildBatches([mark('0', '……', 'zh')]);
     expect(batches).toHaveLength(0);
+  });
+
+  test('merges short paragraphs when batching across marks', () => {
+    const paraA = mark('0', '短段落一。', 'zh');
+    const paraB = mark('1', '短段落二。', 'zh');
+    const paraC = mark('2', `${'中'.repeat(118)}。`, 'zh');
+    const batches = buildBatches([paraA, paraB, paraC]);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.map((m) => m.text).join('').length).toBeGreaterThanOrEqual(BATCH_MAX_CHARS);
+  });
+});
+
+describe('shouldCollectMoreParagraphs', () => {
+  test('keeps collecting while the trailing batch is under 120 chars', () => {
+    const batches = buildBatches([mark('0', 'a'.repeat(48))]);
+    expect(shouldCollectMoreParagraphs(batches, false)).toBe(true);
+  });
+
+  test('stops once the trailing batch closes at punctuation with 120+ chars', () => {
+    const batches = buildBatches([mark('0', `${'a'.repeat(119)},`)]);
+    expect(shouldCollectMoreParagraphs(batches, false)).toBe(false);
+  });
+
+  test('startup keeps collecting after the fast-start batch', () => {
+    const batches = buildBatches([mark('0', 'a'.repeat(30))], true);
+    expect(shouldCollectMoreParagraphs(batches, true)).toBe(true);
   });
 });
 

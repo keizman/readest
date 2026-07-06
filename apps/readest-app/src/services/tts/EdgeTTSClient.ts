@@ -190,11 +190,17 @@ export class EdgeTTSClient implements TTSClient {
 
   async *speak(ssml: string, signal: AbortSignal, preload = false, startup = false) {
     const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
-    // The hosted Edge service returns HTTP 500 / "No audio was received" for
-    // punctuation-only input such as `……`. Keep this client-boundary filter in
-    // addition to the parser guard so callbacks can never strand auto-advance.
     const speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
+    yield* this.speakMarks(speakableMarks, signal, preload, startup);
+  }
 
+  // Speak or preload an explicit mark list (possibly spanning foliate paragraphs).
+  async *speakMarks(
+    speakableMarks: TTSMark[],
+    signal: AbortSignal,
+    preload = false,
+    startup = false,
+  ) {
     if (preload) {
       yield* this.#preload(speakableMarks, signal, startup);
       return;

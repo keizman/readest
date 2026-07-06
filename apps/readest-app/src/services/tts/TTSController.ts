@@ -19,6 +19,7 @@ import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { hasTTSPrefetchCapacity } from '@/libs/edgeTTS';
 import { EdgeTTSClient } from './EdgeTTSClient';
+import { buildBatches, shouldCollectMoreParagraphs } from './ttsBatch';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
 import { TTSClient } from './TTSClient';
@@ -47,6 +48,8 @@ let ttsPositionSequence = 0;
 // English dialogue. Prefetch continues into following sections when needed.
 const PREFETCH_TARGET_SECONDS = 5 * 60;
 const PREFETCH_MAX_PARAGRAPHS = 100;
+// Cap how many foliate paragraphs one Edge speak() may span when batching.
+const CROSS_PARAGRAPH_MAX = 50;
 
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
 // utterance it cannot synthesize offline — typically a specific unsupported
@@ -120,6 +123,7 @@ export class TTSController extends EventTarget {
   #currentSpeakAbortController: AbortController | null = null;
   #currentSpeakPromise: Promise<void> | null = null;
   #hasStartedPlayback = false;
+  #paragraphsConsumedThisSpeak = 1;
 
   #ttsSectionIndex: number = -1;
 
@@ -167,7 +171,7 @@ export class TTSController extends EventTarget {
   ttsRate: number = 1.0;
   ttsClient: TTSClient;
   ttsWebClient: TTSClient;
-  ttsEdgeClient: TTSClient;
+  ttsEdgeClient: EdgeTTSClient;
   ttsNativeClient: TTSClient | null = null;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
@@ -628,10 +632,59 @@ export class TTSController extends EventTarget {
 
   async preloadSSML(ssml: string | undefined, signal: AbortSignal, startup = false) {
     if (!ssml) return;
+    if (this.ttsClient === this.ttsEdgeClient) {
+      const { marks } = await this.#collectSpeakableMarksCrossParagraph(ssml, startup);
+      if (marks.length === 0) return;
+      const iter = startup
+        ? this.ttsEdgeClient.speakMarks(marks, signal, true, true)
+        : this.ttsEdgeClient.speakMarks(marks, signal, true);
+      for await (const _ of iter);
+      return;
+    }
     const iter = startup
       ? await this.ttsClient.speak(ssml, signal, true, true)
       : await this.ttsClient.speak(ssml, signal, true);
     for await (const _ of iter);
+  }
+
+  async #preloadMarks(marks: TTSMark[], signal: AbortSignal) {
+    if (marks.length === 0 || this.ttsClient !== this.ttsEdgeClient) return;
+    const iter = this.ttsEdgeClient.speakMarks(marks, signal, true);
+    for await (const _ of iter);
+  }
+
+  #appendSpeakableMarksFromSSML = (marks: TTSMark[], ssml: string) => {
+    const parsed = parseSSMLMarks(ssml, this.ttsLang);
+    for (const mark of parsed.marks) {
+      if (hasSpeakableText(mark.text)) marks.push(mark);
+    }
+  };
+
+  async #collectSpeakableMarksCrossParagraph(
+    initialSsml: string,
+    startup: boolean,
+  ): Promise<{ marks: TTSMark[]; paragraphsConsumed: number }> {
+    const marks: TTSMark[] = [];
+    this.#appendSpeakableMarksFromSSML(marks, initialSsml);
+    const tts = this.#getTts();
+    let peekCount = 0;
+
+    while (
+      peekCount < CROSS_PARAGRAPH_MAX - 1 &&
+      shouldCollectMoreParagraphs(buildBatches(marks, startup), startup)
+    ) {
+      const nextRaw = tts?.next();
+      if (!nextRaw) break;
+      peekCount++;
+      const nextSsml = await this.#preprocessSSML(nextRaw);
+      if (nextSsml) this.#appendSpeakableMarksFromSSML(marks, nextSsml);
+    }
+
+    for (let i = 0; i < peekCount; i++) {
+      tts?.prev();
+    }
+
+    return { marks, paragraphsConsumed: 1 + peekCount };
   }
 
   async preloadNextSSML(
@@ -660,14 +713,14 @@ export class TTSController extends EventTarget {
       tts.prev();
     }
 
-    // Preload nearest-first and sequentially so the buffer fills in reading
-    // order and requests ramp up rather than firing every paragraph at once
-    // (gentler on the self-hosted TTS server). Callers don't await this, so the
-    // sequential fill runs in the background without blocking playback.
+    const preloadMarks: TTSMark[] = [];
     for (const raw of rawSsmls) {
       if (!hasTTSPrefetchCapacity()) break;
       const ssml = await this.#preprocessSSML(raw);
-      if (ssml) await this.preloadSSML(ssml, new AbortController().signal);
+      if (ssml) this.#appendSpeakableMarksFromSSML(preloadMarks, ssml);
+    }
+    if (preloadMarks.length > 0) {
+      await this.#preloadMarks(preloadMarks, new AbortController().signal);
     }
 
     // A chapter boundary must not shrink the offline window. Build isolated
@@ -693,6 +746,7 @@ export class TTSController extends EventTarget {
         html.setAttribute('xml:lang', this.ttsLang);
       }
       const sectionTTS = await this.#createTTS(doc, () => {});
+      const sectionMarks: TTSMark[] = [];
       let raw = sectionTTS.start();
       while (
         raw &&
@@ -703,8 +757,11 @@ export class TTSController extends EventTarget {
         estimatedSeconds += estimateSpeechDuration(raw.replace(/<[^>]+>/g, ''), this.ttsRate);
         paragraphCount++;
         const ssml = await this.#preprocessSSML(raw);
-        if (ssml) await this.preloadSSML(ssml, new AbortController().signal);
+        if (ssml) this.#appendSpeakableMarksFromSSML(sectionMarks, ssml);
         raw = sectionTTS.next();
+      }
+      if (sectionMarks.length > 0) {
+        await this.#preloadMarks(sectionMarks, new AbortController().signal);
       }
     }
   }
@@ -768,9 +825,17 @@ export class TTSController extends EventTarget {
           this.#nossmlCnt = 0;
         }
 
-        const { marks } = parseSSMLMarks(ssml);
-        const speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
         const startup = !oneTime && !this.#hasStartedPlayback;
+        let speakableMarks: TTSMark[] = [];
+        if (this.ttsClient === this.ttsEdgeClient) {
+          const collected = await this.#collectSpeakableMarksCrossParagraph(ssml, startup);
+          speakableMarks = collected.marks;
+          this.#paragraphsConsumedThisSpeak = collected.paragraphsConsumed;
+        } else {
+          const { marks } = parseSSMLMarks(ssml);
+          speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
+          this.#paragraphsConsumedThisSpeak = 1;
+        }
         if (!oneTime) {
           if (speakableMarks.length === 0) {
             resolve();
@@ -784,7 +849,10 @@ export class TTSController extends EventTarget {
         // Only the native client surfaces an offline engine failure as a
         // terminal 'error' code (Edge/Web throw, which the catch below handles).
         const canSkipOnError = this.ttsClient === this.ttsNativeClient;
-        const iter = await this.ttsClient.speak(ssml, signal, false, startup);
+        const iter =
+          this.ttsClient === this.ttsEdgeClient
+            ? this.ttsEdgeClient.speakMarks(speakableMarks, signal, false, startup)
+            : await this.ttsClient.speak(ssml, signal, false, startup);
         let lastCode;
         let lastMessage: string | undefined;
         for await (const { code, message } of iter) {
@@ -804,6 +872,10 @@ export class TTSController extends EventTarget {
         if (lastCode === 'end' && this.state === 'playing' && !oneTime) {
           this.#consecutiveSpeakErrors = 0;
           resolve();
+          const tts = this.#getTts();
+          for (let i = 0; i < this.#paragraphsConsumedThisSpeak - 1; i++) {
+            tts?.next();
+          }
           await this.forward();
         } else if (
           lastCode === 'error' &&

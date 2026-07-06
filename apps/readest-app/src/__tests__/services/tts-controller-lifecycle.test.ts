@@ -7,28 +7,32 @@ import { FoliateView } from '@/types/view';
 // channel, and terminal (tts-session-ended) semantics. Mocks mirror the
 // controller-timeline suite's harness.
 
-const makeMockClient = (name: string): TTSClient => ({
-  name,
-  initialized: true,
-  init: vi.fn().mockResolvedValue(true),
-  shutdown: vi.fn().mockResolvedValue(undefined),
-  speak: vi.fn().mockImplementation(async function* (): AsyncIterable<TTSMessageEvent> {
+const makeMockClient = (name: string): TTSClient => {
+  const speakImpl = async function* (): AsyncIterable<TTSMessageEvent> {
     yield { code: 'end', message: 'done' };
-  }),
-  pause: vi.fn().mockResolvedValue(true),
-  resume: vi.fn().mockResolvedValue(true),
-  stop: vi.fn().mockResolvedValue(undefined),
-  setPrimaryLang: vi.fn(),
-  setRate: vi.fn().mockResolvedValue(undefined),
-  setPitch: vi.fn().mockResolvedValue(undefined),
-  setVoice: vi.fn().mockResolvedValue(undefined),
-  getAllVoices: vi.fn().mockResolvedValue([]),
-  getVoices: vi.fn().mockResolvedValue([]),
-  getGranularities: vi.fn().mockReturnValue(['sentence']),
-  supportsWordBoundaries: vi.fn().mockReturnValue(false),
-  getVoiceId: vi.fn().mockReturnValue('lifecycle-voice'),
-  getSpeakingLang: vi.fn().mockReturnValue('en'),
-});
+  };
+  return {
+    name,
+    initialized: true,
+    init: vi.fn().mockResolvedValue(true),
+    shutdown: vi.fn().mockResolvedValue(undefined),
+    speak: vi.fn().mockImplementation(speakImpl),
+    ...(name === 'edge-tts' ? { speakMarks: vi.fn().mockImplementation(speakImpl) } : {}),
+    pause: vi.fn().mockResolvedValue(true),
+    resume: vi.fn().mockResolvedValue(true),
+    stop: vi.fn().mockResolvedValue(undefined),
+    setPrimaryLang: vi.fn(),
+    setRate: vi.fn().mockResolvedValue(undefined),
+    setPitch: vi.fn().mockResolvedValue(undefined),
+    setVoice: vi.fn().mockResolvedValue(undefined),
+    getAllVoices: vi.fn().mockResolvedValue([]),
+    getVoices: vi.fn().mockResolvedValue([]),
+    getGranularities: vi.fn().mockReturnValue(['sentence']),
+    supportsWordBoundaries: vi.fn().mockReturnValue(false),
+    getVoiceId: vi.fn().mockReturnValue('lifecycle-voice'),
+    getSpeakingLang: vi.fn().mockReturnValue('en'),
+  };
+};
 
 vi.mock('@/services/tts/WebSpeechClient', () => ({
   WebSpeechClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
@@ -166,7 +170,7 @@ describe('TTSController lifecycle', () => {
     // Hold the auto-advance chain after one paragraph: a speak that ends on
     // 'boundary' does not trigger forward(), so the single advance under test
     // is isolated from the mock queue running dry.
-    (controller.ttsClient.speak as ReturnType<typeof vi.fn>).mockImplementation(
+    (controller.ttsEdgeClient.speakMarks as ReturnType<typeof vi.fn>).mockImplementation(
       async function* (): AsyncIterable<TTSMessageEvent> {
         yield { code: 'boundary', message: 'chunk', mark: '0' };
       },
@@ -197,7 +201,7 @@ describe('TTSController lifecycle', () => {
     controller.state = 'playing';
     await controller.forward(); // terminates
     expect(controller.terminated).toBe(true);
-    (controller.ttsClient.speak as ReturnType<typeof vi.fn>).mockImplementation(
+    (controller.ttsEdgeClient.speakMarks as ReturnType<typeof vi.fn>).mockImplementation(
       async function* (): AsyncIterable<TTSMessageEvent> {
         yield { code: 'boundary', message: 'chunk', mark: '0' };
       },
