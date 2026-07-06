@@ -19,7 +19,6 @@ import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { hasTTSPrefetchCapacity } from '@/libs/edgeTTS';
 import { EdgeTTSClient } from './EdgeTTSClient';
-import { buildBatches, shouldCollectMoreParagraphs } from './ttsBatch';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
 import { TTSClient } from './TTSClient';
@@ -48,8 +47,7 @@ let ttsPositionSequence = 0;
 // English dialogue. Prefetch continues into following sections when needed.
 const PREFETCH_TARGET_SECONDS = 5 * 60;
 const PREFETCH_MAX_PARAGRAPHS = 100;
-// Cap how many foliate paragraphs one Edge speak() may span when batching.
-const CROSS_PARAGRAPH_MAX = 50;
+const PREFETCH_PARALLELISM = 4;
 
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
 // utterance it cannot synthesize offline — typically a specific unsupported
@@ -123,8 +121,6 @@ export class TTSController extends EventTarget {
   #currentSpeakAbortController: AbortController | null = null;
   #currentSpeakPromise: Promise<void> | null = null;
   #hasStartedPlayback = false;
-  #paragraphsConsumedThisSpeak = 1;
-
   #ttsSectionIndex: number = -1;
 
   // Virtual section timeline for position/duration/seek (Edge client only).
@@ -551,8 +547,11 @@ export class TTSController extends EventTarget {
     const duration = timeline.getDuration();
     if (!Number.isFinite(duration) || duration <= 0) return null;
     let index = -1;
+    const snapshot =
+      this.ttsClient === this.ttsEdgeClient ? this.ttsEdgeClient.getPlaybackSnapshot() : null;
     const activeMark =
-      this.ttsClient === this.ttsEdgeClient ? this.ttsEdgeClient.getCurrentSpeakMark() : null;
+      snapshot?.mark ??
+      (this.ttsClient === this.ttsEdgeClient ? this.ttsEdgeClient.getCurrentSpeakMark() : null);
     if (activeMark) {
       index = timeline.indexOfMark(activeMark);
     }
@@ -565,7 +564,7 @@ export class TTSController extends EventTarget {
       index = range ? timeline.indexOfRange(range) : -1;
     }
     if (index < 0) return null;
-    const within = this.ttsClient.getChunkPosition?.() ?? 0;
+    const within = snapshot?.position ?? this.ttsClient.getChunkPosition?.() ?? 0;
     return {
       position: timeline.positionAt(index, within),
       duration,
@@ -643,12 +642,10 @@ export class TTSController extends EventTarget {
   async preloadSSML(ssml: string | undefined, signal: AbortSignal, startup = false) {
     if (!ssml) return;
     if (this.ttsClient === this.ttsEdgeClient) {
-      const { marks } = await this.#collectSpeakableMarksCrossParagraph(ssml, startup);
-      if (marks.length === 0) return;
-      const iter = startup
-        ? this.ttsEdgeClient.speakMarks(marks, signal, true, true)
-        : this.ttsEdgeClient.speakMarks(marks, signal, true);
-      for await (const _ of iter);
+      const { marks } = parseSSMLMarks(ssml, this.ttsLang);
+      const speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
+      if (speakableMarks.length === 0) return;
+      await this.#preloadMarks(speakableMarks, signal, startup);
       return;
     }
     const iter = startup
@@ -657,55 +654,43 @@ export class TTSController extends EventTarget {
     for await (const _ of iter);
   }
 
-  async #preloadMarks(marks: TTSMark[], signal: AbortSignal) {
+  async #preloadMarks(marks: TTSMark[], signal: AbortSignal, startup = false) {
     if (marks.length === 0 || this.ttsClient !== this.ttsEdgeClient) return;
-    const iter = this.ttsEdgeClient.speakMarks(marks, signal, true);
+    const iter = this.ttsEdgeClient.speakMarks(marks, signal, true, startup);
     for await (const _ of iter);
   }
 
-  #appendSpeakableMarksFromSSML = (marks: TTSMark[], ssml: string, captureRange = false) => {
+  #appendSpeakableMarksFromSSML = (marks: TTSMark[], ssml: string) => {
     const parsed = parseSSMLMarks(ssml, this.ttsLang);
-    const tts = captureRange ? this.#getTts() : null;
     for (const mark of parsed.marks) {
       if (!hasSpeakableText(mark.text)) continue;
-      const raw = tts?.setMark(mark.name);
-      const range = raw?.cloneRange();
-      marks.push(range ? { ...mark, range } : mark);
+      marks.push(mark);
     }
   };
 
-  // Range of the mark currently being spoken. Cross-paragraph batches attach a
-  // captured range and skip setMark, so foliate's getLastRange() stays stale.
+  // Range of the mark currently being spoken. Prefer the controller snapshot:
+  // it remains stable while foliate rebuilds its internal mark map.
   #getActiveSpeakRange(): Range | null {
     if (this.#currentSpeakRange) return this.#currentSpeakRange.cloneRange();
     return this.#getTts()?.getLastRange() ?? null;
   }
 
-  async #collectSpeakableMarksCrossParagraph(
-    initialSsml: string,
-    startup: boolean,
-  ): Promise<{ marks: TTSMark[]; paragraphsConsumed: number }> {
-    const marks: TTSMark[] = [];
-    this.#appendSpeakableMarksFromSSML(marks, initialSsml, true);
-    const tts = this.#getTts();
-    let peekCount = 0;
-
-    while (
-      peekCount < CROSS_PARAGRAPH_MAX - 1 &&
-      shouldCollectMoreParagraphs(buildBatches(marks, startup), startup)
-    ) {
-      const nextRaw = tts?.next();
-      if (!nextRaw) break;
-      peekCount++;
-      const nextSsml = await this.#preprocessSSML(nextRaw);
-      if (nextSsml) this.#appendSpeakableMarksFromSSML(marks, nextSsml, true);
-    }
-
-    for (let i = 0; i < peekCount; i++) {
-      tts?.prev();
-    }
-
-    return { marks, paragraphsConsumed: 1 + peekCount };
+  async #preloadRawParagraphs(rawSsmls: string[]): Promise<void> {
+    let nextIndex = 0;
+    const worker = async () => {
+      for (;;) {
+        const index = nextIndex++;
+        if (index >= rawSsmls.length || !hasTTSPrefetchCapacity()) return;
+        const ssml = await this.#preprocessSSML(rawSsmls[index]);
+        if (!ssml) continue;
+        const marks: TTSMark[] = [];
+        this.#appendSpeakableMarksFromSSML(marks, ssml);
+        await this.#preloadMarks(marks, new AbortController().signal);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PREFETCH_PARALLELISM, rawSsmls.length) }, () => worker()),
+    );
   }
 
   async preloadNextSSML(
@@ -734,15 +719,7 @@ export class TTSController extends EventTarget {
       tts.prev();
     }
 
-    const preloadMarks: TTSMark[] = [];
-    for (const raw of rawSsmls) {
-      if (!hasTTSPrefetchCapacity()) break;
-      const ssml = await this.#preprocessSSML(raw);
-      if (ssml) this.#appendSpeakableMarksFromSSML(preloadMarks, ssml);
-    }
-    if (preloadMarks.length > 0) {
-      await this.#preloadMarks(preloadMarks, new AbortController().signal);
-    }
+    await this.#preloadRawParagraphs(rawSsmls);
 
     // A chapter boundary must not shrink the offline window. Build isolated
     // TTS iterators for following sections, so look-ahead can continue without
@@ -767,7 +744,7 @@ export class TTSController extends EventTarget {
         html.setAttribute('xml:lang', this.ttsLang);
       }
       const sectionTTS = await this.#createTTS(doc, () => {});
-      const sectionMarks: TTSMark[] = [];
+      const sectionRawSsmls: string[] = [];
       let raw = sectionTTS.start();
       while (
         raw &&
@@ -777,13 +754,10 @@ export class TTSController extends EventTarget {
       ) {
         estimatedSeconds += estimateSpeechDuration(raw.replace(/<[^>]+>/g, ''), this.ttsRate);
         paragraphCount++;
-        const ssml = await this.#preprocessSSML(raw);
-        if (ssml) this.#appendSpeakableMarksFromSSML(sectionMarks, ssml);
+        sectionRawSsmls.push(raw);
         raw = sectionTTS.next();
       }
-      if (sectionMarks.length > 0) {
-        await this.#preloadMarks(sectionMarks, new AbortController().signal);
-      }
+      await this.#preloadRawParagraphs(sectionRawSsmls);
     }
   }
 
@@ -847,16 +821,8 @@ export class TTSController extends EventTarget {
         }
 
         const startup = !oneTime && !this.#hasStartedPlayback;
-        let speakableMarks: TTSMark[] = [];
-        if (this.ttsClient === this.ttsEdgeClient) {
-          const collected = await this.#collectSpeakableMarksCrossParagraph(ssml, startup);
-          speakableMarks = collected.marks;
-          this.#paragraphsConsumedThisSpeak = collected.paragraphsConsumed;
-        } else {
-          const { marks } = parseSSMLMarks(ssml);
-          speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
-          this.#paragraphsConsumedThisSpeak = 1;
-        }
+        const { marks } = parseSSMLMarks(ssml, this.ttsLang);
+        const speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
         if (!oneTime) {
           if (speakableMarks.length === 0) {
             resolve();
@@ -864,7 +830,13 @@ export class TTSController extends EventTarget {
           } else {
             this.dispatchSpeakMark(speakableMarks[0]);
           }
-          await this.preloadSSML(ssml, signal, startup);
+          if (this.ttsClient === this.ttsEdgeClient) {
+            // Paragraph-local marks guarantee preload and playback produce the
+            // same Edge batch keys and keep foliate's cursor authoritative.
+            await this.#preloadMarks(speakableMarks, signal, startup);
+          } else {
+            await this.preloadSSML(ssml, signal, startup);
+          }
           this.#hasStartedPlayback = true;
         }
         // Only the native client surfaces an offline engine failure as a
@@ -893,10 +865,6 @@ export class TTSController extends EventTarget {
         if (lastCode === 'end' && this.state === 'playing' && !oneTime) {
           this.#consecutiveSpeakErrors = 0;
           resolve();
-          const tts = this.#getTts();
-          for (let i = 0; i < this.#paragraphsConsumedThisSpeak - 1; i++) {
-            tts?.next();
-          }
           await this.forward();
         } else if (
           lastCode === 'error' &&

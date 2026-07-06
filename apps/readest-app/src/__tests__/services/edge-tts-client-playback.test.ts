@@ -11,6 +11,7 @@ type MockAudioData = {
 };
 let createAudioDataBehavior: (payloadText: string) => Promise<MockAudioData>;
 let parsedMarks: Array<{ offset?: number; name: string; text: string; language: string }> = [];
+let hasPrefetchCapacity = true;
 
 vi.mock('@/libs/edgeTTS', () => {
   const voices = [{ id: 'en-US-AriaNeural', name: 'Aria', lang: 'en-US' }];
@@ -25,7 +26,7 @@ vi.mock('@/libs/edgeTTS', () => {
     EDGE_TTS_PROTOCOL: 'wss',
     TTS_AUDIO_CACHE_MAX_BYTES: 5 * 60 * 6 * 1024,
     getTTSAudioCacheBytes: () => 0,
-    hasTTSPrefetchCapacity: () => true,
+    hasTTSPrefetchCapacity: () => hasPrefetchCapacity,
   };
 });
 
@@ -96,6 +97,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
       rafCallbacks.delete(id);
     });
     createAudioDataBehavior = async () => audioOf(1);
+    hasPrefetchCapacity = true;
     parsedMarks = [
       { name: '0', text: 'First sentence.', language: 'en' },
       { name: '1', text: 'Second sentence.', language: 'en' },
@@ -162,30 +164,110 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await ctx().advanceTo(5);
     await done;
     expect(fetchCount).toBe(1);
-    expect(ctx().sources.length).toBe(2);
+    expect(ctx().sources.length).toBe(1);
   });
 
-  test('plays marks gaplessly: boundary per audible chunk, one final end', async () => {
+  test('keeps sentences in one continuous source while mark and progress follow its clock', async () => {
+    const firstText = 'First sentence.';
+    const secondText = 'Second sentence.';
+    parsedMarks = [
+      { offset: 0, name: '0', text: firstText, language: 'en' },
+      { offset: firstText.length, name: '1', text: secondText, language: 'en' },
+    ];
+    createAudioDataBehavior = async () => ({
+      data: new ArrayBuffer(48000),
+      boundaries: [
+        { offset: 1_000_000, duration: 4_000_000, text: 'First' },
+        { offset: 11_000_000, duration: 4_000_000, text: 'Second' },
+      ],
+    });
+    const client = await startClient();
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    expect(ctx().sources).toHaveLength(1);
+    expect(ctx().sources[0]!.buffer!.duration).toBeCloseTo(1.52, 2);
+    expect(client.getCurrentSpeakMark()?.name).toBe('0');
+
+    const sourceStart = ctx().sources[0]!.startedAt!;
+    ctx().currentTime = sourceStart + 1.15;
+    runRaf();
+
+    expect(client.getCurrentSpeakMark()?.name).toBe('1');
+    expect(client.getChunkPosition()).toBeGreaterThan(0);
+    expect(controller.dispatchSpeakMark).toHaveBeenLastCalledWith(parsedMarks[1]);
+
+    await ctx().advanceTo(5);
+    await done;
+  });
+
+  test('preload releases playback after the first batch while later batches fill concurrently', async () => {
+    parsedMarks = [
+      { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+      { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
+      { name: '2', text: `${'c'.repeat(119)}.`, language: 'en' },
+    ];
+    let resolveSecond!: (audio: MockAudioData) => void;
+    let secondStarted = false;
+    createAudioDataBehavior = async (text) => {
+      if (text.startsWith('a')) return audioOf(1);
+      if (text.startsWith('b')) {
+        secondStarted = true;
+        return new Promise<MockAudioData>((resolve) => {
+          resolveSecond = resolve;
+        });
+      }
+      return audioOf(1);
+    };
+    const client = await startClient();
+    let preloadFinished = false;
+    const { done } = collectSpeak(client, new AbortController().signal, { preload: true });
+    done.then(() => {
+      preloadFinished = true;
+    });
+    await flush();
+    await flush();
+
+    expect(secondStarted).toBe(true);
+    expect(preloadFinished).toBe(true);
+    resolveSecond(audioOf(1));
+    await flush();
+  });
+
+  test('always prepares the imminent first batch even when lookahead cache is full', async () => {
+    hasPrefetchCapacity = false;
+    let fetchCount = 0;
+    createAudioDataBehavior = async () => {
+      fetchCount++;
+      return audioOf(1);
+    };
+    const client = await startClient();
+    const { done } = collectSpeak(client, new AbortController().signal, { preload: true });
+    await done;
+    expect(fetchCount).toBe(1);
+  });
+
+  test('plays marks gaplessly inside one batch source with one final end', async () => {
     const client = await startClient();
     const { events, done } = collectSpeak(client, new AbortController().signal);
     await flush();
     await flush();
 
-    // Both chunks scheduled ahead, but only chunk 0 is audible: exactly one
-    // mark dispatched so foliate's cursor tracks the voice, not the fetcher.
-    expect(ctx().sources.length).toBe(2);
+    // Both sentences share one immutable source. The first mark is active
+    // until the source clock crosses the second sentence's interval.
+    expect(ctx().sources.length).toBe(1);
     expect(controller.dispatchSpeakMark).toHaveBeenCalledTimes(1);
     expect(events.filter((e) => e.code === 'boundary')).toHaveLength(1);
 
-    await ctx().advanceTo(1.1); // chunk 0 ends (starts at 0.03, 1s long)
-    await flush();
+    ctx().currentTime = ctx().sources[0]!.startedAt! + 0.6;
+    runRaf();
     expect(controller.dispatchSpeakMark).toHaveBeenCalledTimes(2);
 
-    await ctx().advanceTo(3); // chunk 1 ends
+    await ctx().advanceTo(3);
     await done;
-    expect(events.map((e) => e.code)).toEqual(['boundary', 'boundary', 'end']);
+    expect(events.map((e) => e.code)).toEqual(['boundary', 'end']);
     expect(events[0]!.mark).toBe('0');
-    expect(events[1]!.mark).toBe('1');
   });
 
   test('visual progress follows the audio clock before a delayed onended callback', async () => {
@@ -207,10 +289,10 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
     await flush();
 
-    const secondStart = ctx().sources[1]!.startedAt!;
-    // Move only the audio clock. Deliberately do not call advanceTo(), so the
-    // first source's onended callback remains delayed like a busy WebView.
-    ctx().currentTime = secondStart + 0.05;
+    const sourceStart = ctx().sources[0]!.startedAt!;
+    // Move only the audio clock. No source transition or onended callback is
+    // involved: sentence progress is metadata on the continuous batch source.
+    ctx().currentTime = sourceStart + 1.15;
     runRaf();
 
     expect(controller.dispatchSpeakMark).toHaveBeenLastCalledWith(parsedMarks[1]);

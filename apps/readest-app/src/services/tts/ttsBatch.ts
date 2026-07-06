@@ -116,9 +116,13 @@ export interface BatchPartition {
 
 // Split combined word-boundaries of a batched mp3 back to each sentence mark.
 export const partitionBatch = (batch: TTSMark[], boundaries: TTSWordBoundary[]): BatchPartition => {
-  const base = batch[0]!.offset;
   const combined = batch.map((m) => m.text).join('');
-  const spanEnd = batch.map((m) => m.offset - base + m.text.length);
+  // `offset` is local to one parsed SSML paragraph and resets to zero when a
+  // batch crosses into the next foliate paragraph. The Edge payload, however,
+  // is exactly the concatenation above, so cumulative text lengths are the only
+  // stable coordinate system across both sentence and paragraph boundaries.
+  let combinedOffset = 0;
+  const spanEnd = batch.map((mark) => (combinedOffset += mark.text.length));
   const perMark: TTSWordBoundary[][] = batch.map(() => []);
   let searchPos = 0;
   let markIdx = 0;

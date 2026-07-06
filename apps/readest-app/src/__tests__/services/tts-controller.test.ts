@@ -1388,14 +1388,12 @@ describe('TTSController', () => {
 
       await controller.preloadNextSSML();
 
-      // 20 words is ~6.7 seconds at 180 wpm, so a five-minute buffer needs
-      // about 45 paragraphs. Edge now batches them into one cross-paragraph
-      // preload instead of one HTTP request per paragraph.
-      expect(speakMarksSpy).toHaveBeenCalledOnce();
-      const marksArg = speakMarksSpy.mock.calls[0]?.[0];
-      expect(marksArg).toBeDefined();
-      expect(marksArg!.length).toBeGreaterThanOrEqual(45);
-      expect(mockView.tts!.prev).toHaveBeenCalledTimes(marksArg!.length);
+      // Cache keys must match paragraph-local playback exactly. Combining all
+      // lookahead paragraphs into one mark list creates different Edge batches
+      // and forces playback to synthesize them again.
+      expect(speakMarksSpy.mock.calls.length).toBeGreaterThanOrEqual(45);
+      expect(speakMarksSpy.mock.calls.every((call) => call[0].length === 1)).toBe(true);
+      expect(mockView.tts!.prev).toHaveBeenCalledTimes(speakMarksSpy.mock.calls.length);
     });
 
     test('continues prefetching into the next section when the current one is too short', async () => {
@@ -1414,8 +1412,8 @@ describe('TTSController', () => {
       await controller.preloadNextSSML(1, 2);
 
       expect(nextSection.createDocument).toHaveBeenCalledOnce();
-      expect(speakMarksSpy).toHaveBeenCalledOnce();
-      expect(speakMarksSpy.mock.calls[0]?.[0]).toHaveLength(2);
+      expect(speakMarksSpy).toHaveBeenCalledTimes(2);
+      expect(speakMarksSpy.mock.calls.every((call) => call[0].length === 1)).toBe(true);
     });
   });
 

@@ -48,4 +48,7 @@ export interface TTSClient {
   getChunkPosition?(): number | null;
   // Edge-only: mark whose audio chunk is currently audible (timeline scrubber).
   getCurrentSpeakMark?(): TTSMark | null;
+  // Atomic version of current mark + within-mark position. Consumers should
+  // prefer this over two clock reads that can straddle a sentence boundary.
+  getPlaybackSnapshot?(): { mark: TTSMark; position: number } | null;
 }

@@ -96,10 +96,13 @@ vi.mock('@/utils/ssml', async (importOriginal) => {
   return {
     ...actual,
     filterSSMLWithLang: vi.fn((ssml: string) => ssml),
-    parseSSMLMarks: vi.fn(() => ({
-      plainText: 'hello',
-      marks: [{ offset: 0, name: '0', text: 'hello', language: 'en' }],
-    })),
+    parseSSMLMarks: vi.fn((ssml: string) => {
+      const text = ssml.replace(/<[^>]+>/g, '');
+      return {
+        plainText: text,
+        marks: [{ offset: 0, name: '0', text, language: 'en' }],
+      };
+    }),
   };
 });
 vi.mock('@/utils/node', () => ({ createRejectFilter: vi.fn(() => () => 1) }));
@@ -182,6 +185,41 @@ describe('TTSController lifecycle', () => {
     expect(mockTtsInstances[0]!.next).toHaveBeenCalled();
     expect(ended).not.toHaveBeenCalled();
     expect(controller.terminated).toBe(false);
+  });
+
+  test('keeps playback marks paragraph-local so foliate and audio share one cursor', async () => {
+    const paragraph = `${'a'.repeat(119)}.`;
+    const paragraphs = Array.from({ length: 5 }, () => `<speak>${paragraph}</speak>`);
+    let cursor = -1;
+    mockTtsInstances[0]!.next.mockImplementation(() => {
+      if (cursor + 1 >= paragraphs.length) return undefined;
+      return paragraphs[++cursor];
+    });
+    mockTtsInstances[0]!.prev.mockImplementation(() => {
+      if (cursor < 0) return undefined;
+      return paragraphs[cursor--];
+    });
+    (controller.ttsEdgeClient.speakMarks as ReturnType<typeof vi.fn>).mockImplementation(
+      async function* (
+        _marks: unknown,
+        _signal: AbortSignal,
+        preload = false,
+      ): AsyncIterable<TTSMessageEvent> {
+        yield preload
+          ? { code: 'end', message: 'preloaded' }
+          : { code: 'boundary', message: 'keep session open', mark: '0' };
+      },
+    );
+
+    controller.speak('<speak>hello</speak>');
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    const playbackCall = vi
+      .mocked(controller.ttsEdgeClient.speakMarks!)
+      .mock.calls.find((call) => call[2] === false);
+    expect(playbackCall).toBeDefined();
+    expect(playbackCall![0]).toHaveLength(1);
   });
 
   test('end of book fires tts-session-ended exactly once with reason ended', async () => {

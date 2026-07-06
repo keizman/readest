@@ -34,6 +34,7 @@ const makeMockClient = (name: string): TTSClient => {
     getSpeakingLang: vi.fn().mockReturnValue('en'),
     getChunkPosition: vi.fn().mockReturnValue(0.5),
     getCurrentSpeakMark: vi.fn().mockReturnValue(null),
+    getPlaybackSnapshot: vi.fn().mockReturnValue(null),
   };
 };
 
@@ -182,18 +183,29 @@ describe('TTSController section timeline', () => {
     expect(info!.measuredFraction).toBeGreaterThan(0);
   });
 
-  test('getPlaybackInfo follows the audibly playing mark instead of a stale foliate range', async () => {
+  test('getPlaybackInfo uses one atomic audio snapshot across a sentence boundary', async () => {
     recordMeasuredDuration('timeline-ctrl-voice', S0, 4);
     recordMeasuredDuration('timeline-ctrl-voice', S1, 6);
     await controller.ensureTimeline();
+    vi.mocked(controller.ttsEdgeClient.getPlaybackSnapshot).mockReturnValue({
+      mark: {
+        offset: 0,
+        name: '1',
+        text: S1,
+        language: 'en',
+        range: sentenceRanges[1]!.cloneRange(),
+      },
+      position: 2,
+    });
+    // Legacy split reads deliberately disagree. The atomic snapshot must win.
     vi.mocked(controller.ttsEdgeClient.getCurrentSpeakMark).mockReturnValue({
       offset: 0,
-      name: '1',
-      text: S1,
+      name: '0',
+      text: S0,
       language: 'en',
-      range: sentenceRanges[1]!.cloneRange(),
+      range: sentenceRanges[0]!.cloneRange(),
     });
-    vi.mocked(controller.ttsEdgeClient.getChunkPosition).mockReturnValue(2);
+    vi.mocked(controller.ttsEdgeClient.getChunkPosition).mockReturnValue(0.5);
     const info = controller.getPlaybackInfo();
     expect(info!.position).toBeCloseTo(6, 5);
   });

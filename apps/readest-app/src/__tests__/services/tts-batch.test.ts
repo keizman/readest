@@ -131,4 +131,23 @@ describe('partitionBatch', () => {
     expect(startSec[0]).toBeCloseTo(0.1, 5);
     expect(startSec[1]).toBeCloseTo(1.6, 5);
   });
+
+  test('assigns boundaries when offsets reset at a paragraph boundary', () => {
+    const batch = [
+      mark('0', 'First paragraph has a long line.', 'en', 0),
+      mark('0', 'Second.', 'en', 0),
+      mark('1', 'Last sentence.', 'en', 7),
+    ];
+    const { perMark } = partitionBatch(batch, [
+      { offset: 0, duration: 1_000_000, text: 'First' },
+      { offset: 10_000_000, duration: 1_000_000, text: 'Second' },
+      { offset: 20_000_000, duration: 1_000_000, text: 'Last' },
+    ]);
+
+    expect(perMark.map((boundaries) => boundaries.map((boundary) => boundary.text))).toEqual([
+      ['First'],
+      ['Second'],
+      ['Last'],
+    ]);
+  });
 });
