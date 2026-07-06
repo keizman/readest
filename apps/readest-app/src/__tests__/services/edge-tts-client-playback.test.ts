@@ -27,6 +27,7 @@ vi.mock('@/libs/edgeTTS', () => {
     TTS_AUDIO_CACHE_MAX_BYTES: 5 * 60 * 6 * 1024,
     getTTSAudioCacheBytes: () => 0,
     hasTTSPrefetchCapacity: () => hasPrefetchCapacity,
+    isTTSPayloadCached: () => false,
   };
 });
 
@@ -203,20 +204,27 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
   });
 
-  test('preload releases playback after the first batch while later batches fill concurrently', async () => {
+  test('preload releases after critical batches while later batches fill sequentially', async () => {
     parsedMarks = [
       { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
       { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
       { name: '2', text: `${'c'.repeat(119)}.`, language: 'en' },
+      { name: '3', text: `${'d'.repeat(119)}.`, language: 'en' },
     ];
-    let resolveSecond!: (audio: MockAudioData) => void;
-    let secondStarted = false;
+    let resolveThird!: (audio: MockAudioData) => void;
+    let resolveFourth!: (audio: MockAudioData) => void;
+    let fourthStarted = false;
     createAudioDataBehavior = async (text) => {
-      if (text.startsWith('a')) return audioOf(1);
-      if (text.startsWith('b')) {
-        secondStarted = true;
+      if (text.startsWith('a') || text.startsWith('b')) return audioOf(1);
+      if (text.startsWith('c')) {
         return new Promise<MockAudioData>((resolve) => {
-          resolveSecond = resolve;
+          resolveThird = resolve;
+        });
+      }
+      if (text.startsWith('d')) {
+        fourthStarted = true;
+        return new Promise<MockAudioData>((resolve) => {
+          resolveFourth = resolve;
         });
       }
       return audioOf(1);
@@ -230,9 +238,11 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
     await flush();
 
-    expect(secondStarted).toBe(true);
     expect(preloadFinished).toBe(true);
-    resolveSecond(audioOf(1));
+    resolveThird(audioOf(1));
+    await flush();
+    await vi.waitFor(() => expect(fourthStarted).toBe(true));
+    resolveFourth(audioOf(1));
     await flush();
   });
 
@@ -330,6 +340,40 @@ describe('EdgeTTSClient Web Audio playback', () => {
     const [first, second] = ctx().sources;
     expect(second!.startedAt! - first!.endTime).toBeCloseTo(0, 5);
     await ctx().advanceTo(5);
+    await done;
+  });
+
+  test('pipelines batch fetch so later batches start before earlier ones finish', async () => {
+    const marks = [
+      { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+      { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
+    ];
+    let resolveFirst!: (audio: MockAudioData) => void;
+    let fetchCount = 0;
+    createAudioDataBehavior = async (text) => {
+      fetchCount++;
+      if (text.startsWith('a')) {
+        return new Promise<MockAudioData>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return audioOf(2);
+    };
+    const client = await startClient();
+    const done = (async () => {
+      for await (const _ of client.speakMarks(marks, new AbortController().signal)) {
+        void _;
+      }
+    })();
+    await vi.waitFor(() => expect(fetchCount).toBeGreaterThanOrEqual(2));
+    resolveFirst(audioOf(2));
+    await flush();
+    await flush();
+    if (ctx().sources.length >= 2) {
+      const [first, second] = ctx().sources;
+      expect(second!.startedAt! - first!.endTime).toBeCloseTo(0, 5);
+    }
+    await ctx().advanceTo(10);
     await done;
   });
 

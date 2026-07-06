@@ -47,7 +47,7 @@ let ttsPositionSequence = 0;
 // English dialogue. Prefetch continues into following sections when needed.
 const PREFETCH_TARGET_SECONDS = 5 * 60;
 const PREFETCH_MAX_PARAGRAPHS = 100;
-const PREFETCH_PARALLELISM = 4;
+const PREFETCH_PARALLELISM = 1;
 
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
 // utterance it cannot synthesize offline — typically a specific unsupported
@@ -121,6 +121,7 @@ export class TTSController extends EventTarget {
   #currentSpeakAbortController: AbortController | null = null;
   #currentSpeakPromise: Promise<void> | null = null;
   #hasStartedPlayback = false;
+  #prefetchInFlight = false;
   #ttsSectionIndex: number = -1;
 
   // Virtual section timeline for position/duration/seek (Edge client only).
@@ -698,6 +699,20 @@ export class TTSController extends EventTarget {
     maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
   ) {
     const tts = this.view.tts;
+    if (!tts || !hasTTSPrefetchCapacity() || this.#prefetchInFlight) return;
+    this.#prefetchInFlight = true;
+    try {
+      await this.#preloadNextSSMLImpl(targetSeconds, maxParagraphs);
+    } finally {
+      this.#prefetchInFlight = false;
+    }
+  }
+
+  async #preloadNextSSMLImpl(
+    targetSeconds: number = PREFETCH_TARGET_SECONDS,
+    maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
+  ) {
+    const tts = this.view.tts;
     if (!tts || !hasTTSPrefetchCapacity()) return;
 
     // Gather the next SSMLs and rewind synchronously to avoid a race condition:
@@ -1141,6 +1156,9 @@ export class TTSController extends EventTarget {
         const cfi = this.view.getCFI(this.#ttsSectionIndex, range);
         this.dispatchEvent(new CustomEvent('tts-highlight-mark', { detail: { cfi } }));
         this.#dispatchPosition(cfi, 'sentence');
+        if (this.state === 'playing') {
+          void this.preloadNextSSML();
+        }
       } catch {
         this.#suppressMarkHighlight = false;
       }

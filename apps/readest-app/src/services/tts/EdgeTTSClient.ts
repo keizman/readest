@@ -6,6 +6,7 @@ import {
   EdgeTTSPayload,
   EDGE_TTS_PROTOCOL,
   hasTTSPrefetchCapacity,
+  isTTSPayloadCached,
   TTSWordBoundary,
 } from '@/libs/edgeTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
@@ -56,6 +57,18 @@ type SpeakQueueEvent =
   | { kind: 'chunk-skip'; markName: string }
   | { kind: 'session-end' }
   | { kind: 'error'; message: string };
+
+type BatchPrepareResult =
+  | {
+      kind: 'ready';
+      prepared: ChunkMeta & { buffer: TTSAudioBuffer };
+      voiceId: string;
+      batchIndex: number;
+      cacheHit: boolean;
+      boundaryCount: number;
+    }
+  | { kind: 'skip'; marks: TTSMark[]; batchIndex: number }
+  | { kind: 'fatal'; message: string; batchIndex: number };
 
 class AsyncQueue<T> {
   #items: T[] = [];
@@ -285,12 +298,19 @@ export class EdgeTTSClient implements TTSClient {
     }
   }
 
+  // Batches that must be warm before playback starts. Scales with rate because
+  // faster playback reaches the next batch boundary sooner.
+  #criticalPreloadBatches(batchCount: number): number {
+    const byRate = this.#rate >= 3 ? 3 : 2;
+    return Math.min(batchCount, byRate);
+  }
+
   async *#preload(marks: TTSMark[], signal: AbortSignal, startup: boolean) {
-    // Preload by batch so LRU keys match playback requests. Only batch zero is
-    // on the playback critical path; later requests fill concurrently. Waiting
-    // for two cold batches here used to create a network-sized silence at every
-    // controller session transition.
+    // Preload by batch so LRU keys match playback requests. Critical-path
+    // batches must finish before playback; later batches fill one at a time so
+    // the self-hosted server never sees concurrent synthesis requests.
     const batches = buildBatches(marks, startup);
+    const criticalCount = this.#criticalPreloadBatches(batches.length);
     const preloadBatch = async (batch: TTSMark[]) => {
       const voiceLang = batch[0]!.language;
       const voiceId = await this.getVoiceIdFromLang(voiceLang);
@@ -317,38 +337,102 @@ export class EdgeTTSClient implements TTSClient {
         );
       }
     };
-    const runBatch = async (index: number) => {
-      // Batch zero is required for imminent playback even when the lookahead
-      // cache is nominally full; inserting it evicts an older LRU entry.
-      if (signal.aborted || (index > 0 && !hasTTSPrefetchCapacity())) return;
+    const runBatch = async (index: number, critical: boolean) => {
+      if (signal.aborted || index >= batches.length) return;
+      if (!critical && !hasTTSPrefetchCapacity()) return;
       try {
         await preloadBatch(batches[index]!);
       } catch (err) {
         console.warn('Error preloading batch', index, err);
       }
     };
-    const firstPromise = batches.length > 0 ? runBatch(0) : Promise.resolve();
-    let nextIndex = 1;
-    const worker = async () => {
-      while (!signal.aborted) {
-        const index = nextIndex++;
-        if (index >= batches.length || !hasTTSPrefetchCapacity()) return;
-        await runBatch(index);
-      }
-    };
-    const backgroundPromise = Promise.all([worker(), worker(), worker()]);
-    await firstPromise;
-    void backgroundPromise;
-
+    await Promise.all(Array.from({ length: criticalCount }, (_, index) => runBatch(index, true)));
     yield {
       code: 'end',
       message: 'Preload finished',
     } as TTSMessageEvent;
+    let nextIndex = criticalCount;
+    const worker = async () => {
+      while (!signal.aborted) {
+        const index = nextIndex++;
+        if (index >= batches.length || !hasTTSPrefetchCapacity()) return;
+        await runBatch(index, false);
+      }
+    };
+    void Promise.all([worker(), worker(), worker()]);
   }
 
-  // Detached scheduler: fetches, prepares, and schedules chunks ahead of the
-  // playhead under the player's backpressure. Never throws; failures surface
-  // through the event queue.
+  // Fetch, decode, and compress one batch. Invoked eagerly for every batch so
+  // work pipelines while earlier chunks play.
+  async #prepareBatchForSchedule(
+    batch: TTSMark[],
+    batchIndex: number,
+    signal: AbortSignal,
+    generation: number,
+    rate: number,
+  ): Promise<BatchPrepareResult> {
+    if (signal.aborted || this.#activeGeneration !== generation) {
+      return { kind: 'skip', marks: batch, batchIndex };
+    }
+    const voiceLang = batch[0]!.language;
+    const voiceId = await this.getVoiceIdFromLang(voiceLang);
+    if (signal.aborted || this.#activeGeneration !== generation) {
+      return { kind: 'skip', marks: batch, batchIndex };
+    }
+    this.#speakingLang = voiceLang;
+    this.#currentVoiceId = voiceId;
+    const batchText = batch.map((m) => m.text).join('');
+    if (!hasSpeakableText(batchText)) {
+      return { kind: 'skip', marks: batch, batchIndex };
+    }
+    const payload = this.getPayload(voiceLang, batchText, voiceId);
+    const cacheHit = isTTSPayloadCached(payload);
+
+    let audio: { data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined;
+    try {
+      audio = await this.#createAudioDataWithRetry(payload, signal);
+    } catch (error) {
+      if (isNoAudioSynthesisError(error, batchText)) {
+        console.warn('No audio data received for:', batchText);
+        return { kind: 'skip', marks: batch, batchIndex };
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn('TTS error for batch:', batchText, message);
+      return { kind: 'fatal', message, batchIndex };
+    }
+    if (!audio || signal.aborted || this.#activeGeneration !== generation) {
+      return { kind: 'skip', marks: batch, batchIndex };
+    }
+
+    let decoded: TTSAudioBuffer;
+    try {
+      decoded = await this.#player.decode(audio.data);
+    } catch (error) {
+      console.warn('Failed to decode TTS audio for:', batchText, error);
+      return { kind: 'skip', marks: batch, batchIndex };
+    }
+
+    let prepared: ChunkMeta & { buffer: TTSAudioBuffer };
+    try {
+      prepared = await this.#prepareBatchBuffer(decoded, batch, audio.boundaries, rate);
+    } catch (error) {
+      console.warn('Failed to prepare TTS audio batch:', batchText, error);
+      return { kind: 'skip', marks: batch, batchIndex };
+    }
+
+    return {
+      kind: 'ready',
+      prepared,
+      voiceId,
+      batchIndex,
+      cacheHit,
+      boundaryCount: audio.boundaries.length,
+    };
+  }
+
+  // Detached scheduler: pipelines batch preparation across the mark list, then
+  // schedules in order under the player's backpressure. Never throws; failures
+  // surface through the event queue.
   async #runScheduler(
     marks: TTSMark[],
     signal: AbortSignal,
@@ -365,56 +449,27 @@ export class EdgeTTSClient implements TTSClient {
     };
     try {
       const batches = buildBatches(marks, startup);
-      for (const batch of batches) {
-        if (signal.aborted || this.#activeGeneration !== generation) break;
-        const voiceLang = batch[0]!.language;
-        const voiceId = await this.getVoiceIdFromLang(voiceLang);
-        this.#speakingLang = voiceLang;
-        this.#currentVoiceId = voiceId;
-        const batchText = batch.map((m) => m.text).join('');
-        if (!hasSpeakableText(batchText)) {
-          for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
-          continue;
-        }
-        const payload = this.getPayload(voiceLang, batchText, voiceId);
+      const preparations = batches.map((batch, batchIndex) =>
+        this.#prepareBatchForSchedule(batch, batchIndex, signal, generation, rate),
+      );
 
-        let audio: { data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined;
-        try {
-          audio = await this.#createAudioDataWithRetry(payload, signal);
-        } catch (error) {
-          if (isNoAudioSynthesisError(error, batchText)) {
-            console.warn('No audio data received for:', batchText);
-            for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
-            continue;
-          }
-          const message = error instanceof Error ? error.message : String(error);
-          console.warn('TTS error for batch:', batchText, message);
-          queue.push({ kind: 'error', message });
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+        if (signal.aborted || this.#activeGeneration !== generation) break;
+        const result = await preparations[batchIndex]!;
+        if (result.kind === 'fatal') {
+          queue.push({ kind: 'error', message: result.message });
           return;
         }
-        if (!audio || signal.aborted || this.#activeGeneration !== generation) break;
-
-        let decoded: TTSAudioBuffer;
-        try {
-          decoded = await this.#player.decode(audio.data);
-        } catch (error) {
-          console.warn('Failed to decode TTS audio for:', batchText, error);
-          for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
+        if (result.kind === 'skip') {
+          for (const mark of result.marks) {
+            queue.push({ kind: 'chunk-skip', markName: mark.name });
+          }
           continue;
         }
 
-        let prepared: ChunkMeta & { buffer: TTSAudioBuffer };
-        try {
-          prepared = await this.#prepareBatchBuffer(decoded, batch, audio.boundaries, rate);
-        } catch (error) {
-          console.warn('Failed to prepare TTS audio batch:', batchText, error);
-          for (const mark of batch) queue.push({ kind: 'chunk-skip', markName: mark.name });
-          continue;
-        }
-
-        for (const markMeta of prepared.marks) {
+        for (const markMeta of result.prepared.marks) {
           this.#recordDurations(
-            voiceId,
+            result.voiceId,
             markMeta.mark.text,
             markMeta.boundaries,
             markMeta.durationMediaSec,
@@ -423,14 +478,23 @@ export class EdgeTTSClient implements TTSClient {
 
         const ready = await this.#player.waitUntilReady(generation);
         if (!ready || signal.aborted || this.#activeGeneration !== generation) break;
-        chunkMeta.push({
-          marks: prepared.marks,
-          trimStartSec: prepared.trimStartSec,
-          trimmedDurationSec: prepared.trimmedDurationSec,
+
+        console.log('[TTS] batch prepare', {
+          index: result.batchIndex,
+          cacheHit: result.cacheHit,
+          boundaries: result.boundaryCount,
+          marks: result.prepared.marks.length,
+          durationSec: result.prepared.trimmedDurationSec.toFixed(2),
         });
-        this.#player.scheduleChunk(generation, prepared.buffer, {
-          trimStartSec: prepared.trimStartSec,
-          mediaScale: prepared.trimmedDurationSec / prepared.buffer.duration,
+
+        chunkMeta.push({
+          marks: result.prepared.marks,
+          trimStartSec: result.prepared.trimStartSec,
+          trimmedDurationSec: result.prepared.trimmedDurationSec,
+        });
+        this.#player.scheduleChunk(generation, result.prepared.buffer, {
+          trimStartSec: result.prepared.trimStartSec,
+          mediaScale: result.prepared.trimmedDurationSec / result.prepared.buffer.duration,
           gapSec: 0,
         });
       }
@@ -438,9 +502,6 @@ export class EdgeTTSClient implements TTSClient {
       const message = error instanceof Error ? error.message : String(error);
       queue.push({ kind: 'error', message });
     } finally {
-      // Always close the session when the scheduler exits — including when every
-      // mark was skipped (e.g. punctuation-only ellipsis) or the loop broke
-      // early — so auto-advance never dead-ends with controls stuck playing.
       finishSession();
     }
   }
@@ -478,39 +539,11 @@ export class EdgeTTSClient implements TTSClient {
     const trimmed = channel.subarray(startSample, endSample);
 
     if (rawBoundaries.length === 0) {
-      const buffer = await this.#player.createMonoBuffer(trimmed, sampleRate);
-      const trimmedDurationSec = (trimmed.length / sampleRate) * rate;
-      const totalChars = Math.max(
-        1,
-        batch.reduce((sum, mark) => sum + mark.text.length, 0),
-      );
-      let charsBefore = 0;
-      const starts = batch.map((mark) => {
-        const start = (trimmedDurationSec * charsBefore) / totalChars;
-        charsBefore += mark.text.length;
-        return start;
-      });
-      const marks = batch.map((mark, index): BatchMarkMeta => {
-        const startMediaSec = starts[index]!;
-        const endMediaSec = starts[index + 1] ?? trimmedDurationSec;
-        return {
-          mark,
-          boundaries: [],
-          startMediaSec,
-          durationMediaSec: Math.max(0, endMediaSec - startMediaSec),
-        };
-      });
-      return { buffer, marks, trimStartSec: 0, trimmedDurationSec };
+      return this.#prepareBatchWithoutBoundaries(trimmed, batch, sampleRate, rate);
     }
 
     const { perMark: perMarkRaw } = partitionBatch(batch, rawBoundaries);
-    const sentenceEndWordIndices = new Set<number>();
-    let wordIndex = 0;
-    for (let markIndex = 0; markIndex < batch.length - 1; markIndex++) {
-      const count = perMarkRaw[markIndex]!.length;
-      if (count > 0) sentenceEndWordIndices.add(wordIndex + count - 1);
-      wordIndex += count;
-    }
+    const sentenceEndWordIndices = this.#sentenceEndWordIndices(batch, perMarkRaw);
 
     const secToSamples = (sec: number) => Math.round(sec * sampleRate);
     const wordStarts = rawBoundaries.map(
@@ -569,6 +602,118 @@ export class EdgeTTSClient implements TTSClient {
       return {
         mark,
         boundaries: this.#applyRateToBoundaries(perMark[index] ?? []),
+        startMediaSec,
+        durationMediaSec: Math.max(0, endMediaSec - startMediaSec),
+      };
+    });
+
+    return { buffer, marks, trimStartSec: 0, trimmedDurationSec };
+  }
+
+  #sentenceEndWordIndices(batch: TTSMark[], perMarkRaw: TTSWordBoundary[][]): Set<number> {
+    const indices = new Set<number>();
+    let wordIndex = 0;
+    for (let markIndex = 0; markIndex < batch.length - 1; markIndex++) {
+      const count = perMarkRaw[markIndex]!.length;
+      if (count > 0) {
+        indices.add(wordIndex + count - 1);
+        wordIndex += count;
+      } else if (/[.!?。！？]["'»」』)\]""']*$/u.test(batch[markIndex]!.text.trimEnd())) {
+        if (wordIndex > 0) indices.add(wordIndex - 1);
+      }
+    }
+    return indices;
+  }
+
+  // Edge occasionally returns no word boundaries. Compress inter-mark silences
+  // using char-proportional pseudo slots so batch-internal pauses are still removed.
+  async #prepareBatchWithoutBoundaries(
+    trimmed: Float32Array,
+    batch: TTSMark[],
+    sampleRate: number,
+    rate: number,
+  ): Promise<ChunkMeta & { buffer: TTSAudioBuffer }> {
+    const totalChars = Math.max(
+      1,
+      batch.reduce((sum, mark) => sum + mark.text.length, 0),
+    );
+
+    if (batch.length === 1) {
+      const buffer = await this.#player.createMonoBuffer(trimmed, sampleRate);
+      const trimmedDurationSec = (trimmed.length / sampleRate) * rate;
+      return {
+        buffer,
+        marks: [
+          {
+            mark: batch[0]!,
+            boundaries: [],
+            startMediaSec: 0,
+            durationMediaSec: trimmedDurationSec,
+          },
+        ],
+        trimStartSec: 0,
+        trimmedDurationSec,
+      };
+    }
+
+    const sentenceEndWordIndices = new Set<number>();
+    const wordStarts: number[] = [];
+    const wordEnds: number[] = [];
+    const wordTexts: string[] = [];
+    let charsBefore = 0;
+    for (let i = 0; i < batch.length; i++) {
+      const start = Math.floor((charsBefore / totalChars) * trimmed.length);
+      charsBefore += batch[i]!.text.length;
+      const end =
+        i + 1 < batch.length
+          ? Math.floor((charsBefore / totalChars) * trimmed.length)
+          : trimmed.length;
+      wordStarts.push(start);
+      wordEnds.push(Math.max(start + 1, end));
+      wordTexts.push(batch[i]!.text);
+      if (i < batch.length - 1) sentenceEndWordIndices.add(i);
+    }
+
+    const secToSamples = (sec: number) => Math.round(sec * sampleRate);
+    const plan = planSilenceCompression(
+      wordStarts,
+      wordEnds,
+      wordTexts,
+      trimmed.length,
+      secToSamples(EDGE_KEEP_SEC / rate),
+      secToSamples(TRAILING_KEEP_SEC / rate),
+      secToSamples(MIN_COMPRESS_GAP_SEC / rate),
+      secToSamples(SHORT_PAUSE_SEC / rate),
+      secToSamples(LONG_PAUSE_SEC / rate),
+      sentenceEndWordIndices,
+    );
+
+    const out = new Float32Array(plan.outLength);
+    let write = 0;
+    for (const [s, e] of plan.segments) {
+      const seg = trimmed.subarray(Math.max(0, s), Math.min(trimmed.length, e));
+      out.set(seg, write);
+      write += seg.length;
+    }
+    const buffer = await this.#player.createMonoBuffer(out, sampleRate);
+    const trimmedDurationSec = (plan.outLength / sampleRate) * rate;
+
+    charsBefore = 0;
+    const starts = batch.map((mark) => {
+      const start = (trimmedDurationSec * charsBefore) / totalChars;
+      charsBefore += mark.text.length;
+      return start;
+    });
+    for (let i = 1; i < starts.length; i++) {
+      starts[i] = Math.max(starts[i]!, starts[i - 1]!);
+    }
+
+    const marks = batch.map((mark, index): BatchMarkMeta => {
+      const startMediaSec = starts[index]!;
+      const endMediaSec = starts[index + 1] ?? trimmedDurationSec;
+      return {
+        mark,
+        boundaries: [],
         startMediaSec,
         durationMediaSec: Math.max(0, endMediaSec - startMediaSec),
       };

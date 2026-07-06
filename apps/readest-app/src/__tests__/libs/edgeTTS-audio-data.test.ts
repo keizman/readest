@@ -80,6 +80,22 @@ describe('createAudioData', () => {
     expect(second.boundaries).toHaveLength(1);
   });
 
+  test('serializes concurrent HTTPS fetches for different payloads', async () => {
+    const order: string[] = [];
+    fetchMock.mockImplementation(async (_input: RequestInfo, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { input: string };
+      order.push(body.input);
+      await new Promise((resolve) => setTimeout(resolve, body.input === 'first' ? 20 : 0));
+      return makeResponse();
+    });
+    const tts = new EdgeSpeechTTS('https');
+    const p1 = tts.createAudioData(makePayload('first'));
+    const p2 = tts.createAudioData(makePayload('second'));
+    await Promise.all([p1, p2]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(['first', 'second']);
+  });
+
   test('deduplicates concurrent in-flight fetches for the same payload', async () => {
     let release: (() => void) | undefined;
     fetchMock.mockImplementation(

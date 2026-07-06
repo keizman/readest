@@ -53,6 +53,28 @@ describe('buildBatches', () => {
     expect(BATCH_MAX_CHARS).toBe(120);
   });
 
+  test('splits three playback marks into separate batches', () => {
+    const batches = buildBatches(
+      [
+        mark('0', `${'a'.repeat(119)}.`),
+        mark('1', `${'b'.repeat(119)}.`),
+        mark('2', 'Tail sentence.'),
+      ],
+      false,
+    );
+    expect(batches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('startup splits two long sentences into separate batches', () => {
+    const batches = buildBatches(
+      [mark('0', `${'a'.repeat(119)}.`), mark('1', `${'b'.repeat(119)}.`)],
+      true,
+    );
+    expect(batches).toHaveLength(2);
+    expect(batches[0]!).toHaveLength(1);
+    expect(batches[1]!).toHaveLength(1);
+  });
+
   test('startup peels the first batch then requires 120+ chars for later requests', () => {
     const marks = Array.from({ length: 4 }, (_, i) =>
       mark(String(i), `${'句'.repeat(48)}。`, 'zh'),
@@ -60,7 +82,7 @@ describe('buildBatches', () => {
     const batches = buildBatches(marks, true);
     expect(batches).toHaveLength(2);
     expect(batches[0]!.map((m) => m.text).join('').length).toBeLessThanOrEqual(
-      STARTUP_BATCH_MAX_CHARS + 10,
+      STARTUP_BATCH_MAX_CHARS + 20,
     );
     expect(batches[1]!.map((m) => m.text).join('').length).toBeGreaterThanOrEqual(BATCH_MAX_CHARS);
   });

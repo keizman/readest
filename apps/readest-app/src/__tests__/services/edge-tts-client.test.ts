@@ -1,5 +1,7 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 
+import { buildBatches } from '@/services/tts/ttsBatch';
+
 // Shared mock control: tests can override createBehavior to change how create() behaves
 let createBehavior: () => Promise<undefined> = () => Promise.resolve(undefined);
 
@@ -36,6 +38,7 @@ vi.mock('@/libs/edgeTTS', () => {
     TTS_AUDIO_CACHE_MAX_BYTES: 5 * 60 * 6 * 1024,
     getTTSAudioCacheBytes: () => 0,
     hasTTSPrefetchCapacity: () => true,
+    isTTSPayloadCached: () => false,
   };
 });
 
@@ -452,11 +455,11 @@ describe('EdgeTTSClient', () => {
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
     });
 
-    test('starts the next startup batch in parallel but waits only for the first batch', async () => {
+    test('waits for all critical startup batches before releasing preload', async () => {
       await client.init();
       parsedMarks = [
-        { name: '0', text: 'a'.repeat(30), language: 'en' },
-        { name: '1', text: 'b'.repeat(30), language: 'en' },
+        { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+        { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
       ];
       const resolvers: Array<(value: MockAudioData) => void> = [];
       createAudioDataBehavior = vi.fn(
@@ -466,13 +469,21 @@ describe('EdgeTTSClient', () => {
           }),
       );
 
-      const iterator = client.speak('<ssml/>', new AbortController().signal, true, true);
+      const marks = [
+        { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+        { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
+      ];
+      const criticalFetches = Math.min(buildBatches(marks, true).length, 2);
+      expect(criticalFetches).toBeGreaterThanOrEqual(2);
+      const iterator = client.speakMarks(marks, new AbortController().signal, true, true);
       const pending = iterator.next();
 
-      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() =>
+        expect(createAudioDataBehavior).toHaveBeenCalledTimes(criticalFetches),
+      );
       resolvers[0]!({ data: new ArrayBuffer(8), boundaries: [] });
-      await pending;
       resolvers[1]!({ data: new ArrayBuffer(8), boundaries: [] });
+      await pending;
     });
 
     test('skips pure Chinese ellipsis without requesting Edge audio', async () => {
@@ -535,7 +546,10 @@ describe('EdgeTTSClient', () => {
         { name: '2', text: 'c'.repeat(30), language: 'en' },
       ];
       await consumePreload(client, new AbortController().signal, true);
-      expect(createAudioDataPayloads.map((p) => p.text.length)).toEqual([30, 60]);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
+      expect(createAudioDataPayloads.map((p) => p.text.length).sort((a, b) => a - b)).toEqual([
+        30, 60,
+      ]);
     });
 
     test('merges marks past 120 chars when no punctuation boundary exists', async () => {

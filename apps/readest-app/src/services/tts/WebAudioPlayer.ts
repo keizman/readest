@@ -171,7 +171,8 @@ export class WebAudioPlayer {
     const session = this.#session;
     const ctx = this.#ctx;
     if (!session || session.generation !== generation || !ctx) return;
-    const start = Math.max(session.nextStartTime, ctx.currentTime + SCHEDULE_SAFETY_SEC);
+    const plannedStart = session.nextStartTime;
+    const start = Math.max(plannedStart, ctx.currentTime + SCHEDULE_SAFETY_SEC);
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
@@ -187,9 +188,16 @@ export class WebAudioPlayer {
     session.chunks.push(chunk);
     session.nextStartTime = start + buffer.duration + Math.max(0, timing.gapSec);
     source.start(start);
+    const scheduleGapMs = Math.max(0, (start - plannedStart) * 1000);
     console.log(
-      `[TTS] schedule ${generation}:${chunk.index} at ${start.toFixed(2)} dur ${buffer.duration.toFixed(2)}`,
+      `[TTS] schedule ${generation}:${chunk.index} at ${start.toFixed(2)} dur ${buffer.duration.toFixed(2)}` +
+        (scheduleGapMs > 5 ? ` gap ${scheduleGapMs.toFixed(0)}ms` : ''),
     );
+    if (scheduleGapMs > 50 && chunk.index > 0) {
+      console.warn(
+        `[TTS] batch ${chunk.index} scheduled ${scheduleGapMs.toFixed(0)}ms late — likely cache/prefetch underrun`,
+      );
+    }
     if (chunk.index === 0) {
       session.onEvent({ type: 'chunk-start', chunkIndex: 0 });
     }

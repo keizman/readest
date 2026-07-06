@@ -357,12 +357,20 @@ export const getTTSAudioCacheBytes = (): number => EdgeSpeechTTS.getAudioCacheBy
 export const hasTTSPrefetchCapacity = (): boolean =>
   EdgeSpeechTTS.getAudioCacheBytes() < TTS_AUDIO_CACHE_MAX_BYTES;
 
+export const isTTSPayloadCached = (payload: EdgeTTSPayload): boolean =>
+  EdgeSpeechTTS.isPayloadCached(payload);
+
 export class EdgeSpeechTTS {
   static voices = genVoiceList(EDGE_TTS_VOICES);
   private static audioCacheBytes = 0;
 
   static getAudioCacheBytes(): number {
     return EdgeSpeechTTS.audioCacheBytes;
+  }
+
+  static isPayloadCached(payload: EdgeTTSPayload): boolean {
+    const cacheKey = hashTTSPayload(payload);
+    return EdgeSpeechTTS.audioCache.has(cacheKey) || EdgeSpeechTTS.inflight.has(cacheKey);
   }
   private static onAudioCacheEvict = (key: string, blob: Blob) => {
     EdgeSpeechTTS.audioCacheBytes = Math.max(0, EdgeSpeechTTS.audioCacheBytes - blob.size);
@@ -389,6 +397,19 @@ export class EdgeSpeechTTS {
     string,
     Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }>
   >();
+  // Self-hosted HTTPS TTS cannot absorb concurrent synthesis; serialize network
+  // fetches so preload, playback, and lookahead share one in-flight request.
+  private static httpsRequestQueue: Promise<unknown> = Promise.resolve();
+
+  private static enqueueHttpsRequest<T>(fn: () => Promise<T>): Promise<T> {
+    const run = EdgeSpeechTTS.httpsRequestQueue.then(fn, fn);
+    EdgeSpeechTTS.httpsRequestQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   private protocol: EDGE_TTS_PROTOCOL = 'wss';
 
   constructor(protocol?: EDGE_TTS_PROTOCOL) {
@@ -782,7 +803,14 @@ export class EdgeSpeechTTS {
     }
     const pending = EdgeSpeechTTS.inflight.get(cacheKey);
     if (pending) return pending;
-    const promise = (async () => {
+    const fetchFromNetwork = async (): Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> => {
+      const cachedAfterQueue = EdgeSpeechTTS.audioCache.get(cacheKey);
+      if (cachedAfterQueue) {
+        return {
+          blob: cachedAfterQueue,
+          boundaries: EdgeSpeechTTS.boundariesCache.get(cacheKey) ?? [],
+        };
+      }
       const { response, boundaries } = await this.#fetchEdgeSpeech(payload);
       const arrayBuffer = await response.arrayBuffer();
       const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
@@ -791,7 +819,11 @@ export class EdgeSpeechTTS {
       EdgeSpeechTTS.boundariesCache.set(cacheKey, boundaries);
       EdgeSpeechTTS.trimAudioCache();
       return { blob, boundaries };
-    })();
+    };
+    const promise =
+      this.protocol === 'https'
+        ? EdgeSpeechTTS.enqueueHttpsRequest(fetchFromNetwork)
+        : fetchFromNetwork();
     EdgeSpeechTTS.inflight.set(cacheKey, promise);
     try {
       return await promise;

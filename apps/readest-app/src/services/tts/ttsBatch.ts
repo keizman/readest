@@ -9,7 +9,9 @@ const TICKS_PER_SECOND = 10_000_000;
 // through the next trailing punctuation so Edge handles pauses server-side.
 export const BATCH_MAX_CHARS = 120;
 // First playback uses a smaller budget so one short sentence synthesizes fast.
-export const STARTUP_BATCH_MAX_CHARS = 40;
+// Kept large enough that the first inter-batch boundary does not land seconds
+// into playback (a 40-char peel at 3.0x outruns background prefetch).
+export const STARTUP_BATCH_MAX_CHARS = 80;
 
 // Trailing punctuation that ends a batch once BATCH_MAX_CHARS is met.
 const TRAILING_PUNCTUATION_RE = /[,.!?;:、，；：·•…\u2026\-–—。！？]["'»」』)\]""']*$/u;
