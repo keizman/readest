@@ -23,8 +23,10 @@ vi.mock('@/libs/edgeTTS', () => {
         .fn()
         .mockImplementation((payload: { text: string }) => createAudioDataBehavior(payload.text));
     },
+    EDGE_TTS_MAX_RATE: 2.0,
     EDGE_TTS_PROTOCOL: 'wss',
-    TTS_AUDIO_CACHE_MAX_BYTES: 5 * 60 * 6 * 1024,
+    TTS_WS_MAX_CONCURRENT: 2,
+    TTS_AUDIO_CACHE_MAX_BYTES: 20 * 60 * 6 * 1024,
     getTTSAudioCacheBytes: () => 0,
     hasTTSPrefetchCapacity: () => hasPrefetchCapacity,
     isTTSPayloadCached: () => false,
@@ -188,8 +190,8 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
 
     expect(ctx().sources).toHaveLength(1);
-    // Baked 0.6s inter-sentence gap is removed; only speech + edge padding remains.
-    expect(ctx().sources[0]!.buffer!.duration).toBeCloseTo(0.83, 2);
+    // Baked 0.6s inter-sentence gap is removed; only minimal speech-edge padding remains.
+    expect(ctx().sources[0]!.buffer!.duration).toBeCloseTo(0.81, 2);
     expect(client.getCurrentSpeakMark()?.name).toBe('0');
 
     const sourceStart = ctx().sources[0]!.startedAt!;
@@ -204,7 +206,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
   });
 
-  test('preload releases after critical batches while later batches fill sequentially', async () => {
+  test('preload releases after critical batches while later batches fill in background', async () => {
     parsedMarks = [
       { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
       { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
@@ -212,7 +214,6 @@ describe('EdgeTTSClient Web Audio playback', () => {
       { name: '3', text: `${'d'.repeat(119)}.`, language: 'en' },
     ];
     let resolveThird!: (audio: MockAudioData) => void;
-    let resolveFourth!: (audio: MockAudioData) => void;
     let fourthStarted = false;
     createAudioDataBehavior = async (text) => {
       if (text.startsWith('a') || text.startsWith('b')) return audioOf(1);
@@ -223,9 +224,6 @@ describe('EdgeTTSClient Web Audio playback', () => {
       }
       if (text.startsWith('d')) {
         fourthStarted = true;
-        return new Promise<MockAudioData>((resolve) => {
-          resolveFourth = resolve;
-        });
       }
       return audioOf(1);
     };
@@ -237,13 +235,11 @@ describe('EdgeTTSClient Web Audio playback', () => {
     });
     await flush();
     await flush();
-
     expect(preloadFinished).toBe(true);
+    expect(fourthStarted).toBe(false);
     resolveThird(audioOf(1));
-    await flush();
     await vi.waitFor(() => expect(fourthStarted).toBe(true));
-    resolveFourth(audioOf(1));
-    await flush();
+    await done;
   });
 
   test('always prepares the imminent first batch even when lookahead cache is full', async () => {
@@ -327,6 +323,29 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
   });
 
+  test('trims batch-edge padding so adjacent chunks do not carry audible silence', async () => {
+    parsedMarks = [
+      { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
+      { name: '1', text: 'Second sentence.', language: 'en' },
+    ];
+    createAudioDataBehavior = async () => ({
+      data: new ArrayBuffer(24000),
+      boundaries: [{ offset: 2_000_000, duration: 4_000_000, text: 'word' }],
+    });
+    const client = await startClient();
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    const [first, second] = ctx().sources;
+    expect(first!.buffer!.duration).toBeCloseTo(0.41, 2);
+    expect(second!.buffer!.duration).toBeCloseTo(0.41, 2);
+    expect(second!.startedAt! - first!.endTime).toBeCloseTo(0, 5);
+
+    await ctx().advanceTo(5);
+    await done;
+  });
+
   test('inter-batch scheduling stays gapless when playback rate increases', async () => {
     parsedMarks = [
       { name: '0', text: `${'a'.repeat(119)},`, language: 'en' },
@@ -343,10 +362,54 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
   });
 
+  test('pipelines much further ahead while the page is hidden (backgrounded)', async () => {
+    // Foreground fetches keep ~TTS_WS_MAX_CONCURRENT batches warm, which is
+    // enough since prep keeps pace with playback. Backgrounded, the same
+    // main-thread work (WS fetch/decode) can be throttled far more, so the
+    // pipeline must queue much deeper ahead of time or the already-scheduled
+    // audio drains before the next batch is ready — reintroducing the exact
+    // audible pauses between sentences this pipeline exists to remove.
+    const originalVisibilityState = Object.getOwnPropertyDescriptor(
+      Document.prototype,
+      'visibilityState',
+    );
+    Object.defineProperty(document, 'visibilityState', {
+      value: 'hidden',
+      configurable: true,
+    });
+    try {
+      const manyMarks = Array.from({ length: 12 }, (_, i) => ({
+        offset: i * 120,
+        name: String(i),
+        text: `${String.fromCharCode(97 + i).repeat(119)}.`,
+        language: 'en',
+      }));
+      let fetchCount = 0;
+      const neverResolve = new Promise<MockAudioData>(() => {});
+      createAudioDataBehavior = async () => {
+        fetchCount++;
+        return neverResolve;
+      };
+      const client = await startClient();
+      const done = (async () => {
+        for await (const _ of client.speakMarks(manyMarks, new AbortController().signal)) {
+          void _;
+        }
+      })();
+      await vi.waitFor(() => expect(fetchCount).toBeGreaterThan(2));
+      expect(fetchCount).toBeGreaterThanOrEqual(10);
+      void done;
+    } finally {
+      if (originalVisibilityState) {
+        Object.defineProperty(document, 'visibilityState', originalVisibilityState);
+      }
+    }
+  });
+
   test('pipelines batch fetch so later batches start before earlier ones finish', async () => {
     const marks = [
-      { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
-      { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
+      { offset: 0, name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+      { offset: 120, name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
     ];
     let resolveFirst!: (audio: MockAudioData) => void;
     let fetchCount = 0;
@@ -389,6 +452,29 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await flush();
     const [first, second] = ctx().sources;
     expect(second!.startedAt! - first!.endTime).toBeCloseTo(0, 5);
+    await ctx().advanceTo(5);
+    await done;
+  });
+
+  test('rates above EDGE_TTS_MAX_RATE speed up via time-stretch, not raw source.playbackRate', async () => {
+    // Edge's prosody rate already covers up to EDGE_TTS_MAX_RATE (2.0)
+    // preserving pitch. The remaining factor used to be applied via
+    // AudioBufferSourceNode.playbackRate, which resamples the audio and
+    // shifts pitch upward — the "chipmunk"/Minions voice regression. It must
+    // instead go through the pitch-preserving WSOLA stretch, so the native
+    // source stays at its default rate.
+    parsedMarks = [{ name: '0', text: 'Hello there.', language: 'en' }];
+    createAudioDataBehavior = async () => audioOf(2);
+    const client = await startClient();
+    await client.setRate(3);
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+    const [source] = ctx().sources;
+    expect(source!.playbackRate.value).toBe(1);
+    // webAudioRate = rate / EDGE_TTS_MAX_RATE = 3 / 2 = 1.5, so the 2s source
+    // buffer should have been stretched down to roughly 2 / 1.5s of real audio.
+    expect(source!.buffer!.duration).toBeCloseTo(2 / 1.5, 1);
     await ctx().advanceTo(5);
     await done;
   });

@@ -816,9 +816,9 @@ export const READEST_WEB_BASE_URL = 'https://web.readest.com';
 export const READEST_NODE_BASE_URL = 'https://node.readest.com';
 
 // Self-hosted Edge TTS server (see edge-tts/server/readest_tts_server.py).
-// The client posts to `${base}/api/tts/edge` and gets audio/mpeg + word
-// boundaries, no auth required.
-export const READEST_EDGE_TTS_BASE_URL = 'http://47.112.207.44:57880';
+// HTTP: POST `${base}/api/tts/edge` -> audio/mpeg + word boundaries.
+// WSS:  `${wsBase}/consumer/speech/synthesize/readaloud/edge/v1` (Edge protocol).
+export const READEST_EDGE_TTS_BASE_URL = 'http://175.178.236.127:57880';
 
 export const SHARE_BASE_URL = `${READEST_WEB_BASE_URL}/s`;
 export const SHARE_EXPIRATION_DAYS = [1, 3, 7] as const;

@@ -34,8 +34,10 @@ vi.mock('@/libs/edgeTTS', () => {
         return createAudioDataBehavior();
       });
     },
+    EDGE_TTS_MAX_RATE: 2.0,
     EDGE_TTS_PROTOCOL: 'wss',
-    TTS_AUDIO_CACHE_MAX_BYTES: 5 * 60 * 6 * 1024,
+    TTS_WS_MAX_CONCURRENT: 2,
+    TTS_AUDIO_CACHE_MAX_BYTES: 20 * 60 * 6 * 1024,
     getTTSAudioCacheBytes: () => 0,
     hasTTSPrefetchCapacity: () => true,
     isTTSPayloadCached: () => false,
@@ -149,6 +151,34 @@ describe('EdgeTTSClient', () => {
     test('accepts boundary values', async () => {
       await expect(client.setRate(0.5)).resolves.toBeUndefined();
       await expect(client.setRate(2.0)).resolves.toBeUndefined();
+    });
+
+    test('getPayload caps Edge TTS rate at 2.0 for rates above the limit', async () => {
+      // Edge TTS SSML prosody rate silently caps at 2.0; passing a higher value
+      // has no effect. The extra factor must be applied via Web Audio playbackRate.
+      await client.setRate(3.0);
+      const payload = client.getPayload('en-US', 'hello', 'en-US-AriaNeural');
+      expect(payload.rate).toBe(2.0);
+    });
+
+    test('getPayload passes rate unchanged for rates within Edge TTS range', async () => {
+      await client.setRate(1.5);
+      const payload = client.getPayload('en-US', 'hello', 'en-US-AriaNeural');
+      expect(payload.rate).toBe(1.5);
+    });
+
+    // Regression: a doubled Chinese ellipsis ("……") or an excessive run of
+    // literal periods synthesizes as several stacked baked-in pauses on
+    // Edge's side, observed as a multi-second stall before the next batch
+    // plays. getPayload collapses these before they ever reach the wire.
+    test('getPayload collapses repeated pause punctuation before sending to Edge', () => {
+      const payload = client.getPayload('zh-CN', 'o……', 'zh-CN-XiaoxiaoNeural');
+      expect(payload.text).toBe('o…');
+    });
+
+    test('getPayload leaves normal punctuation untouched', () => {
+      const payload = client.getPayload('en-US', 'Hello, world!', 'en-US-AriaNeural');
+      expect(payload.text).toBe('Hello, world!');
     });
   });
 
@@ -470,8 +500,8 @@ describe('EdgeTTSClient', () => {
       );
 
       const marks = [
-        { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
-        { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
+        { offset: 0, name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+        { offset: 120, name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
       ];
       const criticalFetches = Math.min(buildBatches(marks, true).length, 2);
       expect(criticalFetches).toBeGreaterThanOrEqual(2);

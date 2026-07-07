@@ -38,6 +38,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const getBookData = useBookDataStore((s) => s.getBookData);
   const getView = useReaderStore((s) => s.getView);
   const getProgress = useReaderStore((s) => s.getProgress);
+  const setProgress = useReaderStore((s) => s.setProgress);
   const getViewSettings = useReaderStore((s) => s.getViewSettings);
   const setViewSettings = useReaderStore((s) => s.setViewSettings);
   const setTTSEnabled = useReaderStore((s) => s.setTTSEnabled);
@@ -58,6 +59,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
   const previousSectionLabelRef = useRef<string | undefined>(undefined);
   const ttsControllerRef = useRef<TTSController | null>(null);
   const isStartingTTSRef = useRef(false);
+  const latestTTSPersistSequenceRef = useRef(-1);
   // Last broadcast playback state, so a follower engaging mid-session can be
   // replayed the current state on demand (see handleTTSSyncRequest).
   const playbackStateRef = useRef<'playing' | 'paused' | 'stopped'>('stopped');
@@ -420,6 +422,56 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
       }
     };
 
+    const persistSentenceProgress = async (detail: {
+      cfi?: unknown;
+      kind?: unknown;
+      sequence?: unknown;
+    }) => {
+      if (detail.kind !== 'sentence' || typeof detail.cfi !== 'string') return;
+      const sequence = typeof detail.sequence === 'number' ? detail.sequence : 0;
+      if (sequence <= latestTTSPersistSequenceRef.current) return;
+      latestTTSPersistSequenceRef.current = sequence;
+
+      // The user has navigated away from the TTS position (follow suppressed,
+      // "back to TTS" showing). setProgress below writes into the same
+      // progress store the "re-highlight when progress changes" effect reads
+      // to decide whether the view is still at the TTS location — writing
+      // TTS's own advancing CFI there while the user is elsewhere makes that
+      // check trivially match, silently re-enabling auto-follow and snapping
+      // the visible page back to TTS mid-browse (#back-to-tts-line bug).
+      if (!followingTTSLocationRef.current) return;
+
+      try {
+        if (useReaderStore.getState().getViewState(bookKey)?.previewMode) return;
+        const view = getView(bookKey);
+        if (!view) return;
+        const cfiProgress = await view.getCFIProgress(detail.cfi);
+        if (!cfiProgress) return;
+        const { index, anchor } = view.resolveCFI(detail.cfi);
+        let doc = view.renderer.getContents().find((content) => content.index === index)?.doc;
+        if (!doc) {
+          doc = await view.book.sections[index]?.createDocument?.();
+        }
+        if (!doc) return;
+        const range = anchor(doc);
+        if (sequence !== latestTTSPersistSequenceRef.current) return;
+        const { tocItem, pageItem } = view.getProgressOf(index, range);
+        setProgress(
+          bookKey,
+          detail.cfi,
+          tocItem!,
+          pageItem,
+          cfiProgress.section,
+          cfiProgress.location,
+          cfiProgress.time,
+          range,
+          cfiProgress.fraction,
+        );
+      } catch (error) {
+        console.warn('Failed to persist TTS progress', error);
+      }
+    };
+
     // Republish the controller's canonical position signal onto the app-wide
     // bus so paragraph mode + RSVP can follow TTS without touching the
     // controller. This MUST be its own listener: handleHighlightMark /
@@ -428,6 +480,7 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     // forward fires on every controller 'tts-position', gated only by the
     // listener's lifecycle (it exists only while the controller does).
     const handlePosition = (e: Event) => {
+      void persistSentenceProgress((e as CustomEvent).detail ?? {});
       eventDispatcher.dispatch('tts-position', {
         bookKey,
         ...(e as CustomEvent).detail,

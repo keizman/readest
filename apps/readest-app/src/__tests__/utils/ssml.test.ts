@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   hasSpeakableText,
   isNoAudioSynthesisError,
+  collapseRepeatedPausePunctuation,
   parseSSMLMarks,
   parseSSMLLang,
 } from '@/utils/ssml';
@@ -196,6 +197,29 @@ describe('parseSSMLMarks', () => {
 
     it('should treat single ellipsis as unspeakable', () => {
       expect(hasSpeakableText('…')).toBe(false);
+    });
+  });
+
+  describe('collapseRepeatedPausePunctuation', () => {
+    it('collapses a doubled Chinese ellipsis to a single mark', () => {
+      expect(collapseRepeatedPausePunctuation('o……')).toBe('o…');
+    });
+
+    it('collapses an excessive run of literal periods to a standard ellipsis', () => {
+      expect(collapseRepeatedPausePunctuation('o......')).toBe('o...');
+    });
+
+    it('leaves a standard 3-dot ellipsis untouched', () => {
+      expect(collapseRepeatedPausePunctuation('wait...')).toBe('wait...');
+    });
+
+    it('collapses repeated exclamation and question marks', () => {
+      expect(collapseRepeatedPausePunctuation('no!!!!')).toBe('no!');
+      expect(collapseRepeatedPausePunctuation('what????')).toBe('what?');
+    });
+
+    it('leaves ordinary single punctuation and text untouched', () => {
+      expect(collapseRepeatedPausePunctuation('Hello, world!')).toBe('Hello, world!');
     });
   });
 

@@ -4,6 +4,7 @@ const fetchMock = vi.fn();
 
 vi.mock('@/services/environment', () => ({
   getEdgeTTSBaseUrl: () => 'http://api.test',
+  getEdgeTTSWsUrl: () => 'ws://api.test/consumer/speech/synthesize/readaloud/edge/v1',
   isTauriAppPlatform: () => false,
 }));
 

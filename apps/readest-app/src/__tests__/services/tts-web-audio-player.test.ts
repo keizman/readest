@@ -24,6 +24,25 @@ const setup = () => {
 };
 
 describe('WebAudioPlayer scheduling', () => {
+  test('playbackRate in ChunkTiming sets source speed and adjusts scheduling', async () => {
+    // When playbackRate > 1, the source plays faster so the next chunk must start
+    // earlier (buffer.duration / playbackRate, not buffer.duration).
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    // 2s buffer played at 1.5x → effective duration 1.333s
+    player.scheduleChunk(gen, makeBuffer(2), {
+      trimStartSec: 0,
+      mediaScale: 3,
+      gapSec: 0,
+      playbackRate: 1.5,
+    });
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(ctx.sources[0]!.playbackRate.value).toBe(1.5);
+    // Second chunk starts after first's effective duration (2/1.5 ≈ 1.333s)
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2 / 1.5, 5);
+  });
+
   test('chunks are scheduled contiguously with the requested gap', async () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();

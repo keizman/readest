@@ -65,14 +65,15 @@ import { useProgressAutoSave } from '@/app/reader/hooks/useProgressAutoSave';
 
 const flushDebouncedSave = async () => {
   await act(async () => {
-    // debounce 1000ms + inner setTimeout 500ms + slack
-    vi.advanceTimersByTime(2000);
+    // debounce 1000ms + slack
+    vi.advanceTimersByTime(1100);
     for (let i = 0; i < 10; i++) await Promise.resolve();
   });
 };
 
 beforeEach(() => {
   vi.useFakeTimers();
+  vi.setSystemTime(0);
   h.saveConfigMock.mockClear();
   h.state.config = { location: 'cfi-loc', updatedAt: 1000 };
   h.state.progress = { location: 'cfi-loc' };
@@ -111,6 +112,37 @@ describe('useProgressAutoSave', () => {
     await flushDebouncedSave();
 
     expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('periodically saves during continuous progress changes without waiting for idle debounce', async () => {
+    const { rerender } = renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+    h.saveConfigMock.mockClear();
+
+    for (let i = 1; i <= 8; i++) {
+      h.state.config = { location: `cfi-tts-${i}`, updatedAt: 1000 };
+      h.state.progress = { location: `cfi-tts-${i}` };
+      rerender();
+      await act(async () => {
+        vi.advanceTimersByTime(500);
+        await Promise.resolve();
+      });
+    }
+
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+
+    h.state.config = { location: 'cfi-tts-9', updatedAt: 1000 };
+    h.state.progress = { location: 'cfi-tts-9' };
+    rerender();
+    await act(async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+    const saveConfigCalls = h.saveConfigMock.mock.calls as unknown as Array<
+      [unknown, unknown, { location: string }]
+    >;
+    expect(saveConfigCalls[0]![2].location).toBe('cfi-tts-9');
   });
 
   test('saves when applyRemoteProgress moves the view to a newer remote location', async () => {

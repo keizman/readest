@@ -109,6 +109,19 @@ describe('LRUCache', () => {
       expect(cache.get('d')).toBe(4);
     });
 
+    test('evicts falsy keys when they are the oldest entry', () => {
+      const cache = new LRUCache<number, string>(2);
+      cache.set(0, 'zero');
+      cache.set(1, 'one');
+      cache.set(2, 'two');
+
+      expect(cache.has(0)).toBe(false);
+      expect(cache.entries()).toEqual([
+        [2, 'two'],
+        [1, 'one'],
+      ]);
+    });
+
     test('updating existing key does not trigger capacity eviction', () => {
       const cache = new LRUCache<string, number>(2);
       cache.set('a', 1);
@@ -330,13 +343,13 @@ describe('LRUCache', () => {
       expect(onEvict).toHaveBeenCalledWith('a', 1);
     });
 
-    test('called when entry is updated via set', () => {
+    test('not called when entry is updated via set', () => {
       const onEvict = vi.fn();
       const cache = new LRUCache<string, number>(2, onEvict);
       cache.set('a', 1);
-      cache.set('a', 2); // update triggers onEvict with old value
-      expect(onEvict).toHaveBeenCalledTimes(1);
-      expect(onEvict).toHaveBeenCalledWith('a', 1);
+      cache.set('a', 2); // update should not call onEvict
+      expect(onEvict).not.toHaveBeenCalled();
+      expect(cache.get('a')).toBe(2);
     });
 
     test('called when entry is deleted', () => {
@@ -384,13 +397,12 @@ describe('LRUCache', () => {
       cache.set('a', 1);
       cache.set('b', 2);
       cache.set('c', 3); // evicts 'a'
-      cache.set('b', 20); // updates 'b', evicts old value
+      cache.set('b', 20); // updates 'b', does NOT evict (no onEvict on update)
       cache.delete('c'); // deletes 'c'
       cache.clear(); // clears 'b'
 
       expect(evicted).toEqual([
         ['a', 1],
-        ['b', 2],
         ['c', 3],
         ['b', 20],
       ]);

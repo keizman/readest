@@ -65,7 +65,6 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
   const [pageTurnStyle, setPageTurnStyle] = useState(viewSettings.pageTurnStyle || 'push');
   const [isEink, setIsEink] = useState(viewSettings.isEink);
   const [isColorEink, setIsColorEink] = useState(viewSettings.isColorEink);
-  const [autoScreenBrightness, setAutoScreenBrightness] = useState(settings.autoScreenBrightness);
   const [swipeBrightnessGesture, setSwipeBrightnessGesture] = useState(
     settings.swipeBrightnessGesture,
   );
@@ -242,12 +241,6 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
     saveViewSettings(envConfig, bookKey, 'isColorEink', isColorEink);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isColorEink]);
-
-  useEffect(() => {
-    if (autoScreenBrightness === settings.autoScreenBrightness) return;
-    saveSysSettings(envConfig, 'autoScreenBrightness', autoScreenBrightness);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoScreenBrightness]);
 
   useEffect(() => {
     if (swipeBrightnessGesture === settings.swipeBrightnessGesture) return;
@@ -489,13 +482,6 @@ const ControlPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRes
             disabled={!isEink}
             onChange={() => setIsColorEink(!isColorEink)}
             data-setting-id='settings.control.colorEinkMode'
-          />
-        )}
-        {appService?.isMobileApp && (
-          <SettingsSwitchRow
-            label={_('System Screen Brightness')}
-            checked={autoScreenBrightness}
-            onChange={() => setAutoScreenBrightness(!autoScreenBrightness)}
           />
         )}
         {appService?.hasScreenBrightness && (

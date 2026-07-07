@@ -3,7 +3,6 @@ import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useDeviceControlStore } from '@/store/deviceStore';
-import { saveSysSettings } from '@/helpers/settings';
 import {
   computeBrightness,
   isInLeftEdge,
@@ -30,7 +29,7 @@ interface LatestState {
  * read through `latestRef` (updated each render), mirroring `useTouchInterceptor`.
  */
 export const useBrightnessGesture = (bookKey: string) => {
-  const { appService, envConfig } = useEnv();
+  const { appService } = useEnv();
   const { settings } = useSettingsStore();
   const { getViewSettings } = useReaderStore();
   const { getScreenBrightness, setScreenBrightness } = useDeviceControlStore();
@@ -67,11 +66,6 @@ export const useBrightnessGesture = (bookKey: string) => {
 
   useEffect(() => {
     if (!hasScreenBrightness) return;
-    if (settings.screenBrightness >= 0) {
-      seedRef.current = Math.max(0, Math.min(1, settings.screenBrightness / 100));
-      seededRef.current = true;
-      return;
-    }
     let cancelled = false;
     getScreenBrightness().then((b) => {
       if (cancelled) return;
@@ -81,7 +75,7 @@ export const useBrightnessGesture = (bookKey: string) => {
     return () => {
       cancelled = true;
     };
-  }, [hasScreenBrightness, settings.screenBrightness, getScreenBrightness]);
+  }, [hasScreenBrightness, getScreenBrightness]);
 
   const flushBrightness = useCallback(() => {
     rafIdRef.current = null;
@@ -171,8 +165,6 @@ export const useBrightnessGesture = (bookKey: string) => {
         const value = levelRef.current;
         setScreenBrightness(value);
         seedRef.current = value;
-        saveSysSettings(envConfig, 'screenBrightness', Math.round(value * 100));
-        saveSysSettings(envConfig, 'autoScreenBrightness', false);
         if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
         hideTimerRef.current = setTimeout(() => setOverlayVisible(false), OVERLAY_HIDE_DELAY_MS);
         resetGesture();
@@ -183,7 +175,7 @@ export const useBrightnessGesture = (bookKey: string) => {
       doc.addEventListener('touchend', onTouchEnd, opts);
       doc.addEventListener('touchcancel', onTouchEnd, opts);
     },
-    [resetGesture, scheduleBrightness, cancelRaf, setScreenBrightness, envConfig],
+    [resetGesture, scheduleBrightness, cancelRaf, setScreenBrightness],
   );
 
   useEffect(() => {

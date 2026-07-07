@@ -28,6 +28,7 @@ export interface TTSAudioBuffer {
 export interface TTSAudioBufferSourceNode {
   buffer: TTSAudioBuffer | null;
   onended: (() => void) | null;
+  readonly playbackRate: { value: number };
   connect(destination: unknown): void;
   disconnect(): void;
   start(when?: number, offset?: number, duration?: number): void;
@@ -54,6 +55,9 @@ export interface ChunkTiming {
   mediaScale: number;
   // Silence scheduled after this chunk; the caller rate-scales it.
   gapSec: number;
+  // Extra speed applied via Web Audio source.playbackRate (default 1.0).
+  // Used when the TTS engine's max rate < the desired user rate.
+  playbackRate?: number;
 }
 
 export type WebAudioPlayerEvent =
@@ -175,22 +179,25 @@ export class WebAudioPlayer {
     const start = Math.max(plannedStart, ctx.currentTime + SCHEDULE_SAFETY_SEC);
     const source = ctx.createBufferSource();
     source.buffer = buffer;
+    const playbackRate = timing.playbackRate ?? 1.0;
+    source.playbackRate.value = playbackRate;
     source.connect(ctx.destination);
+    const effectiveDuration = buffer.duration / playbackRate;
     const chunk: ScheduledChunk = {
       index: session.chunks.length,
       source,
       startTime: start,
-      duration: buffer.duration,
+      duration: effectiveDuration,
       timing,
       ended: false,
     };
     source.onended = () => this.#handleChunkEnded(session, chunk);
     session.chunks.push(chunk);
-    session.nextStartTime = start + buffer.duration + Math.max(0, timing.gapSec);
+    session.nextStartTime = start + effectiveDuration + Math.max(0, timing.gapSec);
     source.start(start);
     const scheduleGapMs = Math.max(0, (start - plannedStart) * 1000);
     console.log(
-      `[TTS] schedule ${generation}:${chunk.index} at ${start.toFixed(2)} dur ${buffer.duration.toFixed(2)}` +
+      `[TTS] schedule ${generation}:${chunk.index} at ${start.toFixed(2)} dur ${effectiveDuration.toFixed(2)}` +
         (scheduleGapMs > 5 ? ` gap ${scheduleGapMs.toFixed(0)}ms` : ''),
     );
     if (scheduleGapMs > 50 && chunk.index > 0) {

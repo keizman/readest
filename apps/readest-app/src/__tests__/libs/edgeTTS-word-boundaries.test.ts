@@ -39,6 +39,7 @@ vi.mock('isomorphic-ws', () => ({
 vi.mock('@/services/environment', () => ({
   getAPIBaseUrl: () => 'http://localhost/api',
   getEdgeTTSBaseUrl: () => 'http://localhost',
+  getEdgeTTSWsUrl: () => 'ws://localhost/consumer/speech/synthesize/readaloud/edge/v1',
   isTauriAppPlatform: () => false,
 }));
 
@@ -52,10 +53,14 @@ vi.mock('@/utils/supabase', () => ({
 const httpState = vi.hoisted(() => ({
   headers: {} as Record<string, string>,
   body: new Uint8Array([1, 2, 3]),
+  requests: [] as Array<{ input: unknown; init?: RequestInit }>,
 }));
 vi.stubGlobal(
   'fetch',
-  vi.fn(async () => new Response(httpState.body, { status: 200, headers: httpState.headers })),
+  vi.fn(async (input: unknown, init?: RequestInit) => {
+    httpState.requests.push({ input, init });
+    return new Response(httpState.body, { status: 200, headers: httpState.headers });
+  }),
 );
 
 const makeBinaryAudioFrame = (audio: Uint8Array) => {
@@ -100,6 +105,7 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
     const promise = tts.createAudioData(payload);
     await vi.waitFor(() => expect(wsState.instances.length).toBe(1));
     const ws = wsState.instances[0]!;
+    expect(ws.url).toBe('ws://localhost/consumer/speech/synthesize/readaloud/edge/v1');
     // In a browser (jsdom has `window`), the WebSocket constructor must be
     // called WITHOUT an options argument: native WebSocket treats a second
     // argument as subprotocols and throws SyntaxError on an options object.
@@ -123,6 +129,179 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
     expect(wsState.instances.length).toBe(1);
     expect(new Uint8Array(cached.data)).toEqual(new Uint8Array([1, 2, 3, 4]));
     expect(cached.boundaries).toEqual(boundaries);
+  });
+
+  test('limits self-hosted WS synthesis to two concurrent connections', async () => {
+    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const tts = new EdgeSpeechTTS('wss');
+    const payload = (text: string) => ({
+      lang: 'en',
+      text,
+      voice: 'en-US-AriaNeural',
+      rate: 1.0,
+      pitch: 1.0,
+    });
+
+    const p1 = tts.createAudioData(payload('one'));
+    const p2 = tts.createAudioData(payload('two'));
+    const p3 = tts.createAudioData(payload('three'));
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(2));
+
+    const finish = (index: number) => {
+      const ws = wsState.instances[index]!;
+      ws.emit('open');
+      ws.emit('message', { data: makeBinaryAudioFrame(new Uint8Array([index])) });
+      ws.emit('message', { data: 'Path:turn.end\r\n\r\n' });
+    };
+    finish(0);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(2));
+    finish(1);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(3));
+    finish(2);
+
+    const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+    expect(new Uint8Array(r1.data)[0]).toBe(0);
+    expect(new Uint8Array(r2.data)[0]).toBe(1);
+    expect(new Uint8Array(r3.data)[0]).toBe(2);
+  });
+
+  test('aborted queued WS request does not block later audio from starting', async () => {
+    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const tts = new EdgeSpeechTTS('wss');
+    const payload = (text: string) => ({
+      lang: 'en',
+      text,
+      voice: 'en-US-AriaNeural',
+      rate: 1.0,
+      pitch: 1.0,
+    });
+    const abortQueued = new AbortController();
+
+    const p1 = tts.createAudioData(payload('abort-queue-one'));
+    const p2 = tts.createAudioData(payload('abort-queue-two'));
+    const p3 = tts
+      .createAudioData(payload('abort-queue-three'), abortQueued.signal)
+      .catch((error) => error);
+    const p4 = tts.createAudioData(payload('abort-queue-four'));
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(2));
+
+    abortQueued.abort();
+    await expect(p3).resolves.toBeInstanceOf(Error);
+
+    const finish = (index: number) => {
+      const ws = wsState.instances[index]!;
+      ws.emit('open');
+      ws.emit('message', { data: makeBinaryAudioFrame(new Uint8Array([index])) });
+      ws.emit('message', { data: 'Path:turn.end\r\n\r\n' });
+    };
+    finish(0);
+
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(3));
+    finish(1);
+    finish(2);
+
+    await expect(Promise.all([p1, p2, p4])).resolves.toHaveLength(3);
+  });
+
+  test('rejects (does not hang forever) when the WS resets after partial audio arrives', async () => {
+    // Regression test: an abnormal close before turn.end used to be silently
+    // ignored whenever any audio bytes had already arrived, leaving the
+    // returned promise (and the whole TTS scheduler awaiting it) parked
+    // forever — the "WS resets, next sentence never plays" bug.
+    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const tts = new EdgeSpeechTTS('wss');
+
+    const promise = tts
+      .createAudioData({
+        lang: 'en',
+        text: 'Reset mid stream',
+        voice: 'en-US-AriaNeural',
+        rate: 1.0,
+        pitch: 1.0,
+      })
+      .catch((error) => error);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(1));
+    const ws = wsState.instances[0]!;
+    ws.emit('open');
+    ws.emit('message', { data: makeBinaryAudioFrame(new Uint8Array([1, 2, 3])) });
+    // Connection resets before turn.end ever arrives.
+    ws.emit('close');
+
+    const result = await promise;
+    expect(result).toBeInstanceOf(Error);
+    // Must be retryable, not classified as the permanent "no audio" failure.
+    expect((result as Error).message.toLowerCase()).not.toContain('no audio data received');
+  });
+
+  test('still rejects with "No audio data received" when the WS closes with zero bytes', async () => {
+    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const tts = new EdgeSpeechTTS('wss');
+
+    const promise = tts
+      .createAudioData({
+        lang: 'en',
+        text: 'Never sends audio',
+        voice: 'en-US-AriaNeural',
+        rate: 1.0,
+        pitch: 1.0,
+      })
+      .catch((error) => error);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(1));
+    const ws = wsState.instances[0]!;
+    ws.emit('open');
+    ws.emit('close');
+
+    const result = await promise;
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message.toLowerCase()).toContain('no audio data received');
+  });
+
+  test('a high-priority request jumps ahead of queued low-priority (background prefetch) requests', async () => {
+    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const tts = new EdgeSpeechTTS('wss');
+    const payload = (text: string) => ({
+      lang: 'en',
+      text,
+      voice: 'en-US-AriaNeural',
+      rate: 1.0,
+      pitch: 1.0,
+    });
+    const open = (index: number) => wsState.instances[index]!.emit('open');
+    const complete = (index: number) => {
+      const ws = wsState.instances[index]!;
+      ws.emit('message', { data: makeBinaryAudioFrame(new Uint8Array([index])) });
+      ws.emit('message', { data: 'Path:turn.end\r\n\r\n' });
+    };
+
+    // Fill both WS concurrency slots with background prefetch (low priority).
+    const pSlotOne = tts.createAudioData(payload('prefetch-slot-one'));
+    const pSlotTwo = tts.createAudioData(payload('prefetch-slot-two'));
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(2));
+    open(0);
+    open(1);
+
+    // Another background prefetch queues behind the full slots.
+    const pQueuedLow = tts.createAudioData(payload('prefetch-queued-low'));
+    // The imminent-playback fetch queues after it, but with 'high' priority.
+    const pQueuedHigh = tts.createAudioData(payload('playback-queued-high'), undefined, 'high');
+
+    complete(0);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(3));
+    open(2);
+
+    // The playback-critical request must win the freed slot over the
+    // earlier-queued background prefetch request.
+    const thirdWs = wsState.instances[2]!;
+    expect(String(thirdWs.sent[1])).toContain('playback-queued-high');
+    expect(String(thirdWs.sent[1])).not.toContain('prefetch-queued-low');
+
+    complete(1);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(4));
+    open(3);
+    complete(2);
+    complete(3);
+
+    await Promise.all([pSlotOne, pSlotTwo, pQueuedLow, pQueuedHigh]);
   });
 
   test('resolves with empty boundaries when no metadata frames arrive', async () => {
@@ -175,6 +354,7 @@ describe('EdgeSpeechTTS.createAudioData over the HTTPS proxy (word boundaries vi
   beforeEach(() => {
     httpState.headers = {};
     httpState.body = new Uint8Array([1, 2, 3]);
+    httpState.requests.length = 0;
     (URL as unknown as { createObjectURL?: (blob: Blob) => string }).createObjectURL = vi.fn(
       () => 'blob:mock-object-url',
     );
@@ -212,5 +392,25 @@ describe('EdgeSpeechTTS.createAudioData over the HTTPS proxy (word boundaries vi
       pitch: 1.0,
     });
     expect(result.boundaries).toEqual([]);
+  });
+
+  test('requests gzip transport compression from the self-hosted HTTP server', async () => {
+    const edgeTTS = await import('@/libs/edgeTTS');
+    const { EdgeSpeechTTS } = edgeTTS;
+    const tts = new EdgeSpeechTTS('https');
+
+    await tts.createAudioData({
+      lang: 'en',
+      text: 'Compression header https',
+      voice: 'en-US-AriaNeural',
+      rate: 1.0,
+      pitch: 1.0,
+    });
+
+    expect(httpState.requests).toHaveLength(1);
+    const headers = httpState.requests[0]!.init?.headers as Record<string, string>;
+    expect(edgeTTS.TTS_ACCEPT_ENCODING_HEADER).toBe('X-TTS-Accept-Encoding');
+    expect(edgeTTS.TTS_ACCEPT_ENCODING_VALUE).toBe('gzip');
+    expect(headers['X-TTS-Accept-Encoding']).toBe('gzip');
   });
 });

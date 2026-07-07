@@ -95,7 +95,7 @@ describe('EdgeSpeechTTS on Cloudflare Workers', () => {
 
     // Import AFTER the mocks and globals are set up.
     const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
-    const tts = new EdgeSpeechTTS('wss');
+    const tts = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'bing' });
     const response = await tts.create({
       lang: 'en-US',
       text: 'hello',
@@ -178,7 +178,7 @@ describe('EdgeSpeechTTS on Cloudflare Workers', () => {
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
     const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
-    const tts = new EdgeSpeechTTS('wss');
+    const tts = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'bing' });
     const response = await tts.create({
       lang: 'en-US',
       text: 'hello',
@@ -202,7 +202,7 @@ describe('EdgeSpeechTTS on Cloudflare Workers', () => {
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
     const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
-    const tts = new EdgeSpeechTTS('wss');
+    const tts = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'bing' });
     await expect(
       tts.create({
         lang: 'en-US',
@@ -265,7 +265,7 @@ describe('EdgeSpeechTTS on Cloudflare Workers', () => {
       .mockResolvedValue({ status: 101, webSocket: mockSocket }) as unknown as typeof fetch;
 
     const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
-    const tts = new EdgeSpeechTTS('wss');
+    const tts = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'bing' });
     const { boundaries } = await tts.createWithBoundaries({
       lang: 'en-US',
       text: 'Hello brave',

@@ -3,7 +3,7 @@ import WebSocket from 'isomorphic-ws';
 import { randomMd5 } from '@/utils/misc';
 import { LRUCache } from '@/utils/lru';
 import { genSSML } from '@/utils/ssml';
-import { getEdgeTTSBaseUrl, isTauriAppPlatform } from '@/services/environment';
+import { getEdgeTTSBaseUrl, getEdgeTTSWsUrl, isTauriAppPlatform } from '@/services/environment';
 
 // Cloudflare Workers expose a global `WebSocketPair` that is not available in
 // browsers or Node.js. The Node `ws` package (used transitively via
@@ -318,6 +318,8 @@ export interface EdgeSpeechAudio {
 // Response header used to carry word boundaries through the authenticated
 // HTTPS proxy route (`/api/tts/edge`), which streams only the audio body.
 export const WORD_BOUNDARIES_HEADER = 'X-TTS-Word-Boundaries';
+export const TTS_ACCEPT_ENCODING_HEADER = 'X-TTS-Accept-Encoding';
+export const TTS_ACCEPT_ENCODING_VALUE = 'gzip';
 
 // HTTP header values must be ASCII, but boundary `text` can be any script
 // (em-dashes, CJK, accents). Percent-encode the JSON so the header stays
@@ -349,8 +351,39 @@ export const hashTTSPayload = (payload: EdgeTTSPayload): string => {
 
 export type EDGE_TTS_PROTOCOL = 'wss' | 'https';
 
-// 48 kbit/s mono mp3 ≈ 6 KiB/s — retain ~5 minutes of synthesized audio.
-export const TTS_AUDIO_CACHE_MAX_BYTES = 5 * 60 * 6 * 1024;
+// Max concurrent self-hosted WS synthesis requests (preload + playback share this).
+export const TTS_WS_MAX_CONCURRENT = 2;
+
+// Backstop for a synthesis request that never resolves because the socket
+// closes/hangs without ever delivering a close or error event (observed with
+// some reverse proxies on connection reset). Without this, a single dropped
+// connection could wedge playback forever instead of retrying. See #4954.
+const WS_REQUEST_TIMEOUT_MS = 15000;
+
+// Playback-critical fetches (the sentence about to be scheduled) must not
+// queue behind background paragraph prefetch for the same WS concurrency
+// slots, or an in-progress paragraph stalls waiting on unrelated lookahead
+// work. 'high' priority requests jump the wait queue; prefetch stays 'low'.
+export type WsSlotPriority = 'high' | 'low';
+
+const wsAbortError = (signal: AbortSignal): Error =>
+  signal.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError');
+
+// 'self-hosted' connects to getEdgeTTSWsUrl(); 'bing' hits Microsoft directly.
+export type EdgeTTSWsTarget = 'self-hosted' | 'bing';
+
+export type EdgeSpeechTTSOptions = {
+  protocol?: EDGE_TTS_PROTOCOL;
+  wsTarget?: EdgeTTSWsTarget;
+};
+
+// 48 kbit/s mono mp3 is roughly 6 KiB/s. Retain about 20 minutes so the
+// five-minute lookahead window has room for current and recently played audio
+// without evicting future chunks immediately.
+export const TTS_AUDIO_CACHE_MAX_BYTES = 20 * 60 * 6 * 1024;
+
+// Edge TTS SSML prosody rate silently caps here; higher values have no effect.
+export const EDGE_TTS_MAX_RATE = 2.0;
 
 export const getTTSAudioCacheBytes = (): number => EdgeSpeechTTS.getAudioCacheBytes();
 
@@ -400,6 +433,12 @@ export class EdgeSpeechTTS {
   // Self-hosted HTTPS TTS cannot absorb concurrent synthesis; serialize network
   // fetches so preload, playback, and lookahead share one in-flight request.
   private static httpsRequestQueue: Promise<unknown> = Promise.resolve();
+  private static wsInFlight = 0;
+  private static wsWaiters: Array<{ wake: () => boolean; priority: WsSlotPriority }> = [];
+
+  private static rejectIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw wsAbortError(signal);
+  }
 
   private static enqueueHttpsRequest<T>(fn: () => Promise<T>): Promise<T> {
     const run = EdgeSpeechTTS.httpsRequestQueue.then(fn, fn);
@@ -410,12 +449,82 @@ export class EdgeSpeechTTS {
     return run;
   }
 
-  private protocol: EDGE_TTS_PROTOCOL = 'wss';
-
-  constructor(protocol?: EDGE_TTS_PROTOCOL) {
-    if (protocol) {
-      this.protocol = protocol;
+  private static acquireWsSlot(
+    signal?: AbortSignal,
+    priority: WsSlotPriority = 'low',
+  ): Promise<void> {
+    EdgeSpeechTTS.rejectIfAborted(signal);
+    if (EdgeSpeechTTS.wsInFlight < TTS_WS_MAX_CONCURRENT) {
+      EdgeSpeechTTS.wsInFlight++;
+      return Promise.resolve();
     }
+    return new Promise((resolve, reject) => {
+      let aborted = false;
+      let entry: { wake: () => boolean; priority: WsSlotPriority } | null = null;
+      const onAbort = () => {
+        aborted = true;
+        if (entry) {
+          const index = EdgeSpeechTTS.wsWaiters.indexOf(entry);
+          if (index >= 0) EdgeSpeechTTS.wsWaiters.splice(index, 1);
+        }
+        reject(wsAbortError(signal!));
+      };
+      const wake = () => {
+        signal?.removeEventListener('abort', onAbort);
+        if (aborted) return false;
+        EdgeSpeechTTS.wsInFlight++;
+        resolve();
+        return true;
+      };
+      entry = { wake, priority };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      // 'high' priority (the sentence about to play) jumps ahead of any
+      // queued background prefetch so an urgent fetch never waits behind
+      // unrelated lookahead work fighting for the same WS slots.
+      if (priority === 'high') {
+        const insertAt = EdgeSpeechTTS.wsWaiters.findIndex((w) => w.priority === 'low');
+        if (insertAt === -1) EdgeSpeechTTS.wsWaiters.push(entry);
+        else EdgeSpeechTTS.wsWaiters.splice(insertAt, 0, entry);
+      } else {
+        EdgeSpeechTTS.wsWaiters.push(entry);
+      }
+    });
+  }
+
+  private static releaseWsSlot(): void {
+    EdgeSpeechTTS.wsInFlight = Math.max(0, EdgeSpeechTTS.wsInFlight - 1);
+    while (EdgeSpeechTTS.wsWaiters.length > 0) {
+      const { wake } = EdgeSpeechTTS.wsWaiters.shift()!;
+      if (wake()) break;
+    }
+  }
+
+  private static runWithWsSlot<T>(
+    fn: () => Promise<T>,
+    signal?: AbortSignal,
+    priority: WsSlotPriority = 'low',
+  ): Promise<T> {
+    return EdgeSpeechTTS.acquireWsSlot(signal, priority).then(async () => {
+      EdgeSpeechTTS.rejectIfAborted(signal);
+      try {
+        return await fn();
+      } finally {
+        EdgeSpeechTTS.releaseWsSlot();
+      }
+    });
+  }
+
+  private protocol: EDGE_TTS_PROTOCOL = 'wss';
+  private wsTarget: EdgeTTSWsTarget = 'self-hosted';
+
+  constructor(options?: EDGE_TTS_PROTOCOL | EdgeSpeechTTSOptions) {
+    if (typeof options === 'string') {
+      this.protocol = options;
+      this.wsTarget = options === 'wss' ? 'self-hosted' : 'bing';
+      return;
+    }
+    this.protocol = options?.protocol ?? 'wss';
+    this.wsTarget = options?.wsTarget ?? (this.protocol === 'wss' ? 'self-hosted' : 'bing');
   }
 
   async #fetchEdgeSpeechHttp({ lang, text, voice, rate }: EdgeTTSPayload): Promise<Response> {
@@ -425,6 +534,7 @@ export class EdgeSpeechTTS {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        [TTS_ACCEPT_ENCODING_HEADER]: TTS_ACCEPT_ENCODING_VALUE,
       },
       body: JSON.stringify({
         input: text,
@@ -441,29 +551,37 @@ export class EdgeSpeechTTS {
     return response;
   }
 
-  async #fetchEdgeSpeechWs({ lang, text, voice, rate }: EdgeTTSPayload): Promise<EdgeSpeechAudio> {
+  async #fetchEdgeSpeechWs(
+    { lang, text, voice, rate }: EdgeTTSPayload,
+    signal?: AbortSignal,
+  ): Promise<EdgeSpeechAudio> {
+    EdgeSpeechTTS.rejectIfAborted(signal);
     const connectId = randomMd5();
-    const params = new URLSearchParams({
-      ConnectionId: connectId,
-      TrustedClientToken: EDGE_API_TOKEN,
-      'Sec-MS-GEC': await generateSecMsGec(),
-      'Sec-MS-GEC-Version': `1-${CHROMIUM_FULL_VERSION}`,
-    });
-    const url = `${EDGE_SPEECH_URL}?${params.toString()}`;
+    const useBingDirect = this.wsTarget === 'bing';
+    const url = useBingDirect
+      ? `${EDGE_SPEECH_URL}?${new URLSearchParams({
+          ConnectionId: connectId,
+          TrustedClientToken: EDGE_API_TOKEN,
+          'Sec-MS-GEC': await generateSecMsGec(),
+          'Sec-MS-GEC-Version': `1-${CHROMIUM_FULL_VERSION}`,
+        }).toString()}`
+      : getEdgeTTSWsUrl();
     const date = new Date().toString();
-    const baseHeaders = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' +
-        ` (KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36` +
-        ` Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`,
-      'Accept-Encoding': 'gzip, deflate, br, zstd',
-      'Accept-Language': 'en-US,en;q=0.9',
-      Pragma: 'no-cache',
-      'Cache-Control': 'no-cache',
-      Origin: 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
-      'Sec-WebSocket-Version': '13',
-      Cookie: `muid=${generateMuid()};`,
-    };
+    const baseHeaders: Record<string, string> = useBingDirect
+      ? {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' +
+            ` (KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36` +
+            ` Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`,
+          'Accept-Encoding': 'gzip, deflate, br, zstd',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Pragma: 'no-cache',
+          'Cache-Control': 'no-cache',
+          Origin: 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+          'Sec-WebSocket-Version': '13',
+          Cookie: `muid=${generateMuid()};`,
+        }
+      : {};
     const configHeaders = {
       'Content-Type': 'application/json; charset=utf-8',
       Path: 'speech.config',
@@ -523,9 +641,39 @@ export class EdgeSpeechTTS {
 
     if (isTauriAppPlatform()) {
       return new Promise(async (resolve, reject) => {
+        let settled = false;
+        let disconnect: (() => void) | undefined;
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const finish = (fn: 'resolve' | 'reject', value?: unknown) => {
+          if (settled) return;
+          settled = true;
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
+          detachAbort?.();
+          disconnect?.();
+          if (fn === 'resolve') resolve(value as EdgeSpeechAudio);
+          else reject(value);
+        };
+        let detachAbort: (() => void) | undefined;
+        if (signal?.aborted) return finish('reject', wsAbortError(signal));
+        if (signal) {
+          const onAbort = () => finish('reject', wsAbortError(signal));
+          signal.addEventListener('abort', onAbort, { once: true });
+          detachAbort = () => signal.removeEventListener('abort', onAbort);
+        }
+        // The connection plugin reports disconnects as a 'Close' message
+        // rather than throwing, and a reset mid-stream may deliver neither a
+        // 'Close' message nor an error — this timeout is the last resort so a
+        // dropped socket retries instead of wedging playback indefinitely.
+        timeoutId = setTimeout(
+          () => finish('reject', new Error('Edge TTS WebSocket timed out.')),
+          WS_REQUEST_TIMEOUT_MS,
+        );
         try {
           const TauriWebSocket = (await import('@tauri-apps/plugin-websocket')).default;
           const ws = await TauriWebSocket.connect(url, { headers: baseHeaders });
+          disconnect = () => {
+            void ws.disconnect();
+          };
           let audioData = new ArrayBuffer(0);
           const boundaries: TTSWordBoundary[] = [];
           const messageUnlisten = await ws.addListener((msg) => {
@@ -534,12 +682,11 @@ export class EdgeSpeechTTS {
               if (headers['Path'] === 'audio.metadata') {
                 boundaries.push(...parseAudioMetadataBody(body.trim()));
               } else if (headers['Path'] === 'turn.end') {
-                ws.disconnect();
                 messageUnlisten();
                 if (!audioData.byteLength) {
-                  return reject(new Error('No audio data received.'));
+                  return finish('reject', new Error('No audio data received.'));
                 }
-                resolve({ response: new Response(audioData), boundaries });
+                finish('resolve', { response: new Response(audioData), boundaries });
               }
             } else if (msg.type === 'Binary') {
               let buffer: ArrayBufferLike;
@@ -557,12 +704,28 @@ export class EdgeSpeechTTS {
                 merged.set(new Uint8Array(newBody), audioData.byteLength);
                 audioData = merged.buffer;
               }
+            } else if (msg.type === 'Close') {
+              // The socket reset or the server hung up before turn.end. This
+              // was previously silently ignored, which left the promise (and
+              // the whole scheduler awaiting it) parked forever whenever a
+              // connection dropped mid-synthesis — the "stuck, next sentence
+              // never plays" failure. Reject with a retryable error (not the
+              // permanent "no audio data" message) so #createAudioDataWithRetry
+              // opens a fresh connection instead of hanging.
+              if (!audioData.byteLength) {
+                finish('reject', new Error('No audio data received.'));
+              } else {
+                finish(
+                  'reject',
+                  new Error(`Edge TTS WebSocket closed unexpectedly (code ${msg.data?.code}).`),
+                );
+              }
             }
           });
           await ws.send(config);
           await ws.send(content);
         } catch (error) {
-          reject(new Error(`WebSocket error occurred: ${error}`));
+          finish('reject', new Error(`WebSocket error occurred: ${error}`));
         }
       });
     } else if (isCloudflareWorkers()) {
@@ -595,6 +758,11 @@ export class EdgeSpeechTTS {
             let audioData = new ArrayBuffer(0);
             const boundaries: TTSWordBoundary[] = [];
             let settled = false;
+            const timeoutId = setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              reject(new Error('Edge TTS WebSocket timed out.'));
+            }, WS_REQUEST_TIMEOUT_MS);
             // Cloudflare Workers deliver binary WebSocket frames as `Blob`,
             // whose conversion to bytes (`blob.arrayBuffer()`) is async.
             // Chain every binary message through this promise so frames are
@@ -626,11 +794,18 @@ export class EdgeSpeechTTS {
             const finalize = () => {
               if (settled) return;
               settled = true;
+              clearTimeout(timeoutId);
               if (!audioData.byteLength) {
                 reject(new Error('No audio data received.'));
               } else {
                 resolve({ response: new Response(audioData), boundaries });
               }
+            };
+            const failFast = (error: Error) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeoutId);
+              reject(error);
             };
 
             const onMessage = (event: { data: unknown }) => {
@@ -654,11 +829,7 @@ export class EdgeSpeechTTS {
                       }
                       finalize();
                     })
-                    .catch(() => {
-                      if (settled) return;
-                      settled = true;
-                      reject(new Error('No audio data received.'));
-                    });
+                    .catch(() => failFast(new Error('No audio data received.')));
                 }
                 return;
               }
@@ -685,16 +856,10 @@ export class EdgeSpeechTTS {
               // Drain any pending Blob decodes that may still be in-flight.
               pendingBinary
                 .then(() => finalize())
-                .catch(() => {
-                  if (settled) return;
-                  settled = true;
-                  reject(new Error('No audio data received.'));
-                });
+                .catch(() => failFast(new Error('No audio data received.')));
             });
             ws.addEventListener('error', () => {
-              if (settled) return;
-              settled = true;
-              reject(new Error('WebSocket error occurred.'));
+              failFast(new Error('WebSocket error occurred.'));
             });
 
             ws.accept();
@@ -711,6 +876,27 @@ export class EdgeSpeechTTS {
       });
     } else {
       return new Promise((resolve, reject) => {
+        let settled = false;
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const finish = (fn: 'resolve' | 'reject', value?: unknown) => {
+          if (settled) return;
+          settled = true;
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
+          detachAbort?.();
+          if (fn === 'resolve') resolve(value as EdgeSpeechAudio);
+          else reject(value);
+        };
+        let detachAbort: (() => void) | undefined;
+        if (signal?.aborted) return finish('reject', wsAbortError(signal));
+
+        // Some abnormal resets deliver neither a 'close' nor an 'error' event
+        // promptly (or at all); this timeout is the backstop so the request
+        // always eventually settles and retries instead of wedging playback.
+        timeoutId = setTimeout(
+          () => finish('reject', new Error('Edge TTS WebSocket timed out.')),
+          WS_REQUEST_TIMEOUT_MS,
+        );
+
         // In browsers isomorphic-ws is the native WebSocket, whose second
         // argument is a subprotocol list — passing an options object throws
         // SyntaxError. Custom headers are only supported (and only needed)
@@ -720,6 +906,18 @@ export class EdgeSpeechTTS {
             ? new WebSocket(url, { headers: baseHeaders })
             : new WebSocket(url);
         ws.binaryType = 'arraybuffer';
+        if (signal) {
+          const onAbort = () => {
+            try {
+              ws.close();
+            } catch {
+              // ignore close failures
+            }
+            finish('reject', wsAbortError(signal));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+          detachAbort = () => signal.removeEventListener('abort', onAbort);
+        }
 
         let audioData = new ArrayBuffer(0);
         const boundaries: TTSWordBoundary[] = [];
@@ -735,11 +933,15 @@ export class EdgeSpeechTTS {
             if (headers['Path'] === 'audio.metadata') {
               boundaries.push(...parseAudioMetadataBody(body.trim()));
             } else if (headers['Path'] === 'turn.end') {
-              ws.close();
-              if (!audioData.byteLength) {
-                return reject(new Error('No audio data received.'));
+              try {
+                ws.close();
+              } catch {
+                // ignore close failures
               }
-              resolve({ response: new Response(audioData), boundaries });
+              if (!audioData.byteLength) {
+                return finish('reject', new Error('No audio data received.'));
+              }
+              finish('resolve', { response: new Response(audioData), boundaries });
             }
           } else if (event.data instanceof ArrayBuffer) {
             const dataView = new DataView(event.data);
@@ -755,19 +957,29 @@ export class EdgeSpeechTTS {
         });
 
         ws.addEventListener('close', () => {
+          // A clean-looking close before turn.end (connection reset, proxy
+          // idle-kill, server restart) used to be ignored here whenever some
+          // audio had already arrived, leaving this promise — and the
+          // scheduler awaiting it — parked forever with no further chunks
+          // ever scheduled. Always settle: reject with a retryable error
+          // (distinct from the permanent "no audio data" case) so the retry
+          // path opens a fresh connection instead of stalling playback.
+          if (settled) return;
           if (!audioData.byteLength) {
-            reject(new Error('No audio data received.'));
+            finish('reject', new Error('No audio data received.'));
+          } else {
+            finish('reject', new Error('Edge TTS WebSocket closed unexpectedly.'));
           }
         });
 
         ws.addEventListener('error', () => {
-          reject(new Error('WebSocket error occurred.'));
+          finish('reject', new Error('WebSocket error occurred.'));
         });
       });
     }
   }
 
-  async #fetchEdgeSpeech(payload: EdgeTTSPayload): Promise<EdgeSpeechAudio> {
+  async #fetchEdgeSpeech(payload: EdgeTTSPayload, signal?: AbortSignal): Promise<EdgeSpeechAudio> {
     if (this.protocol === 'https') {
       // The HTTPS proxy streams the audio body and carries word boundaries in
       // the WORD_BOUNDARIES_HEADER response header (see /api/tts/edge route).
@@ -777,7 +989,7 @@ export class EdgeSpeechTTS {
         boundaries: parseWordBoundariesHeader(response.headers.get(WORD_BOUNDARIES_HEADER)),
       };
     } else {
-      return this.#fetchEdgeSpeechWs(payload);
+      return this.#fetchEdgeSpeechWs(payload, signal);
     }
   }
 
@@ -795,7 +1007,10 @@ export class EdgeSpeechTTS {
   // both stored results (LRU) and in-flight requests (inflight map).
   async #fetchAndCache(
     payload: EdgeTTSPayload,
+    signal?: AbortSignal,
+    priority: WsSlotPriority = 'low',
   ): Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> {
+    EdgeSpeechTTS.rejectIfAborted(signal);
     const cacheKey = hashTTSPayload(payload);
     const cachedBlob = EdgeSpeechTTS.audioCache.get(cacheKey);
     if (cachedBlob) {
@@ -804,6 +1019,7 @@ export class EdgeSpeechTTS {
     const pending = EdgeSpeechTTS.inflight.get(cacheKey);
     if (pending) return pending;
     const fetchFromNetwork = async (): Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> => {
+      EdgeSpeechTTS.rejectIfAborted(signal);
       const cachedAfterQueue = EdgeSpeechTTS.audioCache.get(cacheKey);
       if (cachedAfterQueue) {
         return {
@@ -811,7 +1027,7 @@ export class EdgeSpeechTTS {
           boundaries: EdgeSpeechTTS.boundariesCache.get(cacheKey) ?? [],
         };
       }
-      const { response, boundaries } = await this.#fetchEdgeSpeech(payload);
+      const { response, boundaries } = await this.#fetchEdgeSpeech(payload, signal);
       const arrayBuffer = await response.arrayBuffer();
       const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
       EdgeSpeechTTS.audioCache.set(cacheKey, blob);
@@ -823,7 +1039,9 @@ export class EdgeSpeechTTS {
     const promise =
       this.protocol === 'https'
         ? EdgeSpeechTTS.enqueueHttpsRequest(fetchFromNetwork)
-        : fetchFromNetwork();
+        : this.wsTarget === 'self-hosted'
+          ? EdgeSpeechTTS.runWithWsSlot(fetchFromNetwork, signal, priority)
+          : fetchFromNetwork();
     EdgeSpeechTTS.inflight.set(cacheKey, promise);
     try {
       return await promise;
@@ -835,11 +1053,14 @@ export class EdgeSpeechTTS {
   // Audio bytes for Web Audio decoding. The cache keeps a Blob and every call
   // mints a fresh ArrayBuffer copy via blob.arrayBuffer() — WebKit's
   // decodeAudioData detaches its input, so handing out a shared buffer would
-  // break replay from cache on Safari.
+  // break replay from cache on Safari. `priority` lets the imminent-playback
+  // fetch preempt queued background prefetch for the same WS slots.
   async createAudioData(
     payload: EdgeTTSPayload,
+    signal?: AbortSignal,
+    priority: WsSlotPriority = 'low',
   ): Promise<{ data: ArrayBuffer; boundaries: TTSWordBoundary[] }> {
-    const { blob, boundaries } = await this.#fetchAndCache(payload);
+    const { blob, boundaries } = await this.#fetchAndCache(payload, signal, priority);
     return { data: await blob.arrayBuffer(), boundaries };
   }
 }

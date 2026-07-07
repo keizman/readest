@@ -4,14 +4,21 @@ import { TTSClient, TTSMessageEvent } from './TTSClient';
 import {
   EdgeSpeechTTS,
   EdgeTTSPayload,
+  EDGE_TTS_MAX_RATE,
   EDGE_TTS_PROTOCOL,
-  hasTTSPrefetchCapacity,
   isTTSPayloadCached,
+  TTS_WS_MAX_CONCURRENT,
   TTSWordBoundary,
+  WsSlotPriority,
 } from '@/libs/edgeTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 import { AppService } from '@/types/system';
-import { hasSpeakableText, isNoAudioSynthesisError, parseSSMLMarks } from '@/utils/ssml';
+import {
+  collapseRepeatedPausePunctuation,
+  hasSpeakableText,
+  isNoAudioSynthesisError,
+  parseSSMLMarks,
+} from '@/utils/ssml';
 import { TTSController } from './TTSController';
 import { TTSUtils } from './TTSUtils';
 import { findBoundaryIndexAtTime } from './wordHighlight';
@@ -22,6 +29,7 @@ import {
   planSilenceCompression,
   SHORT_PAUSE_SEC,
 } from './pcm';
+import { timeStretch } from './timeStretch';
 import {
   calibrateVoiceRate,
   recordMeasuredDuration,
@@ -35,9 +43,22 @@ import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioP
 // and audio share one clock. Edge's baked inter-sentence silences are removed
 // via planSilenceCompression before scheduling; chunk boundaries stay gapSec 0.
 const BATCH_EDGE_KEEP_SEC = 0.06;
-const EDGE_KEEP_SEC = 0.02;
-const TRAILING_KEEP_SEC = 0.01;
+// Final PCM padding around word-boundary-trimmed speech. Keep these tight so
+// adjacent Edge batches do not sound like separate audio clips with a pause.
+const EDGE_KEEP_SEC = 0.008;
+const TRAILING_KEEP_SEC = 0.004;
 const TICKS_PER_SECOND = 10_000_000;
+// While the app is backgrounded, WS fetches/decodes on the main thread can be
+// throttled far more than the ~1 batch's worth of lead time TTS_WS_MAX_CONCURRENT
+// pipelines while visible — that gap between "audio already scheduled" and
+// "next batch prepared" is exactly what reintroduces audible pauses once the
+// user leaves the foreground. Look further ahead in the batch queue while
+// hidden so a deeper buffer of already-fetched chunks is queued up (bounded by
+// WebAudioPlayer's MAX_PENDING_HIDDEN backpressure, which allows scheduling
+// that far ahead in the first place) before background throttling can starve it.
+const PIPELINE_LOOKAHEAD_HIDDEN = 10;
+const isPageHidden = (): boolean =>
+  typeof document !== 'undefined' && document.visibilityState === 'hidden';
 
 interface BatchMarkMeta {
   mark: TTSMark;
@@ -116,30 +137,34 @@ export class EdgeTTSClient implements TTSClient {
     this.appService = appService;
   }
 
-  async init(protocol: EDGE_TTS_PROTOCOL = 'https') {
-    this.#edgeTTS = new EdgeSpeechTTS(protocol);
+  async init(protocol: EDGE_TTS_PROTOCOL = 'wss') {
+    this.#edgeTTS = new EdgeSpeechTTS({ protocol, wsTarget: 'self-hosted' });
     this.#voices = EdgeSpeechTTS.voices;
-    // The self-hosted HTTPS service needs no auth or startup probe. A slow or
-    // transient probe must not disable the complete voice list before playback.
+    // Self-hosted WS needs no auth or startup probe. A slow or transient probe
+    // must not disable the complete voice list before playback.
     this.initialized = true;
     return this.initialized;
   }
 
   getPayload = (lang: string, text: string, voiceId: string) => {
     // Speed is rendered server-side via Edge's prosody rate, which changes
-    // tempo while preserving pitch. Applying it here instead of via a
-    // client-side time-stretch avoids the "warble"/fan artifact that
-    // overlap-add resampling produces. The MP3 cache key includes rate, so
-    // each speed keeps its own cached audio.
-    return { lang, text, voice: voiceId, rate: this.#rate, pitch: this.#pitch } as EdgeTTSPayload;
+    // tempo while preserving pitch. The MP3 cache key includes rate, so each
+    // speed keeps its own cached audio. Edge TTS silently caps prosody rate at
+    // EDGE_TTS_MAX_RATE; any extra factor is applied via Web Audio playbackRate.
+    return {
+      lang,
+      text: collapseRepeatedPausePunctuation(text),
+      voice: voiceId,
+      rate: Math.min(this.#rate, EDGE_TTS_MAX_RATE),
+      pitch: this.#pitch,
+    } as EdgeTTSPayload;
   };
 
-  // Edge renders the MP3 at the playback rate (prosody rate), so its word
+  // Edge renders the MP3 at the prosody rate (≤ EDGE_TTS_MAX_RATE), so its word
   // boundaries live in that sped-up timeline. Scale them back to rate-1.0 media
   // time — the reference frame the player's mediaScale and the section timeline
   // both use.
-  #applyRateToBoundaries = (boundaries: TTSWordBoundary[]): TTSWordBoundary[] => {
-    const rate = this.#rate;
+  #applyRateToBoundaries = (boundaries: TTSWordBoundary[], rate: number): TTSWordBoundary[] => {
     if (rate === 1) return boundaries;
     return boundaries.map((b) => ({ ...b, offset: b.offset * rate, duration: b.duration * rate }));
   };
@@ -151,15 +176,21 @@ export class EdgeTTSClient implements TTSClient {
   #createAudioDataWithRetry = async (
     payload: EdgeTTSPayload,
     signal: AbortSignal,
+    priority: WsSlotPriority = 'low',
     maxAttempts = 3,
   ): Promise<{ data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined> => {
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (signal.aborted) return undefined;
       try {
-        return await this.#edgeTTS?.createAudioData(payload);
+        return await this.#edgeTTS?.createAudioData(payload, signal, priority);
       } catch (err) {
-        if (isNoAudioSynthesisError(err)) throw err;
+        // Pass payload.text through so the punctuation-only-batch branch of
+        // isNoAudioSynthesisError (mirrors the check the caller already does
+        // with batchText) is recognized here too, skipping straight to the
+        // caller's skip path instead of burning retries on a batch that would
+        // fail identically every time.
+        if (isNoAudioSynthesisError(err, payload.text)) throw err;
         lastError = err;
         console.warn(`Edge TTS fetch attempt ${attempt}/${maxAttempts} failed`, err);
         if (attempt < maxAttempts && !signal.aborted) {
@@ -298,17 +329,17 @@ export class EdgeTTSClient implements TTSClient {
     }
   }
 
-  // Batches that must be warm before playback starts. Scales with rate because
-  // faster playback reaches the next batch boundary sooner.
+  // Batches that must be warm before playback starts. Capped at the WS
+  // concurrency limit so startup preload does not overload the server.
   #criticalPreloadBatches(batchCount: number): number {
-    const byRate = this.#rate >= 3 ? 3 : 2;
-    return Math.min(batchCount, byRate);
+    return Math.min(batchCount, TTS_WS_MAX_CONCURRENT);
   }
 
   async *#preload(marks: TTSMark[], signal: AbortSignal, startup: boolean) {
-    // Preload by batch so LRU keys match playback requests. Critical-path
-    // batches must finish before playback; later batches fill one at a time so
-    // the self-hosted server never sees concurrent synthesis requests.
+    // Preload by batch so LRU keys match playback requests. The first
+    // TTS_WS_MAX_CONCURRENT batches are warmed before playback; later batches
+    // keep filling in a single background worker so long paragraphs do not fall
+    // back to playback-time one-by-one synthesis.
     const batches = buildBatches(marks, startup);
     const criticalCount = this.#criticalPreloadBatches(batches.length);
     const preloadBatch = async (batch: TTSMark[]) => {
@@ -333,43 +364,44 @@ export class EdgeTTSClient implements TTSClient {
               ...boundary,
               offset: boundary.offset - firstOffset,
             })),
+            Math.min(this.#rate, EDGE_TTS_MAX_RATE),
           ),
         );
       }
     };
-    const runBatch = async (index: number, critical: boolean) => {
+    const runBatch = async (index: number) => {
       if (signal.aborted || index >= batches.length) return;
-      if (!critical && !hasTTSPrefetchCapacity()) return;
       try {
         await preloadBatch(batches[index]!);
       } catch (err) {
         console.warn('Error preloading batch', index, err);
       }
     };
-    await Promise.all(Array.from({ length: criticalCount }, (_, index) => runBatch(index, true)));
+    await Promise.all(Array.from({ length: criticalCount }, (_, index) => runBatch(index)));
+    let nextBackgroundIndex = criticalCount;
+    const runBackgroundBatches = async () => {
+      while (!signal.aborted) {
+        const index = nextBackgroundIndex++;
+        if (index >= batches.length) return;
+        await runBatch(index);
+      }
+    };
+    void runBackgroundBatches();
     yield {
       code: 'end',
       message: 'Preload finished',
     } as TTSMessageEvent;
-    let nextIndex = criticalCount;
-    const worker = async () => {
-      while (!signal.aborted) {
-        const index = nextIndex++;
-        if (index >= batches.length || !hasTTSPrefetchCapacity()) return;
-        await runBatch(index, false);
-      }
-    };
-    void Promise.all([worker(), worker(), worker()]);
   }
 
-  // Fetch, decode, and compress one batch. Invoked eagerly for every batch so
-  // work pipelines while earlier chunks play.
+  // Fetch, decode, and compress one batch. The scheduler keeps at most
+  // TTS_WS_MAX_CONCURRENT preparations in flight while earlier chunks play.
   async #prepareBatchForSchedule(
     batch: TTSMark[],
     batchIndex: number,
     signal: AbortSignal,
     generation: number,
     rate: number,
+    webAudioRate: number,
   ): Promise<BatchPrepareResult> {
     if (signal.aborted || this.#activeGeneration !== generation) {
       return { kind: 'skip', marks: batch, batchIndex };
@@ -390,7 +422,11 @@ export class EdgeTTSClient implements TTSClient {
 
     let audio: { data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined;
     try {
-      audio = await this.#createAudioDataWithRetry(payload, signal);
+      // 'high': this batch is on the imminent-playback critical path, so it
+      // must not queue behind background paragraph prefetch for the same WS
+      // slots — that contention was a real source of the audible gaps this
+      // pipeline exists to remove.
+      audio = await this.#createAudioDataWithRetry(payload, signal, 'high');
     } catch (error) {
       if (isNoAudioSynthesisError(error, batchText)) {
         console.warn('No audio data received for:', batchText);
@@ -414,7 +450,13 @@ export class EdgeTTSClient implements TTSClient {
 
     let prepared: ChunkMeta & { buffer: TTSAudioBuffer };
     try {
-      prepared = await this.#prepareBatchBuffer(decoded, batch, audio.boundaries, rate);
+      prepared = await this.#prepareBatchBuffer(
+        decoded,
+        batch,
+        audio.boundaries,
+        rate,
+        webAudioRate,
+      );
     } catch (error) {
       console.warn('Failed to prepare TTS audio batch:', batchText, error);
       return { kind: 'skip', marks: batch, batchIndex };
@@ -441,7 +483,8 @@ export class EdgeTTSClient implements TTSClient {
     chunkMeta: ChunkMeta[],
     startup: boolean,
   ): Promise<void> {
-    const rate = this.#rate;
+    const edgeRate = Math.min(this.#rate, EDGE_TTS_MAX_RATE);
+    const webAudioRate = this.#rate / edgeRate;
     const finishSession = () => {
       if (!signal.aborted && this.#activeGeneration === generation) {
         this.#player.endSession(generation);
@@ -449,11 +492,29 @@ export class EdgeTTSClient implements TTSClient {
     };
     try {
       const batches = buildBatches(marks, startup);
-      const preparations = batches.map((batch, batchIndex) =>
-        this.#prepareBatchForSchedule(batch, batchIndex, signal, generation, rate),
-      );
+      const preparations: Array<Promise<BatchPrepareResult>> = new Array(batches.length);
+      let started = 0;
+      const startPreparationsThrough = (throughIndex: number) => {
+        const limit = Math.min(throughIndex, batches.length - 1);
+        while (started <= limit) {
+          const batchIndex = started++;
+          preparations[batchIndex] = this.#prepareBatchForSchedule(
+            batches[batchIndex]!,
+            batchIndex,
+            signal,
+            generation,
+            edgeRate,
+            webAudioRate,
+          );
+        }
+      };
 
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+        // Re-checked every iteration: backgrounding can happen mid-playback,
+        // and the deeper lookahead should kick in immediately rather than
+        // waiting for the session to restart.
+        const lookahead = isPageHidden() ? PIPELINE_LOOKAHEAD_HIDDEN : TTS_WS_MAX_CONCURRENT;
+        startPreparationsThrough(batchIndex + lookahead - 1);
         if (signal.aborted || this.#activeGeneration !== generation) break;
         const result = await preparations[batchIndex]!;
         if (result.kind === 'fatal') {
@@ -492,6 +553,13 @@ export class EdgeTTSClient implements TTSClient {
           trimStartSec: result.prepared.trimStartSec,
           trimmedDurationSec: result.prepared.trimmedDurationSec,
         });
+        // The buffer's samples are already tempo-shifted by `webAudioRate`
+        // (see #prepareBatchBuffer), via pitch-preserving WSOLA rather than
+        // AudioBufferSourceNode.playbackRate — a naive resample-based rate
+        // change, which is what produced the sped-up, pitch-distorted
+        // "chipmunk"/Minions voice for rates above EDGE_TTS_MAX_RATE. Its
+        // duration is therefore already correct in real time, so mediaScale
+        // needs no extra correction here.
         this.#player.scheduleChunk(generation, result.prepared.buffer, {
           trimStartSec: result.prepared.trimStartSec,
           mediaScale: result.prepared.trimmedDurationSec / result.prepared.buffer.duration,
@@ -511,6 +579,7 @@ export class EdgeTTSClient implements TTSClient {
     batch: TTSMark[],
     rawBoundaries: TTSWordBoundary[],
     rate: number,
+    webAudioRate: number,
   ): Promise<ChunkMeta & { buffer: TTSAudioBuffer }> {
     const sampleRate = decoded.sampleRate;
     const channel = decoded.getChannelData(0);
@@ -539,7 +608,7 @@ export class EdgeTTSClient implements TTSClient {
     const trimmed = channel.subarray(startSample, endSample);
 
     if (rawBoundaries.length === 0) {
-      return this.#prepareBatchWithoutBoundaries(trimmed, batch, sampleRate, rate);
+      return this.#prepareBatchWithoutBoundaries(trimmed, batch, sampleRate, rate, webAudioRate);
     }
 
     const { perMark: perMarkRaw } = partitionBatch(batch, rawBoundaries);
@@ -572,7 +641,14 @@ export class EdgeTTSClient implements TTSClient {
       out.set(seg, write);
       write += seg.length;
     }
-    const buffer = await this.#player.createMonoBuffer(out, sampleRate);
+    // Rates above EDGE_TTS_MAX_RATE need extra speed beyond what Edge's
+    // pitch-preserving prosody already rendered. Applying that via
+    // AudioBufferSourceNode.playbackRate would resample the audio — changing
+    // pitch along with tempo, which is exactly the sped-up, "chipmunk"/Minions
+    // voice this stretch avoids by re-laying waveform frames at a different
+    // spacing instead (see timeStretch.ts).
+    const finalSamples = webAudioRate !== 1 ? timeStretch(out, sampleRate, webAudioRate) : out;
+    const buffer = await this.#player.createMonoBuffer(finalSamples, sampleRate);
     const trimmedDurationSec = (plan.outLength / sampleRate) * rate;
 
     const remappedBoundaries = rawBoundaries.map((b, i) => ({
@@ -601,7 +677,7 @@ export class EdgeTTSClient implements TTSClient {
       const endMediaSec = starts[index + 1] ?? trimmedDurationSec;
       return {
         mark,
-        boundaries: this.#applyRateToBoundaries(perMark[index] ?? []),
+        boundaries: this.#applyRateToBoundaries(perMark[index] ?? [], rate),
         startMediaSec,
         durationMediaSec: Math.max(0, endMediaSec - startMediaSec),
       };
@@ -632,6 +708,7 @@ export class EdgeTTSClient implements TTSClient {
     batch: TTSMark[],
     sampleRate: number,
     rate: number,
+    webAudioRate: number,
   ): Promise<ChunkMeta & { buffer: TTSAudioBuffer }> {
     const totalChars = Math.max(
       1,
@@ -639,7 +716,9 @@ export class EdgeTTSClient implements TTSClient {
     );
 
     if (batch.length === 1) {
-      const buffer = await this.#player.createMonoBuffer(trimmed, sampleRate);
+      const finalSamples =
+        webAudioRate !== 1 ? timeStretch(trimmed, sampleRate, webAudioRate) : trimmed;
+      const buffer = await this.#player.createMonoBuffer(finalSamples, sampleRate);
       const trimmedDurationSec = (trimmed.length / sampleRate) * rate;
       return {
         buffer,
@@ -695,7 +774,8 @@ export class EdgeTTSClient implements TTSClient {
       out.set(seg, write);
       write += seg.length;
     }
-    const buffer = await this.#player.createMonoBuffer(out, sampleRate);
+    const finalSamples = webAudioRate !== 1 ? timeStretch(out, sampleRate, webAudioRate) : out;
+    const buffer = await this.#player.createMonoBuffer(finalSamples, sampleRate);
     const trimmedDurationSec = (plan.outLength / sampleRate) * rate;
 
     charsBefore = 0;

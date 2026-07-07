@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useEnv } from '@/context/EnvContext';
 import { useBookDataStore, flushPendingLibrarySave } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useBookProgress } from '@/store/readerProgressStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { debounce } from '@/utils/debounce';
+
+const PROGRESS_AUTOSAVE_MAX_DEFER_MS = 5_000;
 
 export const useProgressAutoSave = (bookKey: string) => {
   const { envConfig } = useEnv();
@@ -22,28 +24,34 @@ export const useProgressAutoSave = (bookKey: string) => {
   // overwrites the server's progress with the stale local one (issue #4222).
   const lastSavedLocationRef = useRef<string | null>(null);
   const initializedRef = useRef(false);
+  const lastForcedSaveAtRef = useRef(0);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const saveBookConfig = useCallback(
-    debounce(() => {
-      setTimeout(async () => {
-        // Skip while previewing a deep-link target — the user's actual
-        // last-read position should not be overwritten by a transient view.
-        if (useReaderStore.getState().getViewState(bookKey)?.previewMode) return;
-        const config = getConfig(bookKey);
-        if (!config) return;
-        const currentLocation = config.location ?? null;
-        if (!initializedRef.current) {
-          initializedRef.current = true;
-          lastSavedLocationRef.current = currentLocation;
-          return;
-        }
-        if (currentLocation === lastSavedLocationRef.current) return;
-        const settings = useSettingsStore.getState().settings;
-        await saveConfig(envConfig, bookKey, config, settings);
-        lastSavedLocationRef.current = currentLocation;
-      }, 500);
-    }, 1000),
+  const persistBookConfig = useCallback(async () => {
+    // Skip while previewing a deep-link target — the user's actual
+    // last-read position should not be overwritten by a transient view.
+    if (useReaderStore.getState().getViewState(bookKey)?.previewMode) return;
+    const config = getConfig(bookKey);
+    if (!config) return;
+    const currentLocation = config.location ?? null;
+    if (!initializedRef.current) {
+      initializedRef.current = true;
+      lastSavedLocationRef.current = currentLocation;
+      return;
+    }
+    if (currentLocation === lastSavedLocationRef.current) return;
+    const settings = useSettingsStore.getState().settings;
+    await saveConfig(envConfig, bookKey, config, settings);
+    lastSavedLocationRef.current = currentLocation;
+  }, [bookKey, envConfig, getConfig, saveConfig]);
+
+  const persistBookConfigRef = useRef(persistBookConfig);
+  persistBookConfigRef.current = persistBookConfig;
+
+  const saveBookConfig = useMemo(
+    () =>
+      debounce(() => {
+        void persistBookConfigRef.current();
+      }, 1000),
     [],
   );
 
@@ -62,8 +70,15 @@ export const useProgressAutoSave = (bookKey: string) => {
 
   useEffect(() => {
     saveBookConfig();
+    if (progress?.location) {
+      const now = Date.now();
+      if (now - lastForcedSaveAtRef.current >= PROGRESS_AUTOSAVE_MAX_DEFER_MS) {
+        lastForcedSaveAtRef.current = now;
+        saveBookConfig.flush();
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress, bookKey]);
+  }, [progress?.location, bookKey]);
 
   // On unmount (book closed / navigated away), flush any pending throttled
   // library.json write so the shelf reflects this session's last read
@@ -72,6 +87,7 @@ export const useProgressAutoSave = (bookKey: string) => {
   // library-level rollup.
   useEffect(() => {
     return () => {
+      saveBookConfig.flush();
       flushPendingLibrarySave().catch(() => {
         // Best-effort on teardown — failures fall through to next launch's
         // reconstruction from per-book config.json files.

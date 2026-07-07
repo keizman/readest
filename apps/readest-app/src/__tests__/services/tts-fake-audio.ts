@@ -31,6 +31,7 @@ export class FakeAudioBuffer implements TTSAudioBuffer {
 export class FakeSourceNode implements TTSAudioBufferSourceNode {
   buffer: TTSAudioBuffer | null = null;
   onended: (() => void) | null = null;
+  readonly playbackRate = { value: 1 };
   startedAt: number | null = null;
   stopped = false;
   connected = false;
@@ -53,7 +54,7 @@ export class FakeSourceNode implements TTSAudioBufferSourceNode {
     this.onended?.();
   }
   get endTime(): number {
-    return (this.startedAt ?? 0) + (this.buffer?.duration ?? 0);
+    return (this.startedAt ?? 0) + (this.buffer?.duration ?? 0) / this.playbackRate.value;
   }
 }
 

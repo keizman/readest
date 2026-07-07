@@ -28,17 +28,23 @@ pick_apk() {
 }
 
 APK=""
-APK="$(pick_apk "$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/arm64/release" "app-arm64-release-unsigned.apk" || true)"
-if [[ -z "$APK" ]]; then
-  APK="$(pick_apk "$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/universal/release" "app-universal-release-unsigned.apk" || true)"
-fi
+for candidate in \
+  "arm64/release/app-arm64-release-unsigned.apk" \
+  "arm64/release/app-arm64-release.apk" \
+  "universal/release/app-universal-release-unsigned.apk" \
+  "universal/release/app-universal-release.apk"; do
+  if [[ -f "$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/$candidate" ]]; then
+    APK="$APP_DIR/src-tauri/gen/android/app/build/outputs/apk/$candidate"
+    break
+  fi
+done
 if [[ -z "$APK" ]]; then
   echo "No release APK found under src-tauri/gen/android/app/build/outputs/apk/" >&2
   exit 1
 fi
 
-SIGNED_APK="${APK%-unsigned.apk}.apk"
 if [[ "$APK" == *-unsigned.apk ]]; then
+  SIGNED_APK="${APK%-unsigned.apk}.apk"
   bash "$APP_DIR/scripts/sign-android-apk.sh" "$APK" "$SIGNED_APK"
   APK="$SIGNED_APK"
 fi

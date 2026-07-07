@@ -1,11 +1,6 @@
 import { FoliateView } from '@/types/view';
 import { AppService } from '@/types/system';
-import {
-  filterSSMLWithLang,
-  hasSpeakableText,
-  isNoAudioSynthesisError,
-  parseSSMLMarks,
-} from '@/utils/ssml';
+import { filterSSMLWithLang, hasSpeakableText, parseSSMLMarks } from '@/utils/ssml';
 import { Overlayer } from 'foliate-js/overlayer.js';
 import {
   TTSGranularity,
@@ -17,7 +12,6 @@ import {
 import { createRejectFilter } from '@/utils/node';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
-import { hasTTSPrefetchCapacity } from '@/libs/edgeTTS';
 import { EdgeTTSClient } from './EdgeTTSClient';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
@@ -59,7 +53,12 @@ const PREFETCH_PARALLELISM = 1;
 // would just fail again, so we skip the bad chunk and advance — bounding
 // consecutive failures so a wholly-unusable engine still stops gracefully
 // instead of silently racing to the end of the book. See #4613, #4408.
-const TTS_NATIVE_SPEAK_MAX_CONSECUTIVE_ERRORS = 5;
+// Edge TTS shares this bound: a paragraph whose batch exhausts its WS
+// retries (reset connection, timeout, transient 5xx) used to terminate the
+// whole session outright, which is what "TTS just stops / gets stuck" was —
+// almost always a single flaky paragraph, not a broken pipeline, so treat it
+// like the native case and skip forward instead.
+const TTS_SPEAK_MAX_CONSECUTIVE_ERRORS = 5;
 
 type TTSState =
   | 'stopped'
@@ -121,6 +120,7 @@ export class TTSController extends EventTarget {
   #currentSpeakAbortController: AbortController | null = null;
   #currentSpeakPromise: Promise<void> | null = null;
   #hasStartedPlayback = false;
+  #prefetchAbortController: AbortController | null = null;
   #prefetchInFlight = false;
   #ttsSectionIndex: number = -1;
 
@@ -676,17 +676,28 @@ export class TTSController extends EventTarget {
     return this.#getTts()?.getLastRange() ?? null;
   }
 
-  async #preloadRawParagraphs(rawSsmls: string[]): Promise<void> {
+  #cancelPrefetch() {
+    const controller = this.#prefetchAbortController;
+    if (!controller) return;
+    controller.abort();
+    if (this.#prefetchAbortController === controller) {
+      this.#prefetchAbortController = null;
+    }
+    this.#prefetchInFlight = false;
+  }
+
+  async #preloadRawParagraphs(rawSsmls: string[], signal: AbortSignal): Promise<void> {
     let nextIndex = 0;
     const worker = async () => {
       for (;;) {
+        if (signal.aborted) return;
         const index = nextIndex++;
-        if (index >= rawSsmls.length || !hasTTSPrefetchCapacity()) return;
+        if (index >= rawSsmls.length) return;
         const ssml = await this.#preprocessSSML(rawSsmls[index]);
-        if (!ssml) continue;
+        if (!ssml || signal.aborted) continue;
         const marks: TTSMark[] = [];
         this.#appendSpeakableMarksFromSSML(marks, ssml);
-        await this.#preloadMarks(marks, new AbortController().signal);
+        await this.#preloadMarks(marks, signal);
       }
     };
     await Promise.all(
@@ -699,21 +710,27 @@ export class TTSController extends EventTarget {
     maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
   ) {
     const tts = this.view.tts;
-    if (!tts || !hasTTSPrefetchCapacity() || this.#prefetchInFlight) return;
+    if (!tts || this.#prefetchInFlight) return;
+    const abortController = new AbortController();
+    this.#prefetchAbortController = abortController;
     this.#prefetchInFlight = true;
     try {
-      await this.#preloadNextSSMLImpl(targetSeconds, maxParagraphs);
+      await this.#preloadNextSSMLImpl(targetSeconds, maxParagraphs, abortController.signal);
     } finally {
-      this.#prefetchInFlight = false;
+      if (this.#prefetchAbortController === abortController) {
+        this.#prefetchAbortController = null;
+        this.#prefetchInFlight = false;
+      }
     }
   }
 
   async #preloadNextSSMLImpl(
     targetSeconds: number = PREFETCH_TARGET_SECONDS,
     maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
+    signal: AbortSignal,
   ) {
     const tts = this.view.tts;
-    if (!tts || !hasTTSPrefetchCapacity()) return;
+    if (!tts || signal.aborted) return;
 
     // Gather the next SSMLs and rewind synchronously to avoid a race condition:
     // tts.next() replaces TTS.#ranges (used by setMark() during playback).
@@ -724,7 +741,7 @@ export class TTSController extends EventTarget {
     // a real time-based buffer (bounded by maxParagraphs).
     const rawSsmls: string[] = [];
     let estimatedSeconds = 0;
-    for (let i = 0; i < maxParagraphs && estimatedSeconds < targetSeconds; i++) {
+    for (let i = 0; i < maxParagraphs && estimatedSeconds < targetSeconds && !signal.aborted; i++) {
       const ssml = tts.next();
       if (!ssml) break;
       rawSsmls.push(ssml);
@@ -734,7 +751,7 @@ export class TTSController extends EventTarget {
       tts.prev();
     }
 
-    await this.#preloadRawParagraphs(rawSsmls);
+    await this.#preloadRawParagraphs(rawSsmls, signal);
 
     // A chapter boundary must not shrink the offline window. Build isolated
     // TTS iterators for following sections, so look-ahead can continue without
@@ -746,12 +763,14 @@ export class TTSController extends EventTarget {
       sections &&
       sectionIndex < sections.length &&
       paragraphCount < maxParagraphs &&
-      estimatedSeconds < targetSeconds;
+      estimatedSeconds < targetSeconds &&
+      !signal.aborted;
       sectionIndex++
     ) {
       const section = sections[sectionIndex];
       if (!section?.createDocument) continue;
       const doc = await section.createDocument();
+      if (signal.aborted) return;
       const html = doc.querySelector('html');
       const lang = html?.getAttribute('lang') || html?.getAttribute('xml:lang') || '';
       if (html && !isValidLang(lang) && this.ttsLang) {
@@ -765,14 +784,14 @@ export class TTSController extends EventTarget {
         raw &&
         paragraphCount < maxParagraphs &&
         estimatedSeconds < targetSeconds &&
-        hasTTSPrefetchCapacity()
+        !signal.aborted
       ) {
         estimatedSeconds += estimateSpeechDuration(raw.replace(/<[^>]+>/g, ''), this.ttsRate);
         paragraphCount++;
         sectionRawSsmls.push(raw);
         raw = sectionTTS.next();
       }
-      await this.#preloadRawParagraphs(sectionRawSsmls);
+      await this.#preloadRawParagraphs(sectionRawSsmls, signal);
     }
   }
 
@@ -801,7 +820,7 @@ export class TTSController extends EventTarget {
   }
 
   async #speak(ssml: string | undefined | Promise<string>, oneTime = false) {
-    await this.stop();
+    await this.stop(true);
     this.#terminated = false;
     this.#currentSpeakAbortController = new AbortController();
     const { signal } = this.#currentSpeakAbortController;
@@ -872,10 +891,12 @@ export class TTSController extends EventTarget {
           lastMessage = message;
         }
 
-        const canSkipEdgeNoAudio =
-          this.ttsClient === this.ttsEdgeClient &&
-          lastCode === 'error' &&
-          isNoAudioSynthesisError(new Error(lastMessage ?? ''));
+        // Edge's own retry loop already exhausted its attempts (WS reset,
+        // timeout, transient 5xx, or a permanently-unsynthesizable batch) by
+        // the time this 'error' surfaces — retrying the same paragraph here
+        // would just repeat the same multi-second stall. Skip forward like
+        // any other engine failure rather than killing the whole session.
+        const canSkipEdgeError = this.ttsClient === this.ttsEdgeClient && lastCode === 'error';
 
         if (lastCode === 'end' && this.state === 'playing' && !oneTime) {
           this.#consecutiveSpeakErrors = 0;
@@ -883,23 +904,26 @@ export class TTSController extends EventTarget {
           await this.forward();
         } else if (
           lastCode === 'error' &&
-          (canSkipOnError || canSkipEdgeNoAudio) &&
+          (canSkipOnError || canSkipEdgeError) &&
           !signal.aborted &&
           this.state === 'playing' &&
           !oneTime
         ) {
-          // The native engine reported it can't speak this chunk. Offline this
-          // is almost always a specific unsynthesizable utterance (e.g. an
-          // unsupported character) that would fail every time, not a transient
-          // glitch — so retrying the same text is futile. Skip it and advance
-          // exactly as a normal 'end' would, so one bad chunk (often the first
-          // utterance across a chapter boundary) can't strand playback with the
-          // controls wedged in 'playing'. Bound consecutive failures so a
-          // wholly-unusable engine stops gracefully instead of silently racing
-          // to the end of the book. See #4613, #4408.
+          // The engine reported it can't speak this chunk — offline that's
+          // almost always a specific unsynthesizable utterance (e.g. an
+          // unsupported character), and for Edge it's almost always a single
+          // flaky paragraph (network blip, WS reset, doomed punctuation-only
+          // batch), neither of which retrying the identical request fixes.
+          // Skip it and advance exactly as a normal 'end' would, so one bad
+          // chunk (often the first utterance across a chapter boundary) can't
+          // strand playback with the controls wedged in 'playing'. Bound
+          // consecutive failures so a wholly-unusable engine/connection stops
+          // gracefully instead of silently racing to the end of the book.
+          // See #4613, #4408.
+          console.warn('[TTS] skipping paragraph after speak error:', lastMessage);
           this.#consecutiveSpeakErrors++;
           resolve();
-          if (this.#consecutiveSpeakErrors <= TTS_NATIVE_SPEAK_MAX_CONSECUTIVE_ERRORS) {
+          if (this.#consecutiveSpeakErrors <= TTS_SPEAK_MAX_CONSECUTIVE_ERRORS) {
             await this.forward();
           } else {
             this.#consecutiveSpeakErrors = 0;
@@ -976,7 +1000,8 @@ export class TTSController extends EventTarget {
     await this.ttsClient.resume().catch((e) => this.error(e));
   }
 
-  async stop() {
+  async stop(keepPrefetch = false) {
+    if (!keepPrefetch) this.#cancelPrefetch();
     if (this.#currentSpeakAbortController) {
       this.#currentSpeakAbortController.abort();
     }
@@ -1013,7 +1038,7 @@ export class TTSController extends EventTarget {
   async forward(byMark = false) {
     await this.initViewTTS();
     const isPlaying = this.state === 'playing';
-    await this.stop();
+    await this.stop(true);
     if (!isPlaying) this.state = 'forward-paused';
 
     const ssml = byMark ? this.#getTts()?.nextMark(!isPlaying) : this.#getTts()?.next(!isPlaying);

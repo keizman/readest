@@ -29,6 +29,21 @@ export const getNodeBaseUrl = () =>
 export const getEdgeTTSBaseUrl = () =>
   process.env['NEXT_PUBLIC_EDGE_TTS_BASE_URL'] ?? READEST_EDGE_TTS_BASE_URL;
 
+// WebSocket endpoint for self-hosted Edge TTS (Edge read-aloud protocol).
+// Override with NEXT_PUBLIC_EDGE_TTS_WS_URL; otherwise derived from getEdgeTTSBaseUrl().
+export const EDGE_TTS_WS_PATH = '/consumer/speech/synthesize/readaloud/edge/v1';
+
+export const getEdgeTTSWsUrl = (): string => {
+  const explicit = process.env['NEXT_PUBLIC_EDGE_TTS_WS_URL'];
+  if (explicit) return explicit;
+  const parsed = new URL(getEdgeTTSBaseUrl());
+  parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+  parsed.pathname = EDGE_TTS_WS_PATH;
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString();
+};
+
 export const isMacPlatform = () =>
   typeof window !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform);
 

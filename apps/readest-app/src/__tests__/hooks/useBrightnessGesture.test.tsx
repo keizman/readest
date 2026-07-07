@@ -5,10 +5,8 @@ const h = vi.hoisted(() => ({
   hasScreenBrightness: true,
   swipeSetting: true,
   scrolled: false,
-  screenBrightness: -1,
   setScreenBrightness: vi.fn(),
   getScreenBrightness: vi.fn(),
-  saveSysSettings: vi.fn(),
 }));
 
 vi.mock('@/context/EnvContext', () => ({
@@ -19,7 +17,7 @@ vi.mock('@/context/EnvContext', () => ({
 }));
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: () => ({
-    settings: { swipeBrightnessGesture: h.swipeSetting, screenBrightness: h.screenBrightness },
+    settings: { swipeBrightnessGesture: h.swipeSetting },
   }),
 }));
 vi.mock('@/store/readerStore', () => ({
@@ -31,8 +29,6 @@ vi.mock('@/store/deviceStore', () => ({
     setScreenBrightness: h.setScreenBrightness,
   }),
 }));
-vi.mock('@/helpers/settings', () => ({ saveSysSettings: h.saveSysSettings }));
-
 import { useBrightnessGesture } from '@/app/reader/hooks/useBrightnessGesture';
 
 type Api = ReturnType<typeof useBrightnessGesture>;
@@ -88,9 +84,7 @@ describe('useBrightnessGesture (listener-level)', () => {
     h.hasScreenBrightness = true;
     h.swipeSetting = true;
     h.scrolled = false;
-    h.screenBrightness = -1;
     h.setScreenBrightness.mockReset();
-    h.saveSysSettings.mockReset();
     h.getScreenBrightness.mockReset().mockResolvedValue(0.5);
   });
   afterEach(() => cleanup());
@@ -138,7 +132,7 @@ describe('useBrightnessGesture (listener-level)', () => {
     expect(stopImmediatePropagation).not.toHaveBeenCalled(); // not yet active
   });
 
-  it('persists brightness and disables auto-brightness on release', () => {
+  it('applies the adjusted brightness on release without persisting settings', () => {
     const { target } = setup();
     fireTouch(target, 'touchstart', 10, 800);
     fireTouch(target, 'touchmove', 10, 300); // big upward drag → brighter
@@ -146,8 +140,6 @@ describe('useBrightnessGesture (listener-level)', () => {
     expect(h.setScreenBrightness).toHaveBeenCalled();
     const last = h.setScreenBrightness.mock.calls.at(-1)![0];
     expect(last).toBeGreaterThan(0.5);
-    expect(h.saveSysSettings).toHaveBeenCalledWith({}, 'screenBrightness', expect.any(Number));
-    expect(h.saveSysSettings).toHaveBeenCalledWith({}, 'autoScreenBrightness', false);
   });
 
   it('is inert when the setting is disabled', () => {

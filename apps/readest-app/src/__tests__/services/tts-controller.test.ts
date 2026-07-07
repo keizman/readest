@@ -8,6 +8,14 @@ import { AppService } from '@/types/system';
 
 // --- Mock all heavy dependencies so we never import real TTS clients ---
 
+const edgeTTSState = vi.hoisted(() => ({
+  hasPrefetchCapacity: true,
+}));
+
+vi.mock('@/libs/edgeTTS', () => ({
+  hasTTSPrefetchCapacity: () => edgeTTSState.hasPrefetchCapacity,
+}));
+
 vi.mock('@/services/tts/WebSpeechClient', () => ({
   WebSpeechClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, createMockTTSClient('web'));
@@ -166,6 +174,7 @@ describe('TTSController', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    edgeTTSState.hasPrefetchCapacity = true;
     mockView = createMockView();
     mockAppService = createMockAppService();
     controller = new TTSController(mockAppService, mockView, false);
@@ -1286,6 +1295,73 @@ describe('TTSController', () => {
     });
   });
 
+  // Regression: an Edge TTS paragraph whose WS request exhausts its internal
+  // retries (connection reset, timeout, transient 5xx, or a batch Edge simply
+  // can't synthesize — e.g. mostly-punctuation text like a trailing "……")
+  // surfaces as a single terminal 'error' from speakMarks(). Previously only
+  // the exact "no audio data received" message was treated as skippable —
+  // any other error message terminated the whole TTS session outright, which
+  // looked to users like playback randomly "getting stuck" and never
+  // recovering. It should instead skip the bad paragraph and keep reading,
+  // bounded by the same consecutive-error cap used for native TTS.
+  describe('Edge TTS error recovery', () => {
+    const makeEdgeController = async () => {
+      const c = new TTSController(mockAppService, mockView, false);
+      await c.init();
+      await c.initViewTTS(0);
+      return c;
+    };
+
+    const alwaysErrorSpeakMarksMock = (state: { attempts: number }) =>
+      async function* (
+        _marks: unknown,
+        _signal: AbortSignal,
+        oneTime?: boolean,
+      ): AsyncGenerator<TTSMessageEvent> {
+        if (oneTime) {
+          yield { code: 'end' };
+          return;
+        }
+        state.attempts += 1;
+        yield { code: 'error', message: 'Edge TTS websocket closed unexpectedly' };
+      };
+
+    test('skips a paragraph Edge cannot synthesize and advances instead of terminating', async () => {
+      const c = await makeEdgeController();
+      expect(c.ttsClient).toBe(c.ttsEdgeClient);
+      const forwardSpy = vi.spyOn(c, 'forward').mockResolvedValue();
+
+      const state = { attempts: 0 };
+      vi.mocked(c.ttsEdgeClient.speakMarks).mockImplementation(alwaysErrorSpeakMarksMock(state));
+
+      c.speak('<speak>bad-batch</speak>');
+
+      await vi.waitFor(
+        () => {
+          expect(forwardSpy).toHaveBeenCalled();
+        },
+        { timeout: 5000 },
+      );
+      expect(c.state).toBe('playing');
+    });
+
+    test('terminates gracefully after a run of consecutive Edge errors', async () => {
+      const c = await makeEdgeController();
+      expect(c.ttsClient).toBe(c.ttsEdgeClient);
+
+      const state = { attempts: 0 };
+      vi.mocked(c.ttsEdgeClient.speakMarks).mockImplementation(alwaysErrorSpeakMarksMock(state));
+
+      c.speak('<speak>bad-batch</speak>');
+
+      await vi.waitFor(() => expect(state.attempts).toBeGreaterThanOrEqual(5), { timeout: 8000 });
+
+      await new Promise((r) => setTimeout(r, 150));
+      expect(c.state).not.toBe('playing');
+      expect(state.attempts).toBeLessThanOrEqual(10);
+    });
+  });
+
   describe('unspeakable paragraphs', () => {
     test('advances past a Chinese ellipsis paragraph', async () => {
       vi.mocked(parseSSMLMarks).mockReturnValueOnce({ plainText: '……', marks: [] });
@@ -1394,6 +1470,89 @@ describe('TTSController', () => {
       expect(speakMarksSpy.mock.calls.length).toBeGreaterThanOrEqual(45);
       expect(speakMarksSpy.mock.calls.every((call) => call[0].length === 1)).toBe(true);
       expect(mockView.tts!.prev).toHaveBeenCalledTimes(speakMarksSpy.mock.calls.length);
+    });
+
+    test('prefetches paragraphs even when audio cache byte-count exceeds capacity', async () => {
+      // hasPrefetchCapacity=false means audioCacheBytes >= TTS_AUDIO_CACHE_MAX_BYTES.
+      // The cache is full of already-played audio; trimAudioCache() will evict old
+      // entries when new blobs are stored. Gathering + preloading must still proceed
+      // so the user has offline content ready.
+      await controller.init();
+      edgeTTSState.hasPrefetchCapacity = false;
+      const paragraphs = ['<speak>one</speak>', '<speak>two</speak>', undefined];
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {});
+
+      await controller.preloadNextSSML(300, 2);
+
+      expect(mockView.tts!.next).toHaveBeenCalled();
+      expect(speakMarksSpy).toHaveBeenCalled();
+    });
+
+    test('aborts stale lookahead prefetch when playback stops', async () => {
+      await controller.init();
+      let capturedSignal: AbortSignal | undefined;
+      let releasePreload!: () => void;
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>one</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* (_marks, signal) {
+          capturedSignal = signal;
+          await new Promise<void>((resolve) => {
+            releasePreload = resolve;
+          });
+        });
+
+      const preload = controller.preloadNextSSML(300, 1);
+      await vi.waitFor(() => expect(capturedSignal).toBeDefined());
+
+      await controller.stop();
+      const wasAborted = capturedSignal!.aborted;
+      releasePreload();
+      await preload;
+
+      expect(wasAborted).toBe(true);
+      expect(speakMarksSpy).toHaveBeenCalledOnce();
+    });
+
+    test('keeps lookahead prefetch running when stop is called with keepPrefetch=true', async () => {
+      await controller.init();
+      let capturedSignal: AbortSignal | undefined;
+      let releasePreload!: () => void;
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>one</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      vi.spyOn(controller.ttsEdgeClient, 'speakMarks').mockImplementation(
+        async function* (_marks, signal) {
+          capturedSignal = signal;
+          await new Promise<void>((resolve) => {
+            releasePreload = resolve;
+          });
+        },
+      );
+
+      const preload = controller.preloadNextSSML(300, 1);
+      await vi.waitFor(() => expect(capturedSignal).toBeDefined());
+
+      await controller.stop(true);
+      const wasAborted = capturedSignal!.aborted;
+      releasePreload();
+      await preload;
+
+      expect(wasAborted).toBe(false);
     });
 
     test('continues prefetching into the next section when the current one is too short', async () => {

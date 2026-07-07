@@ -44,6 +44,9 @@ const nextConfig = {
     // a build interrupted mid-compile leaves a partial cache that the next
     // build mishandles, fanning out workers until it exhausts RAM.
     turbopackFileSystemCacheForDev: true,
+    // Static export on a cold .next can race when Next fans out page-data
+    // workers (pages-manifest ENOENT). Single worker is slower but reliable.
+    ...(isDev ? {} : { cpus: 1 }),
   },
   // Configure assetPrefix or else the server won't properly resolve your assets.
   assetPrefix: '',

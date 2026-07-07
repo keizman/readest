@@ -1,5 +1,5 @@
-import { BookDoc } from '@/libs/document';
-import { BookNote, BookSearchConfig, BookSearchResult } from '@/types/book';
+import { BookDoc, TOCItem } from '@/libs/document';
+import { BookNote, BookProgress, BookSearchConfig, BookSearchResult } from '@/types/book';
 import { TTSGranularity } from '@/services/tts';
 import { TTS } from 'foliate-js/tts.js';
 import { LocaleWithTextInfo } from './misc';
@@ -86,6 +86,13 @@ export interface FoliateView extends HTMLElement {
     location: { current: number; next: number; total: number };
     time: { section: number; total: number };
   } | null>;
+  getProgressOf: (
+    index: number,
+    range: Range,
+  ) => {
+    tocItem?: TOCItem;
+    pageItem?: BookProgress['pageItem'];
+  };
   resolveCFI: (cfi: string) => { index: number; anchor: RangeAnchor };
   resolveNavigation: (cfiOrHrefOrIndex: string | number) => { index: number; anchor?: RangeAnchor };
   addAnnotation: (

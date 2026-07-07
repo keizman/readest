@@ -5,9 +5,7 @@ import { TbSunMoon } from 'react-icons/tb';
 import { useEnv } from '@/context/EnvContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useTranslation } from '@/hooks/useTranslation';
-import { useSettingsStore } from '@/store/settingsStore';
 import { useDeviceControlStore } from '@/store/deviceStore';
-import { saveSysSettings } from '@/helpers/settings';
 import { themes } from '@/styles/themes';
 import { debounce } from '@/utils/debounce';
 import Slider from '@/components/Slider';
@@ -30,13 +28,12 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
   forceMobileLayout,
 }) => {
   const _ = useTranslation();
-  const { envConfig, appService } = useEnv();
-  const { settings } = useSettingsStore();
+  const { appService } = useEnv();
   const { getScreenBrightness, setScreenBrightness } = useDeviceControlStore();
   const { themeMode, themeColor, isDarkMode, setThemeMode, setThemeColor } = useThemeStore();
 
-  const [screenBrightnessValue, setScreenBrightnessValue] = useState(
-    settings.screenBrightness >= 0 ? settings.screenBrightness : SCREEN_BRIGHTNESS_LIMITS.DEFAULT,
+  const [screenBrightnessValue, setScreenBrightnessValue] = useState<number>(
+    SCREEN_BRIGHTNESS_LIMITS.DEFAULT,
   );
 
   useEffect(() => {
@@ -54,11 +51,9 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
   const debouncedSetScreenBrightness = useMemo(
     () =>
       debounce(async (value: number) => {
-        saveSysSettings(envConfig, 'screenBrightness', value);
-        saveSysSettings(envConfig, 'autoScreenBrightness', false);
         await setScreenBrightness(value / 100);
       }, 100),
-    [envConfig, setScreenBrightness],
+    [setScreenBrightness],
   );
 
   const handleScreenBrightnessChange = useCallback(

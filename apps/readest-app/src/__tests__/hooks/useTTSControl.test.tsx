@@ -32,6 +32,16 @@ const mockView = {
     goTo: vi.fn(),
   },
   resolveCFI: vi.fn().mockReturnValue({ index: 0, anchor: () => new Range() }),
+  getCFIProgress: vi.fn().mockResolvedValue({
+    fraction: 0.42,
+    section: { current: 0, total: 2 },
+    location: { current: 4, next: 5, total: 10 },
+    time: { section: 100, total: 200 },
+  }),
+  getProgressOf: vi.fn().mockReturnValue({
+    tocItem: { href: 'chapter-1.xhtml', label: 'Chapter 1' },
+    pageItem: { label: '5' },
+  }),
   getCFI: vi.fn().mockReturnValue('cfi'),
   deselect: vi.fn(),
   resolveNavigation: vi.fn(),
@@ -45,7 +55,7 @@ const mockView = {
   },
 };
 
-const mockProgress = {
+let mockProgress = {
   location: { start: { cfi: '' }, end: { cfi: '' } },
   index: 0,
   range: null,
@@ -74,8 +84,10 @@ vi.mock('@/store/readerStore', () => {
     bookKeys: ['book-1'],
     getView: () => mockView,
     getProgress: () => mockProgress,
+    getViewState: () => ({ previewMode: false }),
     getViewSettings: () => mockViewSettings,
     setViewSettings: vi.fn(),
+    setProgress: vi.fn(),
     setTTSEnabled: vi.fn(),
   };
   // Production code uses per-field selectors; mock must apply them.
@@ -149,6 +161,8 @@ vi.mock('@/services/tts', () => ({
       getVoices: vi.fn().mockResolvedValue([]),
       getVoiceId: vi.fn().mockReturnValue(''),
       redispatchPosition: vi.fn(),
+      getCurrentHighlightCfi: vi.fn().mockReturnValue(null),
+      reapplyCurrentHighlight: vi.fn(),
       ensureTimeline: vi.fn().mockResolvedValue(null),
       getPlaybackInfo: vi.fn().mockReturnValue(null),
       seekToTime: vi.fn().mockResolvedValue(undefined),
@@ -244,6 +258,13 @@ const getSetTTSEnabledMock = () =>
       getState: () => { setTTSEnabled: ReturnType<typeof vi.fn> };
     }
   ).getState().setTTSEnabled;
+
+const getSetProgressMock = () =>
+  (
+    useReaderStore as unknown as {
+      getState: () => { setProgress: ReturnType<typeof vi.fn> };
+    }
+  ).getState().setProgress;
 
 const Harness = () => {
   useTTSControl({ bookKey: 'book-1' });
@@ -498,6 +519,151 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
 
     expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledTimes(1);
     expect(mockView.goTo).not.toHaveBeenCalled();
+  });
+});
+
+describe('useTTSControl TTS progress persistence', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+    mockView.resolveCFI.mockReset();
+    mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+    mockView.getCFIProgress.mockClear();
+    mockView.getProgressOf.mockClear();
+    getSetProgressMock().mockClear();
+    mockProgress = {
+      location: { start: { cfi: '' }, end: { cfi: '' } },
+      index: 0,
+      range: null,
+      sectionLabel: '',
+    };
+    mockViewSettings.ttsLocation = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  const setupAndCapturePositionHandler = async () => {
+    render(<Harness />);
+
+    await act(async () => {
+      const p = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await p;
+    });
+
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+
+    const controller = ttsControllerInstances[0] as {
+      addEventListener: { mock: { calls: [string, (e: Event) => void][] } };
+    };
+    const calls = controller.addEventListener.mock.calls;
+    const entry = calls.find(([name]) => name === 'tts-position');
+    if (!entry) throw new Error('tts-position listener was not registered');
+    return entry[1];
+  };
+
+  it('writes sentence-level TTS position into normal reading progress', async () => {
+    const handler = await setupAndCapturePositionHandler();
+    const cfi = 'epubcfi(/6/8!/4/2)';
+
+    await act(async () => {
+      handler(
+        new CustomEvent('tts-position', {
+          detail: { cfi, kind: 'sentence', sectionIndex: 0, sequence: 10 },
+        }),
+      );
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    expect(getSetProgressMock()).toHaveBeenCalledWith(
+      'book-1',
+      cfi,
+      { href: 'chapter-1.xhtml', label: 'Chapter 1' },
+      { label: '5' },
+      { current: 0, total: 2 },
+      { current: 4, next: 5, total: 10 },
+      { section: 100, total: 200 },
+      expect.any(Range),
+      0.42,
+    );
+  });
+
+  it('does not write TTS position to reading progress once the user has navigated away', async () => {
+    // isCfiInLocation is mocked to always return false (see module mock
+    // above), so once the "Location tracking" effect below runs with a
+    // non-null ttsLocation, it always takes the mismatch branch — mirroring
+    // a user who switched to another chapter while TTS kept narrating the
+    // old one in the background.
+    const { rerender } = render(<Harness />);
+    await act(async () => {
+      const p = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await p;
+    });
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+
+    // The "Location tracking" effect only reconsiders `progress` once the
+    // controller ref exists and `progress` gets a new reference — mimic the
+    // reader emitting a fresh progress update (e.g. from the user's manual
+    // page turn) now that the TTS session is live.
+    mockViewSettings.ttsLocation = 'epubcfi(/6/2!/4/2)';
+    mockProgress = { ...mockProgress };
+    await act(async () => {
+      rerender(<Harness />);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+
+    const controller = ttsControllerInstances[0] as {
+      addEventListener: { mock: { calls: [string, (e: Event) => void][] } };
+    };
+    const entry = controller.addEventListener.mock.calls.find(([name]) => name === 'tts-position');
+    if (!entry) throw new Error('tts-position listener was not registered');
+    const handler = entry[1];
+
+    getSetProgressMock().mockClear();
+    await act(async () => {
+      handler(
+        new CustomEvent('tts-position', {
+          detail: { cfi: 'epubcfi(/6/8!/4/2)', kind: 'sentence', sectionIndex: 0, sequence: 10 },
+        }),
+      );
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    // Regression: this write used to happen unconditionally, clobbering the
+    // shared progress store with TTS's own advancing location and making the
+    // reconciliation effect think the view was still following TTS — which
+    // silently re-enabled auto-follow and snapped the visible page back to
+    // TTS mid-browse.
+    expect(getSetProgressMock()).not.toHaveBeenCalled();
+  });
+
+  it('does not write every word-level TTS position to reading progress', async () => {
+    const handler = await setupAndCapturePositionHandler();
+
+    await act(async () => {
+      handler(
+        new CustomEvent('tts-position', {
+          detail: {
+            cfi: 'epubcfi(/6/8!/4/2:3)',
+            kind: 'word',
+            sectionIndex: 0,
+            sequence: 11,
+          },
+        }),
+      );
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    expect(getSetProgressMock()).not.toHaveBeenCalled();
   });
 });
 

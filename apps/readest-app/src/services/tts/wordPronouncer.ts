@@ -51,7 +51,7 @@ const getPlayer = (): WebAudioPlayer | null => {
 
 // Reused across calls; EdgeSpeechTTS keeps its MP3/boundary caches on static
 // members, so this just avoids per-call allocation.
-const edgeWss = new EdgeSpeechTTS('wss');
+const edgeWss = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'self-hosted' });
 const edgeHttps = new EdgeSpeechTTS('https');
 
 // Bumped on every new request so a slower in-flight synth/fetch can detect it
@@ -83,9 +83,8 @@ export const cancelWordPronounce = (): void => {
   stopFallback();
 };
 
-// Edge audio bytes: direct wss first; on failure the authenticated https proxy
-// (the reader's own fallback for networks that block Bing). The proxy throws
-// "Not authenticated" when logged out, which propagates to the speech fallback.
+// Edge audio bytes: self-hosted wss first; on failure fall back to the
+// self-hosted https proxy at getEdgeTTSBaseUrl().
 const fetchEdgeAudio = async (payload: EdgeTTSPayload): Promise<ArrayBuffer> => {
   try {
     return (await edgeWss.createAudioData(payload)).data;

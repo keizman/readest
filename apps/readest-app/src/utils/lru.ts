@@ -24,14 +24,11 @@ export class LRUCache<K, V> {
 
   set(key: K, value: V): void {
     if (this.map.has(key)) {
-      const oldValue = this.map.get(key)!;
       this.map.delete(key);
-      if (this.onEvict) {
-        this.onEvict(key, oldValue);
-      }
     } else if (this.map.size === this.capacity) {
-      const oldestKey = this.map.keys().next().value;
-      if (oldestKey) {
+      const oldest = this.map.keys().next();
+      if (!oldest.done) {
+        const oldestKey = oldest.value;
         const oldestValue = this.map.get(oldestKey)!;
         this.map.delete(oldestKey);
         if (this.onEvict) {

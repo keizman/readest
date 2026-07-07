@@ -52,6 +52,22 @@ const normalizeForSpeakability = (text: string): string =>
     .replace(/\p{Z}/gu, '')
     .trim();
 
+// Chinese web-novel text conventionally renders a dramatic pause as two
+// consecutive ellipsis characters ("……"), and sometimes several literal
+// periods in a row; other repeated punctuation ("!!!!", "????") shows up too.
+// Edge's synthesis appears to render (and take proportionally longer to
+// stream back) a baked-in pause per consecutive pause-mark rather than
+// treating the run as a single pause, so text that visually reads as one
+// trailing-off pause can turn into several stacked seconds of silence /
+// synthesis latency. Collapsing runs down to one mark (or the conventional
+// 3-dot ellipsis) keeps the same "trails off" meaning without asking Edge to
+// render — and us to wait for — multiple pauses back to back.
+export const collapseRepeatedPausePunctuation = (text: string): string =>
+  text
+    .replace(/…{2,}/gu, '…')
+    .replace(/\.{4,}/g, '...')
+    .replace(/([!?,;:、，。！？；：])\1{2,}/gu, '$1');
+
 /** True when text contains something a speech engine can pronounce. */
 export const hasSpeakableText = (text: string): boolean => {
   const trimmed = normalizeForSpeakability(text);
