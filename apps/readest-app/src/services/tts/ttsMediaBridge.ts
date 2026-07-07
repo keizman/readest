@@ -90,7 +90,6 @@ export class TTSMediaBridge {
   #onSpeakMark: ((e: Event) => void) | null = null;
   #onStateChange: ((e: Event) => void) | null = null;
   #coverArtwork = '';
-  #privacyArtwork = '';
   #privacyActive = false;
 
   constructor(resolveMediaSession: () => BridgeMediaSession | null = getMediaSession) {
@@ -117,7 +116,7 @@ export class TTSMediaBridge {
     this.#privacyActive = !!privacyTitle;
 
     if (this.#mediaSession instanceof TauriMediaSession) {
-      const artwork = await this.#resolveArtwork(!!privacyTitle);
+      const artwork = await this.#resolveArtwork();
       await this.#mediaSession.setActive({ active: true });
       await this.#mediaSession.updateMetadata({
         title: privacyTitle || meta.title,
@@ -180,7 +179,6 @@ export class TTSMediaBridge {
     this.#lastSectionLabel = undefined;
     this.#previousSectionLabel = undefined;
     this.#coverArtwork = '';
-    this.#privacyArtwork = '';
     this.#privacyActive = false;
   }
 
@@ -199,10 +197,9 @@ export class TTSMediaBridge {
     return isBookMasked(settings, bookHash) ? meta.title : null;
   }
 
-  async #resolveArtwork(privateArtwork: boolean): Promise<string> {
-    if (privateArtwork && this.#privacyArtwork) return this.#privacyArtwork;
-    if (!privateArtwork && this.#coverArtwork) return this.#coverArtwork;
-    const source = privateArtwork ? '/icon.png' : this.#meta?.coverImageUrl || '/icon.png';
+  async #resolveArtwork(): Promise<string> {
+    if (this.#coverArtwork) return this.#coverArtwork;
+    const source = this.#meta?.coverImageUrl || '/icon.png';
     let artwork = '';
     try {
       artwork = await fetchImageAsBase64(source);
@@ -215,8 +212,7 @@ export class TTSMediaBridge {
         }
       }
     }
-    if (privateArtwork) this.#privacyArtwork = artwork;
-    else this.#coverArtwork = artwork;
+    this.#coverArtwork = artwork;
     return artwork;
   }
 
@@ -293,7 +289,7 @@ export class TTSMediaBridge {
         title: metadata.title,
         artist: metadata.artist,
         album: metadata.album,
-        artwork: privacyChanged ? await this.#resolveArtwork(!!privacyTitle) : '',
+        artwork: privacyChanged ? await this.#resolveArtwork() : '',
       });
     } else {
       mediaSession.metadata = new MediaMetadata({
@@ -302,7 +298,7 @@ export class TTSMediaBridge {
         album: metadata.album,
         artwork: [
           {
-            src: privacyTitle ? '/icon.png' : meta.coverImageUrl || '/icon.png',
+            src: meta.coverImageUrl || '/icon.png',
             sizes: '512x512',
             type: 'image/png',
           },

@@ -5,6 +5,7 @@ vi.mock('@/utils/image', () => ({
 }));
 
 import { TTSMediaBridge } from '@/services/tts/ttsMediaBridge';
+import { useSettingsStore } from '@/store/settingsStore';
 import type { TTSController } from '@/services/tts/TTSController';
 
 // A controller stand-in: EventTarget + the surface the bridge consumes.
@@ -66,10 +67,12 @@ class FakeMediaMetadata {
   title: string;
   artist: string;
   album: string;
-  constructor(init: { title: string; artist: string; album: string }) {
+  artwork?: MediaImage[];
+  constructor(init: { title: string; artist: string; album: string; artwork?: MediaImage[] }) {
     this.title = init.title;
     this.artist = init.artist;
     this.album = init.album;
+    this.artwork = init.artwork;
   }
 }
 vi.stubGlobal('MediaMetadata', FakeMediaMetadata);
@@ -83,6 +86,7 @@ describe('TTSMediaBridge', () => {
     controller = new FakeController();
     fake = makeFakeMediaSession();
     bridge = new TTSMediaBridge(() => fake as unknown as MediaSession);
+    useSettingsStore.setState({ settings: {} as never });
   });
 
   const bind = () => bridge.bind(controller as unknown as TTSController, meta());
@@ -163,5 +167,29 @@ describe('TTSMediaBridge', () => {
     // Metadata still reflects the last known chapter, no crash, no blanking.
     expect(first).toBeTruthy();
     expect(bridge.isBound).toBe(true);
+  });
+
+  test('library privacy masks metadata text without replacing the media artwork', async () => {
+    useSettingsStore.setState({
+      settings: {
+        libraryPrivacyModeEnabled: true,
+        privateBookTitleAliases: {
+          'hash-abc': { title: 'Alice', alias: 'Book-123456' },
+        },
+      } as never,
+    });
+    await bridge.bind(
+      controller as unknown as TTSController,
+      meta({ bookKey: 'hash-abc-reader', bookHash: 'hash-abc', coverImageUrl: 'cover.png' }),
+    );
+
+    controller.emitMark('Sensitive sentence text.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+
+    const metadata = fake.metadata as FakeMediaMetadata;
+    expect(metadata.title).toBe('Book-123456');
+    expect(metadata.artist).toBe('Book-123456');
+    expect(metadata.album).toBe('Book-123456');
+    expect(metadata.artwork?.[0]?.src).toBe('cover.png');
   });
 });

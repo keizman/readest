@@ -56,6 +56,7 @@ vi.mock('@/services/tts', () => ({
 }));
 
 import { eventDispatcher } from '@/utils/event';
+import { useSettingsStore } from '@/store/settingsStore';
 import NowPlayingBar from '@/app/library/components/NowPlayingBar';
 
 const makeSession = (state = 'playing') => ({
@@ -73,8 +74,9 @@ describe('NowPlayingBar', () => {
     vi.clearAllMocks();
     mockManager.session = null;
     mockManager.sleepTimer = null;
+    useSettingsStore.setState({ settings: {} as never });
     getBookData.mockReturnValue({
-      book: { title: 'Alice in Wonderland', coverImageUrl: null },
+      book: { hash: 'hashA', title: 'Alice in Wonderland', coverImageUrl: null },
     });
   });
 
@@ -153,5 +155,27 @@ describe('NowPlayingBar', () => {
     mockManager.sleepTimer = { timeoutSec: 600, firesAt: Date.now() + 90_000 };
     render(<NowPlayingBar isSelectMode={false} />);
     expect(screen.getByText(/^1:(2\d|30)$/)).toBeTruthy();
+  });
+
+  test('privacy mode masks text but keeps the now-playing cover visible', () => {
+    mockManager.session = makeSession();
+    useSettingsStore.setState({
+      settings: {
+        libraryPrivacyModeEnabled: true,
+        privateBookTitleAliases: {
+          hashA: { title: 'Alice in Wonderland', alias: 'Book-123456' },
+        },
+      } as never,
+    });
+    getBookData.mockReturnValue({
+      book: { hash: 'hashA', title: 'Alice in Wonderland', coverImageUrl: 'cover.png' },
+    });
+
+    const { container } = render(<NowPlayingBar isSelectMode={false} />);
+
+    expect(screen.getByText('Book-123456')).toBeTruthy();
+    expect(screen.queryByText('Alice in Wonderland')).toBeNull();
+    expect(container.querySelector('img[src="cover.png"]')).toBeTruthy();
+    expect(screen.getByLabelText('Pause')).toBeTruthy();
   });
 });

@@ -9,7 +9,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
 import { navigateToReader } from '@/utils/nav';
 import { useSettingsStore } from '@/store/settingsStore';
-import { getBookDisplayTitle, isLibraryPrivacyModeEnabled } from '@/utils/privacy';
+import { getBookDisplayTitle } from '@/utils/privacy';
 
 const formatCountdown = (msLeft: number) => {
   const total = Math.max(0, Math.floor(msLeft / 1000));
@@ -97,7 +97,6 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
   if (!visible) return null;
 
   const book = getBookData(session.bookKey)?.book;
-  const privacyModeEnabled = isLibraryPrivacyModeEnabled(settings);
   const title = book ? getBookDisplayTitle(settings, book) : '';
   const coverImageUrl = book?.coverImageUrl;
 
@@ -146,7 +145,7 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
           'focus-visible:ring-primary focus-visible:ring-2 focus-visible:outline-none',
         )}
       >
-        {coverImageUrl && !privacyModeEnabled ? (
+        {coverImageUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img src={coverImageUrl} alt='' className='h-8 w-8 shrink-0 rounded-full object-cover' />
         ) : null}
