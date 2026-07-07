@@ -105,22 +105,17 @@ const MAX_AHEAD_SEC = 60;
 // hidden lets already-prepared audio queue up several minutes deep instead.
 const MAX_AHEAD_SEC_HIDDEN = 300;
 
-// Android's Chromium WebView throttles a backgrounded page's main thread
-// almost immediately on app-switch (no gradual ramp like a desktop hidden
-// tab), so the `visibilitychange`-triggered escalation to the *_HIDDEN
-// budgets above often fires too late: by the time `hidden` is observed, the
-// throttling has already started and there was no runway built up in
-// advance. Treat the native Android app as permanently at background-risk
-// (use the deep budgets even while visible) rather than reactively widening
-// them only after the OS has already started throttling. The extra decoded
-// PCM held in memory is the same small mono buffers already accepted for the
-// hidden case; the real cost is a few more speculative Edge fetches, which
-// TTS_WS_MAX_CONCURRENT still caps to 2 concurrent connections regardless of
-// how far ahead the lookahead reaches.
-export const isMobileBackgroundRiskPlatform = (): boolean =>
-  typeof navigator !== 'undefined' &&
-  process.env['NEXT_PUBLIC_APP_PLATFORM'] === 'tauri' &&
-  /android/.test(navigator.userAgent.toLowerCase());
+// REVERTED (see #tts-android-eager-lookahead-regression): making Android
+// treat itself as permanently background-at-risk — i.e. always requesting
+// the *_HIDDEN budgets and EdgeTTSClient's PIPELINE_LOOKAHEAD_HIDDEN even
+// while visible — caused sustained over-fetching against the self-hosted
+// Edge TTS relay (continuously trying to keep up to 300s/40 chunks warm
+// instead of settling once the visible-tier buffer filled) and broke TTS
+// entirely in the field ("Edge TTS WebSocket timed out" on every batch,
+// including the very first preload). The *_HIDDEN budgets stay reactive
+// (`document.visibilityState === 'hidden'` only); do not resurrect the
+// always-on variant without first confirming the self-hosted relay can
+// absorb sustained max-depth prefetch, not just brief bursts.
 
 let sharedContext: TTSAudioContext | null = null;
 
@@ -336,9 +331,7 @@ export class WebAudioPlayer {
   }
 
   #isReadyForMore(session: PlayerSession): boolean {
-    const hidden =
-      (typeof document !== 'undefined' && document.visibilityState === 'hidden') ||
-      isMobileBackgroundRiskPlatform();
+    const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
     const unfinished = session.chunks.reduce((n, c) => n + (c.ended ? 0 : 1), 0);
     const limit = hidden ? MAX_PENDING_HIDDEN : MAX_PENDING_VISIBLE;
     if (unfinished >= limit) return false;

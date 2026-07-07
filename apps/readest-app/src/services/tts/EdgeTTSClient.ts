@@ -36,12 +36,7 @@ import {
   recordProvisionalDuration,
 } from './ttsDuration';
 import { buildBatches, partitionBatch } from './ttsBatch';
-import {
-  isMobileBackgroundRiskPlatform,
-  TTSAudioBuffer,
-  WebAudioPlayer,
-  WebAudioPlayerEvent,
-} from './WebAudioPlayer';
+import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
 
 // One Edge request is one immutable Web Audio source. Sentence boundaries are
 // metadata on that source, never PCM cut points — highlighting, the scrubber,
@@ -65,14 +60,15 @@ const TICKS_PER_SECOND = 10_000_000;
 // MAX_AHEAD_SEC_HIDDEN (300s): even short (~10s) batches need ~30 in flight
 // to fill that window, and each is a small MP3-derived buffer.
 const PIPELINE_LOOKAHEAD_HIDDEN = 32;
-// Android's WebView can start throttling the main thread within seconds of
-// the user switching apps — before `visibilitychange` even fires and long
-// before a useful buffer has been built reactively. Treat it as always at
-// that risk (see isMobileBackgroundRiskPlatform) so the deep lookahead is
-// already running from the first batch, not just once hidden is observed.
+// REVERTED: an earlier attempt made Android always request this deep
+// lookahead (see WebAudioPlayer.ts's comment on the removed
+// isMobileBackgroundRiskPlatform) even while visible, to get ahead of
+// app-switch throttling. It caused sustained over-fetching against the
+// self-hosted Edge TTS relay and broke playback outright (WS timeouts on
+// every batch, including the first). Keep this reactive to the actual
+// visibility signal only.
 const isPageHidden = (): boolean =>
-  (typeof document !== 'undefined' && document.visibilityState === 'hidden') ||
-  isMobileBackgroundRiskPlatform();
+  typeof document !== 'undefined' && document.visibilityState === 'hidden';
 
 interface BatchMarkMeta {
   mark: TTSMark;

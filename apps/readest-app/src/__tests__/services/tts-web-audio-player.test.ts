@@ -190,40 +190,14 @@ describe('WebAudioPlayer backpressure', () => {
     expect(await wait).toBe(true);
   });
 
-  // Regression: Android's WebView can throttle the main thread within
-  // seconds of an app-switch, well before `visibilitychange` fires and
-  // before any buffer built up reactively. The native Android app is
-  // treated as always at that risk, so it gets the deep hidden-tier budgets
-  // even while `document.visibilityState` still reports 'visible'.
-  test('Android native app deepens the pending-chunk budget even while visible', async () => {
+  // Regression guard: an earlier change made the native Android app always
+  // request the hidden-tier budgets even while visible, to get ahead of
+  // app-switch throttling. That caused sustained over-fetching against the
+  // self-hosted Edge TTS relay and broke playback outright in the field, so
+  // it was reverted (see WebAudioPlayer.ts). Android must behave like any
+  // other visible platform until the page is actually hidden.
+  test('Android native app uses the visible-tier budget while visible (no eager escalation)', async () => {
     setAndroidTauriApp(true);
-    const { player, onEvent } = setup();
-    await player.ensureContext();
-    const gen = player.startSession(onEvent);
-    // 9 would block a visible session (MAX_PENDING_VISIBLE is 8); still ready.
-    for (let i = 0; i < 9; i++) {
-      player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    }
-    expect(await player.waitUntilReady(gen)).toBe(true);
-  });
-
-  test('Android native app allows scheduling far past the visible seconds cap', async () => {
-    setAndroidTauriApp(true);
-    const { player, onEvent } = setup();
-    await player.ensureContext();
-    const gen = player.startSession(onEvent);
-    player.scheduleChunk(gen, makeBuffer(30), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    player.scheduleChunk(gen, makeBuffer(31), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    // 61s ahead would block a visible session, but is well under the hidden cap.
-    expect(await player.waitUntilReady(gen)).toBe(true);
-  });
-
-  test('non-Android tauri app keeps the visible-tier budget (iOS has AVAudioSession instead)', async () => {
-    // Only android should opt into the always-deep budget; the same UA
-    // string without NEXT_PUBLIC_APP_PLATFORM=tauri means "mobile web", not
-    // the native app with a WebView subject to app-switch throttling.
-    Object.defineProperty(navigator, 'userAgent', { value: ANDROID_UA, configurable: true });
-    delete process.env['NEXT_PUBLIC_APP_PLATFORM'];
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
@@ -235,7 +209,7 @@ describe('WebAudioPlayer backpressure', () => {
       return r;
     });
     await Promise.resolve();
-    expect(resolved).toBeNull();
+    expect(resolved).toBeNull(); // 61s ahead > 60s visible cap, same as any other platform
     await ctx.advanceTo(SAFETY + 30);
     expect(await wait).toBe(true);
   });

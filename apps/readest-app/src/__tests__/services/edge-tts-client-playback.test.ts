@@ -406,13 +406,14 @@ describe('EdgeTTSClient Web Audio playback', () => {
     }
   });
 
-  // Regression: Android's WebView can start throttling the main thread
-  // within seconds of an app-switch — before `visibilitychange` fires and
-  // before the reactive lookahead escalation has a chance to build any
-  // buffer. The native Android app is treated as always at that risk, so it
-  // pipelines this deeply from the very first batch, not just once
-  // `document.visibilityState` reports 'hidden'.
-  test('pipelines much further ahead on the Android native app even while visible', async () => {
+  // Regression guard: an earlier change made the native Android app always
+  // pipeline this deeply (PIPELINE_LOOKAHEAD_HIDDEN) even while visible, to
+  // get ahead of app-switch throttling. In the field this sustained
+  // over-fetching overwhelmed the self-hosted Edge TTS relay and broke
+  // playback outright (every batch, including the first, timed out), so it
+  // was reverted. Android must stay at the visible-tier lookahead
+  // (TTS_WS_MAX_CONCURRENT) until the page is actually hidden.
+  test('does not deepen lookahead on the Android native app while visible', async () => {
     const originalUA = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', {
       value:
@@ -439,8 +440,11 @@ describe('EdgeTTSClient Web Audio playback', () => {
           void _;
         }
       })();
-      await vi.waitFor(() => expect(fetchCount).toBeGreaterThan(2));
-      expect(fetchCount).toBeGreaterThanOrEqual(10);
+      await vi.waitFor(() => expect(fetchCount).toBeGreaterThan(0));
+      // Give any errant extra pipelining a chance to fire before asserting
+      // it stayed capped at the same visible-tier depth as any other platform.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(fetchCount).toBeLessThanOrEqual(2);
       void done;
     } finally {
       Object.defineProperty(navigator, 'userAgent', { value: originalUA, configurable: true });
