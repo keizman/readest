@@ -70,6 +70,33 @@ const PIPELINE_LOOKAHEAD_HIDDEN = 32;
 const isPageHidden = (): boolean =>
   typeof document !== 'undefined' && document.visibilityState === 'hidden';
 
+const delayUnlessAborted = (ms: number, signal: AbortSignal): Promise<boolean> =>
+  new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve(false);
+      return;
+    }
+
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    function cleanup() {
+      if (timeoutId) clearTimeout(timeoutId);
+      signal.removeEventListener('abort', onAbort);
+    }
+    function finish(shouldContinue: boolean) {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(shouldContinue);
+    }
+    function onAbort() {
+      finish(false);
+    }
+
+    timeoutId = setTimeout(() => finish(true), ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
 interface BatchMarkMeta {
   mark: TTSMark;
   boundaries: TTSWordBoundary[];
@@ -212,7 +239,8 @@ export class EdgeTTSClient implements TTSClient {
         lastError = err;
         console.warn(`Edge TTS fetch attempt ${attempt}/${maxAttempts} failed`, err);
         if (attempt < maxAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+          const shouldRetry = await delayUnlessAborted(200 * attempt, signal);
+          if (!shouldRetry) return undefined;
         }
       }
     }
@@ -360,6 +388,11 @@ export class EdgeTTSClient implements TTSClient {
     // back to playback-time one-by-one synthesis.
     const batches = buildBatches(marks, startup);
     const criticalCount = this.#criticalPreloadBatches(batches.length);
+    // Startup playback should unblock as soon as the deliberately small first
+    // batch is warm. Start the next critical batch immediately so cache fill is
+    // still pipelined, but do not let a slow/timeout second WS request delay
+    // first audio indefinitely.
+    const blockingCount = startup ? Math.min(1, criticalCount) : criticalCount;
     const preloadBatch = async (batch: TTSMark[]) => {
       const voiceLang = batch[0]!.language;
       const voiceId = await this.getVoiceIdFromLang(voiceLang);
@@ -395,9 +428,11 @@ export class EdgeTTSClient implements TTSClient {
         console.warn('Error preloading batch', index, err);
       }
     };
-    await Promise.all(Array.from({ length: criticalCount }, (_, index) => runBatch(index)));
+    const criticalPromises = Array.from({ length: criticalCount }, (_, index) => runBatch(index));
+    await Promise.all(criticalPromises.slice(0, blockingCount));
     let nextBackgroundIndex = criticalCount;
     const runBackgroundBatches = async () => {
+      await Promise.allSettled(criticalPromises.slice(blockingCount));
       while (!signal.aborted) {
         const index = nextBackgroundIndex++;
         if (index >= batches.length) return;

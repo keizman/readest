@@ -485,7 +485,28 @@ describe('EdgeTTSClient', () => {
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
     });
 
-    test('waits for all critical startup batches before releasing preload', async () => {
+    test('releases retry backoff immediately when the signal is aborted', async () => {
+      await client.init();
+      parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];
+      const controller = new AbortController();
+      createAudioDataBehavior = vi.fn(() => Promise.reject(new Error('network error')));
+
+      const pending = consumePreload(client, controller.signal);
+      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(1));
+      await Promise.resolve();
+      await Promise.resolve();
+      controller.abort();
+
+      await expect(
+        Promise.race([
+          pending.then(() => 'released'),
+          new Promise((resolve) => setTimeout(() => resolve('blocked'), 50)),
+        ]),
+      ).resolves.toBe('released');
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+    });
+
+    test('starts the next startup batch immediately but releases preload after the first batch', async () => {
       await client.init();
       parsedMarks = [
         { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
@@ -512,8 +533,17 @@ describe('EdgeTTSClient', () => {
         expect(createAudioDataBehavior).toHaveBeenCalledTimes(criticalFetches),
       );
       resolvers[0]!({ data: new ArrayBuffer(8), boundaries: [] });
-      resolvers[1]!({ data: new ArrayBuffer(8), boundaries: [] });
-      await pending;
+      try {
+        await expect(
+          Promise.race([
+            pending.then(() => 'released'),
+            new Promise((resolve) => setTimeout(() => resolve('blocked'), 20)),
+          ]),
+        ).resolves.toBe('released');
+      } finally {
+        resolvers[1]?.({ data: new ArrayBuffer(8), boundaries: [] });
+        await pending.catch(() => {});
+      }
     });
 
     test('skips pure Chinese ellipsis without requesting Edge audio', async () => {
