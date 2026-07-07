@@ -108,11 +108,11 @@ describe('WebAudioPlayer backpressure', () => {
     expect(ctx.sources).toHaveLength(5);
   });
 
-  test('ninth chunk waits until the first finishes while visible', async () => {
+  test('seventeenth chunk waits until the first finishes while visible', async () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 16; i++) {
       player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     }
     let resolved: boolean | null = null;
@@ -131,8 +131,8 @@ describe('WebAudioPlayer backpressure', () => {
     const { player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    // 9 would block a visible session (MAX_PENDING_VISIBLE is 8); still ready hidden.
-    for (let i = 0; i < 9; i++) {
+    // 17 would block a visible session (MAX_PENDING_VISIBLE is 16); still ready hidden.
+    for (let i = 0; i < 17; i++) {
       player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     }
     expect(await player.waitUntilReady(gen)).toBe(true);
@@ -142,33 +142,33 @@ describe('WebAudioPlayer backpressure', () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    player.scheduleChunk(gen, makeBuffer(30), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    player.scheduleChunk(gen, makeBuffer(31), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(60), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(61), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     let resolved: boolean | null = null;
     const wait = player.waitUntilReady(gen).then((r) => {
       resolved = r;
       return r;
     });
     await Promise.resolve();
-    expect(resolved).toBeNull(); // 61s ahead > 60s visible cap, though only 2 < 8 chunks
-    await ctx.advanceTo(SAFETY + 30);
+    expect(resolved).toBeNull(); // 121s ahead > 120s visible cap, though only 2 < 16 chunks
+    await ctx.advanceTo(SAFETY + 60);
     expect(await wait).toBe(true);
   });
 
   // Regression: background CPU/network throttling can slow a batch's
-  // fetch+decode well past real time. The visible-mode 60s seconds-cap was
+  // fetch+decode well past real time. The visible-mode seconds-cap was
   // the actual ceiling on background resilience — no amount of upstream
   // fetch lookahead helps if the player itself refuses to hold more than
-  // 60s of already-prepared audio queued up. Hidden sessions get a much
+  // the visible budget of already-prepared audio queued up. Hidden sessions get a much
   // deeper (300s) window instead.
   test('hidden sessions allow scheduling far past the visible seconds cap', async () => {
     setVisibility('hidden');
     const { player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    player.scheduleChunk(gen, makeBuffer(30), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    player.scheduleChunk(gen, makeBuffer(31), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    // 61s ahead would block a visible session, but is well under the hidden cap.
+    // 121s ahead would block a visible session, but is well under the hidden cap.
+    player.scheduleChunk(gen, makeBuffer(60), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(61), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     expect(await player.waitUntilReady(gen)).toBe(true);
   });
 
@@ -201,16 +201,16 @@ describe('WebAudioPlayer backpressure', () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    player.scheduleChunk(gen, makeBuffer(30), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    player.scheduleChunk(gen, makeBuffer(31), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(60), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(61), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     let resolved: boolean | null = null;
     const wait = player.waitUntilReady(gen).then((r) => {
       resolved = r;
       return r;
     });
     await Promise.resolve();
-    expect(resolved).toBeNull(); // 61s ahead > 60s visible cap, same as any other platform
-    await ctx.advanceTo(SAFETY + 30);
+    expect(resolved).toBeNull(); // 121s ahead > 120s visible cap, same as any other platform
+    await ctx.advanceTo(SAFETY + 60);
     expect(await wait).toBe(true);
   });
 
@@ -272,7 +272,7 @@ describe('WebAudioPlayer abort', () => {
     const { ctx, player, events, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 16; i++) {
       player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     }
     const wait = player.waitUntilReady(gen);

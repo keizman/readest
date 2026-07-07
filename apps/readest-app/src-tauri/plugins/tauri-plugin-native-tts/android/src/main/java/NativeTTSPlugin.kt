@@ -83,6 +83,7 @@ class UpdateMediaSessionMetadataArgs {
   var artist: String? = null
   var album: String? = null
   var artwork: String? = null
+  var refreshNotification: Boolean? = null
 }
 
 @InvokeArg
@@ -90,6 +91,7 @@ class UpdateMediaSessionStateArgs {
   var playing: Boolean? = null
   var position: Int? = null // in milliseconds
   var duration: Int? = null // in milliseconds
+  var refreshNotification: Boolean? = null
 }
 
 @InvokeArg
@@ -498,6 +500,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         val title = args.title ?: ""
         val artist = args.artist ?: ""
         val album = args.album ?: ""
+        val refreshNotification = args.refreshNotification ?: true
 
         coroutineScope.launch {
             try {
@@ -508,6 +511,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
                     putExtra("artist", artist)
                     putExtra("album", album)
                     putExtra("artwork", artworkBitmap)
+                    putExtra("refreshNotification", refreshNotification)
                 }
                 activity.startService(intent)
                 invoke.resolve()
@@ -523,6 +527,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         val isPlaying = args.playing ?: false
         val position = args.position ?: 0
         val duration = args.duration ?: 0
+        val refreshNotification = args.refreshNotification ?: true
 
         try {
             val intent = Intent(activity, MediaPlaybackService::class.java).apply {
@@ -530,6 +535,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
                 putExtra("playing", isPlaying)
                 putExtra("position", position)
                 putExtra("duration", duration)
+                putExtra("refreshNotification", refreshNotification)
             }
             activity.startService(intent)
             invoke.resolve()

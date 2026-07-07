@@ -336,6 +336,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
             "UPDATE_METADATA" -> {
                 currentTitle = intent.getStringExtra("title") ?: currentTitle
                 currentArtist = intent.getStringExtra("artist") ?: currentArtist
+                val refreshNotification = intent.getBooleanExtra("refreshNotification", true)
                 // Unmarshal the artwork Bitmap off the main thread; copying its
                 // pixel buffer out of the Parcel can stall the UI thread and trip
                 // an ANR for large covers.
@@ -358,7 +359,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
                         .putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, currentArtwork)
                     mediaSession?.setMetadata(metadataBuilder.build())
                     notifyChildrenChanged(MEDIA_ROOT_ID)
-                    if (sessionActive) {
+                    if (sessionActive && refreshNotification) {
                         showNotification(if (player.isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED)
                     }
                 }
@@ -368,6 +369,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
                     val isPlaying = intent.getBooleanExtra("playing", false)
                     val position = intent.getLongExtra("position", 0L) // in milliseconds
                     val duration = intent.getLongExtra("duration", 0L) // in milliseconds
+                    val refreshNotification = intent.getBooleanExtra("refreshNotification", true)
 
                     if (isPlaying && !player.isPlaying) {
                         player.play()
@@ -380,7 +382,9 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
                     mediaSession?.setPlaybackState(
                         stateBuilder.setState(state, position, 1f).build()
                     )
-                    showNotification(state)
+                    if (refreshNotification) {
+                        showNotification(state)
+                    }
                 }
             }
         }

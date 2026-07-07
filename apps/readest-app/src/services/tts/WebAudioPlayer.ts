@@ -90,10 +90,10 @@ const SCHEDULE_SAFETY_SEC = 0.03;
 // Keep enough decoded chunks scheduled that delayed main-thread `onended`
 // delivery cannot drain the audio timeline. The page-hidden budget is deeper
 // because Android/WebKit may throttle JS callbacks aggressively after lock.
-const MAX_PENDING_VISIBLE = 8;
+const MAX_PENDING_VISIBLE = 16;
 const MAX_PENDING_HIDDEN = 40;
 // Bounds decoded PCM at slow rates (0.2x stretches a 30s sentence to 150s).
-const MAX_AHEAD_SEC = 60;
+const MAX_AHEAD_SEC = 120;
 // While hidden, a much deeper scheduled-ahead window is worth the extra
 // decoded-PCM memory (small mono MP3-derived buffers): this is the ceiling
 // that was actually capping background resilience. Even with the fetch
@@ -101,8 +101,8 @@ const MAX_AHEAD_SEC = 60;
 // player refused to schedule more than MAX_AHEAD_SEC past the audio clock —
 // so once backgrounded (main-thread CPU/network throttling can slow fetch +
 // decode well beyond real time), the actual insurance buffer was still only
-// ~60s and a slow batch could still starve the timeline. Raising it while
-// hidden lets already-prepared audio queue up several minutes deep instead.
+// the visible cap and a slow batch could still starve the timeline. Hidden
+// sessions let already-prepared audio queue up several minutes deep instead.
 const MAX_AHEAD_SEC_HIDDEN = 300;
 
 // REVERTED (see #tts-android-eager-lookahead-regression): making Android

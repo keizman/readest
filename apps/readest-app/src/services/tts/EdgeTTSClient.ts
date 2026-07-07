@@ -48,15 +48,20 @@ const BATCH_EDGE_KEEP_SEC = 0.06;
 const EDGE_KEEP_SEC = 0.008;
 const TRAILING_KEEP_SEC = 0.004;
 const TICKS_PER_SECOND = 10_000_000;
+// Visible playback should keep materially more than the two active WS slots
+// queued, especially at 2x+ speed, but not jump to the aggressive hidden-tier
+// depth that previously overwhelmed the self-hosted relay while the app was
+// foregrounded. EdgeSpeechTTS still enforces TTS_WS_MAX_CONCURRENT network
+// concurrency; this only keeps a bounded wait queue warm.
+const PIPELINE_LOOKAHEAD_VISIBLE = 8;
 // While the app is backgrounded, WS fetches/decodes on the main thread can be
-// throttled far more than the ~1 batch's worth of lead time TTS_WS_MAX_CONCURRENT
-// pipelines while visible — that gap between "audio already scheduled" and
-// "next batch prepared" is exactly what reintroduces audible pauses once the
-// user leaves the foreground. Look further ahead in the batch queue while
-// hidden so a deeper buffer of already-fetched chunks is queued up (bounded by
-// WebAudioPlayer's MAX_PENDING_HIDDEN / MAX_AHEAD_SEC_HIDDEN backpressure,
-// which allows scheduling that far ahead in the first place) before
-// background throttling can starve it. Sized generously against
+// throttled far more than the bounded visible lookahead can absorb — that gap
+// between "audio already scheduled" and "next batch prepared" is exactly what
+// reintroduces audible pauses once the user leaves the foreground. Look further
+// ahead in the batch queue while hidden so a deeper buffer of already-fetched
+// chunks is queued up (bounded by WebAudioPlayer's MAX_PENDING_HIDDEN /
+// MAX_AHEAD_SEC_HIDDEN backpressure, which allows scheduling that far ahead in
+// the first place) before background throttling can starve it. Sized generously against
 // MAX_AHEAD_SEC_HIDDEN (300s): even short (~10s) batches need ~30 in flight
 // to fill that window, and each is a small MP3-derived buffer.
 const PIPELINE_LOOKAHEAD_HIDDEN = 32;
@@ -581,7 +586,7 @@ export class EdgeTTSClient implements TTSClient {
         // Re-checked every iteration: backgrounding can happen mid-playback,
         // and the deeper lookahead should kick in immediately rather than
         // waiting for the session to restart.
-        const lookahead = isPageHidden() ? PIPELINE_LOOKAHEAD_HIDDEN : TTS_WS_MAX_CONCURRENT;
+        const lookahead = isPageHidden() ? PIPELINE_LOOKAHEAD_HIDDEN : PIPELINE_LOOKAHEAD_VISIBLE;
         startPreparationsThrough(batchIndex + lookahead - 1);
         if (signal.aborted || this.#activeGeneration !== generation) break;
         const result = await preparations[batchIndex]!;

@@ -276,6 +276,37 @@ describe('TTSMediaBridge', () => {
       artist: 'Book-123456',
       album: 'Book-123456',
       artwork: 'data:image/png;base64,x',
+      refreshNotification: true,
+    });
+  });
+
+  test('tauri sentence metadata updates do not rebuild the foreground notification', async () => {
+    const tauri = new TauriMediaSession();
+    const updateMetadata = vi.spyOn(tauri, 'updateMetadata').mockResolvedValue(undefined);
+    const updatePlaybackState = vi.spyOn(tauri, 'updatePlaybackState').mockResolvedValue(undefined);
+    vi.spyOn(tauri, 'setActive').mockResolvedValue(undefined);
+    const tauriBridge = new TTSMediaBridge(() => tauri);
+    await tauriBridge.bind(
+      controller as unknown as TTSController,
+      meta({ bookKey: 'hash-abc-reader', coverImageUrl: 'cover.png' }),
+    );
+    updateMetadata.mockClear();
+    updatePlaybackState.mockClear();
+
+    controller.emitMark('First visible sentence.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(updateMetadata).toHaveBeenCalledWith({
+      title: 'First visible sentence.',
+      artist: 'Alice',
+      album: 'Carroll',
+      refreshNotification: false,
+    });
+    expect(updatePlaybackState).toHaveBeenCalledWith({
+      playing: true,
+      position: 12000,
+      duration: 60000,
+      refreshNotification: false,
     });
   });
 });

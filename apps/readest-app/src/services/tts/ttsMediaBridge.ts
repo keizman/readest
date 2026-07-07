@@ -132,6 +132,7 @@ export class TTSMediaBridge {
       await this.#mediaSession.updateMetadata({
         ...initialMetadata,
         artwork,
+        refreshNotification: true,
       });
     }
 
@@ -323,12 +324,16 @@ export class TTSMediaBridge {
     if (unchanged) return;
 
     if (mediaSession instanceof TauriMediaSession) {
-      await mediaSession.updateMetadata({
+      const shouldRefreshNotification = artworkChanged || privacyChanged;
+      const payload = {
         title: metadata.title,
         artist: metadata.artist,
         album: metadata.album,
-        artwork: artworkChanged || privacyChanged ? await this.#resolveArtwork() : '',
-      });
+        refreshNotification: shouldRefreshNotification,
+      } as const;
+      await mediaSession.updateMetadata(
+        shouldRefreshNotification ? { ...payload, artwork: await this.#resolveArtwork() } : payload,
+      );
     } else {
       if (!this.#webMetadata || this.#webArtworkSrc !== artworkSrc) {
         this.#webMetadata = new MediaMetadata({
@@ -368,6 +373,7 @@ export class TTSMediaBridge {
         playing: ctrl.state === 'playing',
         position: Math.round(position * 1000),
         duration: Math.round(info.duration * 1000),
+        refreshNotification: false,
       });
     } else if ('setPositionState' in mediaSession) {
       try {
@@ -387,7 +393,10 @@ export class TTSMediaBridge {
     // playing/paused flips to the OS.
     if (ctrl.state === 'stopped' && !ctrl.terminated) return;
     if (mediaSession instanceof TauriMediaSession) {
-      await mediaSession.updatePlaybackState({ playing: ctrl.state === 'playing' });
+      await mediaSession.updatePlaybackState({
+        playing: ctrl.state === 'playing',
+        refreshNotification: true,
+      });
     } else {
       mediaSession.playbackState = ctrl.state === 'playing' ? 'playing' : 'paused';
     }

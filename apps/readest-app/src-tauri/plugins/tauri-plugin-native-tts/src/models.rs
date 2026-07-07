@@ -80,6 +80,7 @@ pub struct UpdateMediaSessionStateRequest {
     pub playing: bool,
     pub position: Option<f64>,
     pub duration: Option<f64>,
+    pub refresh_notification: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -89,4 +90,5 @@ pub struct UpdateMediaSessionMetadataRequest {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub artwork: Option<String>,
+    pub refresh_notification: Option<bool>,
 }

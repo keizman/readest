@@ -406,13 +406,38 @@ describe('EdgeTTSClient Web Audio playback', () => {
     }
   });
 
+  test('pipelines a larger bounded window while visible', async () => {
+    const manyMarks = Array.from({ length: 12 }, (_, i) => ({
+      offset: i * 120,
+      name: String(i),
+      text: `${String.fromCharCode(97 + i).repeat(119)}.`,
+      language: 'en',
+    }));
+    let fetchCount = 0;
+    const neverResolve = new Promise<MockAudioData>(() => {});
+    createAudioDataBehavior = async () => {
+      fetchCount++;
+      return neverResolve;
+    };
+    const client = await startClient();
+    const done = (async () => {
+      for await (const _ of client.speakMarks(manyMarks, new AbortController().signal)) {
+        void _;
+      }
+    })();
+    await vi.waitFor(() => expect(fetchCount).toBeGreaterThan(2));
+    expect(fetchCount).toBeGreaterThanOrEqual(8);
+    expect(fetchCount).toBeLessThan(12);
+    void done;
+  });
+
   // Regression guard: an earlier change made the native Android app always
   // pipeline this deeply (PIPELINE_LOOKAHEAD_HIDDEN) even while visible, to
   // get ahead of app-switch throttling. In the field this sustained
   // over-fetching overwhelmed the self-hosted Edge TTS relay and broke
   // playback outright (every batch, including the first, timed out), so it
-  // was reverted. Android must stay at the visible-tier lookahead
-  // (TTS_WS_MAX_CONCURRENT) until the page is actually hidden.
+  // was reverted. Android must stay at the bounded visible-tier lookahead
+  // until the page is actually hidden, not jump to the hidden-tier depth.
   test('does not deepen lookahead on the Android native app while visible', async () => {
     const originalUA = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', {
@@ -442,9 +467,11 @@ describe('EdgeTTSClient Web Audio playback', () => {
       })();
       await vi.waitFor(() => expect(fetchCount).toBeGreaterThan(0));
       // Give any errant extra pipelining a chance to fire before asserting
-      // it stayed capped at the same visible-tier depth as any other platform.
+      // it stayed capped at the same bounded visible-tier depth as any other
+      // platform.
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(fetchCount).toBeLessThanOrEqual(2);
+      expect(fetchCount).toBeGreaterThanOrEqual(8);
+      expect(fetchCount).toBeLessThan(12);
       void done;
     } finally {
       Object.defineProperty(navigator, 'userAgent', { value: originalUA, configurable: true });
@@ -481,9 +508,9 @@ describe('EdgeTTSClient Web Audio playback', () => {
         }
       })();
 
-      // Starts visible: only TTS_WS_MAX_CONCURRENT batches are queued, and
-      // batch 0 never resolves, so the scheduler loop is parked on it.
-      await vi.waitFor(() => expect(fetchCount).toBe(2));
+      // Starts visible: the bounded visible lookahead is queued, and batch 0
+      // never resolves, so the scheduler loop is parked on it.
+      await vi.waitFor(() => expect(fetchCount).toBe(8));
 
       Object.defineProperty(document, 'visibilityState', {
         value: 'hidden',

@@ -8,12 +8,14 @@ export interface MediaMetadata {
   artist?: string;
   album?: string;
   artwork?: string;
+  refreshNotification?: boolean;
 }
 
 export interface PlaybackState {
   playing: boolean;
   position?: number; // in milliseconds
   duration?: number; // in milliseconds
+  refreshNotification?: boolean;
 }
 
 export interface MediaSessionState {

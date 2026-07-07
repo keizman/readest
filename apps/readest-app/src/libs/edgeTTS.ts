@@ -377,10 +377,11 @@ export type EdgeSpeechTTSOptions = {
   wsTarget?: EdgeTTSWsTarget;
 };
 
-// 48 kbit/s mono mp3 is roughly 6 KiB/s. Retain about 20 minutes so the
-// five-minute lookahead window has room for current and recently played audio
-// without evicting future chunks immediately.
-export const TTS_AUDIO_CACHE_MAX_BYTES = 20 * 60 * 6 * 1024;
+// Edge's MP3 bitrate varies by voice/service path and is commonly higher than
+// the optimistic 48 kbit/s estimate. Keep a hard byte cap large enough for a
+// real multi-minute lookahead at 2x+ speed without evicting future chunks as
+// soon as the current chapter warms.
+export const TTS_AUDIO_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 
 // Edge TTS SSML prosody rate silently caps here; higher values have no effect.
 export const EDGE_TTS_MAX_RATE = 2.0;
@@ -409,8 +410,8 @@ export class EdgeSpeechTTS {
     EdgeSpeechTTS.audioCacheBytes = Math.max(0, EdgeSpeechTTS.audioCacheBytes - blob.size);
     EdgeSpeechTTS.boundariesCache.delete(key);
   };
-  private static audioCache = new LRUCache<string, Blob>(200, EdgeSpeechTTS.onAudioCacheEvict);
-  private static boundariesCache = new LRUCache<string, TTSWordBoundary[]>(200);
+  private static audioCache = new LRUCache<string, Blob>(800, EdgeSpeechTTS.onAudioCacheEvict);
+  private static boundariesCache = new LRUCache<string, TTSWordBoundary[]>(800);
   private static trimAudioCache = () => {
     while (
       EdgeSpeechTTS.audioCacheBytes > TTS_AUDIO_CACHE_MAX_BYTES &&

@@ -36,7 +36,7 @@ let ttsPositionSequence = 0;
 // Keep at least five minutes of wall-clock speech ready in the Edge LRU cache.
 // Duration is estimated per paragraph (CJK chars vs. words), so English and
 // short dialogue receive the same real playback buffer as dense CJK prose.
-// 100 paragraphs is still below the 200-entry cache in the worst short-block
+// 100 paragraphs is still below the 800-entry cache in the worst short-block
 // case, while avoiding the old 16-paragraph cap that held under two minutes of
 // English dialogue. Prefetch continues into following sections when needed.
 const PREFETCH_TARGET_SECONDS = 5 * 60;
