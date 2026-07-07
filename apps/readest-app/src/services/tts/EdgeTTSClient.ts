@@ -195,6 +195,14 @@ export class EdgeTTSClient implements TTSClient {
       try {
         return await this.#edgeTTS?.createAudioData(payload, signal, priority);
       } catch (err) {
+        // An in-flight fetch/WS wait rejects with this exact DOMException when
+        // its signal is aborted (see wsAbortError in edgeTTS.ts) — an expected
+        // outcome of the caller being superseded (navigation, stop, a newer
+        // session), not a real synthesis failure. Logging it as a "failed"
+        // warning is misleading (indistinguishable from a genuine server/
+        // network error in logs) and needlessly burns a retry-backoff delay
+        // for something that will never be retried anyway.
+        if (signal.aborted) return undefined;
         // Pass payload.text through so the punctuation-only-batch branch of
         // isNoAudioSynthesisError (mirrors the check the caller already does
         // with batchText) is recognized here too, skipping straight to the
@@ -203,7 +211,7 @@ export class EdgeTTSClient implements TTSClient {
         if (isNoAudioSynthesisError(err, payload.text)) throw err;
         lastError = err;
         console.warn(`Edge TTS fetch attempt ${attempt}/${maxAttempts} failed`, err);
-        if (attempt < maxAttempts && !signal.aborted) {
+        if (attempt < maxAttempts) {
           await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
         }
       }
