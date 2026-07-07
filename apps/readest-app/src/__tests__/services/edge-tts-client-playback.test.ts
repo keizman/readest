@@ -406,6 +406,99 @@ describe('EdgeTTSClient Web Audio playback', () => {
     }
   });
 
+  // Regression: Android's WebView can start throttling the main thread
+  // within seconds of an app-switch — before `visibilitychange` fires and
+  // before the reactive lookahead escalation has a chance to build any
+  // buffer. The native Android app is treated as always at that risk, so it
+  // pipelines this deeply from the very first batch, not just once
+  // `document.visibilityState` reports 'hidden'.
+  test('pipelines much further ahead on the Android native app even while visible', async () => {
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', {
+      value:
+        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36',
+      configurable: true,
+    });
+    process.env['NEXT_PUBLIC_APP_PLATFORM'] = 'tauri';
+    try {
+      const manyMarks = Array.from({ length: 12 }, (_, i) => ({
+        offset: i * 120,
+        name: String(i),
+        text: `${String.fromCharCode(97 + i).repeat(119)}.`,
+        language: 'en',
+      }));
+      let fetchCount = 0;
+      const neverResolve = new Promise<MockAudioData>(() => {});
+      createAudioDataBehavior = async () => {
+        fetchCount++;
+        return neverResolve;
+      };
+      const client = await startClient();
+      const done = (async () => {
+        for await (const _ of client.speakMarks(manyMarks, new AbortController().signal)) {
+          void _;
+        }
+      })();
+      await vi.waitFor(() => expect(fetchCount).toBeGreaterThan(2));
+      expect(fetchCount).toBeGreaterThanOrEqual(10);
+      void done;
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { value: originalUA, configurable: true });
+      delete process.env['NEXT_PUBLIC_APP_PLATFORM'];
+    }
+  });
+
+  // Regression: backgrounding can happen while the scheduler is parked on
+  // `await preparations[batchIndex]` for a batch that is itself slow under
+  // throttling — exactly when the deeper hidden lookahead is most needed.
+  // It must not wait for that await to resolve before deepening the queue.
+  test('reacts immediately to backgrounding mid-batch instead of waiting for the loop to advance', async () => {
+    const originalVisibilityState = Object.getOwnPropertyDescriptor(
+      Document.prototype,
+      'visibilityState',
+    );
+    try {
+      const manyMarks = Array.from({ length: 12 }, (_, i) => ({
+        offset: i * 120,
+        name: String(i),
+        text: `${String.fromCharCode(97 + i).repeat(119)}.`,
+        language: 'en',
+      }));
+      let fetchCount = 0;
+      const neverResolve = new Promise<MockAudioData>(() => {});
+      createAudioDataBehavior = async () => {
+        fetchCount++;
+        return neverResolve;
+      };
+      const client = await startClient();
+      const done = (async () => {
+        for await (const _ of client.speakMarks(manyMarks, new AbortController().signal)) {
+          void _;
+        }
+      })();
+
+      // Starts visible: only TTS_WS_MAX_CONCURRENT batches are queued, and
+      // batch 0 never resolves, so the scheduler loop is parked on it.
+      await vi.waitFor(() => expect(fetchCount).toBe(2));
+
+      Object.defineProperty(document, 'visibilityState', {
+        value: 'hidden',
+        configurable: true,
+      });
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      // No further await/flush beyond the event dispatch: the deeper queue
+      // must be triggered synchronously by the visibilitychange handler,
+      // not by the stalled loop reaching its next per-batch check.
+      await vi.waitFor(() => expect(fetchCount).toBeGreaterThanOrEqual(10));
+      void done;
+    } finally {
+      if (originalVisibilityState) {
+        Object.defineProperty(document, 'visibilityState', originalVisibilityState);
+      }
+    }
+  });
+
   test('pipelines batch fetch so later batches start before earlier ones finish', async () => {
     const marks = [
       { offset: 0, name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },

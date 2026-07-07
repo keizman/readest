@@ -66,6 +66,7 @@ pub struct GetVoicesResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SetMediaSessionActiveRequest {
     pub active: bool,
+    #[serde(default)]
     pub keep_app_in_foreground: bool,
     pub notification_title: Option<String>,
     pub notification_text: Option<String>,

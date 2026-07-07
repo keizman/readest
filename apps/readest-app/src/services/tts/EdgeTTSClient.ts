@@ -36,7 +36,12 @@ import {
   recordProvisionalDuration,
 } from './ttsDuration';
 import { buildBatches, partitionBatch } from './ttsBatch';
-import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
+import {
+  isMobileBackgroundRiskPlatform,
+  TTSAudioBuffer,
+  WebAudioPlayer,
+  WebAudioPlayerEvent,
+} from './WebAudioPlayer';
 
 // One Edge request is one immutable Web Audio source. Sentence boundaries are
 // metadata on that source, never PCM cut points — highlighting, the scrubber,
@@ -54,11 +59,20 @@ const TICKS_PER_SECOND = 10_000_000;
 // "next batch prepared" is exactly what reintroduces audible pauses once the
 // user leaves the foreground. Look further ahead in the batch queue while
 // hidden so a deeper buffer of already-fetched chunks is queued up (bounded by
-// WebAudioPlayer's MAX_PENDING_HIDDEN backpressure, which allows scheduling
-// that far ahead in the first place) before background throttling can starve it.
-const PIPELINE_LOOKAHEAD_HIDDEN = 10;
+// WebAudioPlayer's MAX_PENDING_HIDDEN / MAX_AHEAD_SEC_HIDDEN backpressure,
+// which allows scheduling that far ahead in the first place) before
+// background throttling can starve it. Sized generously against
+// MAX_AHEAD_SEC_HIDDEN (300s): even short (~10s) batches need ~30 in flight
+// to fill that window, and each is a small MP3-derived buffer.
+const PIPELINE_LOOKAHEAD_HIDDEN = 32;
+// Android's WebView can start throttling the main thread within seconds of
+// the user switching apps — before `visibilitychange` even fires and long
+// before a useful buffer has been built reactively. Treat it as always at
+// that risk (see isMobileBackgroundRiskPlatform) so the deep lookahead is
+// already running from the first batch, not just once hidden is observed.
 const isPageHidden = (): boolean =>
-  typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  (typeof document !== 'undefined' && document.visibilityState === 'hidden') ||
+  isMobileBackgroundRiskPlatform();
 
 interface BatchMarkMeta {
   mark: TTSMark;
@@ -490,6 +504,13 @@ export class EdgeTTSClient implements TTSClient {
         this.#player.endSession(generation);
       }
     };
+    // Backgrounding can happen mid-batch, i.e. while the loop below is
+    // parked on `await preparations[batchIndex]`, which would otherwise
+    // leave the deeper hidden lookahead unapplied until that await resolves
+    // and the loop reaches its next per-iteration check — exactly the
+    // narrow window where a batch already slow from throttling most needs
+    // the wider buffer. React to the transition immediately instead.
+    let onVisibilityChange: (() => void) | undefined;
     try {
       const batches = buildBatches(marks, startup);
       const preparations: Array<Promise<BatchPrepareResult>> = new Array(batches.length);
@@ -508,6 +529,14 @@ export class EdgeTTSClient implements TTSClient {
           );
         }
       };
+      if (typeof document !== 'undefined') {
+        onVisibilityChange = () => {
+          if (isPageHidden()) {
+            startPreparationsThrough(started + PIPELINE_LOOKAHEAD_HIDDEN - 1);
+          }
+        };
+        document.addEventListener('visibilitychange', onVisibilityChange);
+      }
 
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
         // Re-checked every iteration: backgrounding can happen mid-playback,
@@ -570,6 +599,7 @@ export class EdgeTTSClient implements TTSClient {
       const message = error instanceof Error ? error.message : String(error);
       queue.push({ kind: 'error', message });
     } finally {
+      if (onVisibilityChange) document.removeEventListener('visibilitychange', onVisibilityChange);
       finishSession();
     }
   }

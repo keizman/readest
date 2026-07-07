@@ -91,9 +91,36 @@ const SCHEDULE_SAFETY_SEC = 0.03;
 // delivery cannot drain the audio timeline. The page-hidden budget is deeper
 // because Android/WebKit may throttle JS callbacks aggressively after lock.
 const MAX_PENDING_VISIBLE = 8;
-const MAX_PENDING_HIDDEN = 16;
+const MAX_PENDING_HIDDEN = 40;
 // Bounds decoded PCM at slow rates (0.2x stretches a 30s sentence to 150s).
 const MAX_AHEAD_SEC = 60;
+// While hidden, a much deeper scheduled-ahead window is worth the extra
+// decoded-PCM memory (small mono MP3-derived buffers): this is the ceiling
+// that was actually capping background resilience. Even with the fetch
+// pipeline queued far ahead (EdgeTTSClient's PIPELINE_LOOKAHEAD_HIDDEN), the
+// player refused to schedule more than MAX_AHEAD_SEC past the audio clock —
+// so once backgrounded (main-thread CPU/network throttling can slow fetch +
+// decode well beyond real time), the actual insurance buffer was still only
+// ~60s and a slow batch could still starve the timeline. Raising it while
+// hidden lets already-prepared audio queue up several minutes deep instead.
+const MAX_AHEAD_SEC_HIDDEN = 300;
+
+// Android's Chromium WebView throttles a backgrounded page's main thread
+// almost immediately on app-switch (no gradual ramp like a desktop hidden
+// tab), so the `visibilitychange`-triggered escalation to the *_HIDDEN
+// budgets above often fires too late: by the time `hidden` is observed, the
+// throttling has already started and there was no runway built up in
+// advance. Treat the native Android app as permanently at background-risk
+// (use the deep budgets even while visible) rather than reactively widening
+// them only after the OS has already started throttling. The extra decoded
+// PCM held in memory is the same small mono buffers already accepted for the
+// hidden case; the real cost is a few more speculative Edge fetches, which
+// TTS_WS_MAX_CONCURRENT still caps to 2 concurrent connections regardless of
+// how far ahead the lookahead reaches.
+export const isMobileBackgroundRiskPlatform = (): boolean =>
+  typeof navigator !== 'undefined' &&
+  process.env['NEXT_PUBLIC_APP_PLATFORM'] === 'tauri' &&
+  /android/.test(navigator.userAgent.toLowerCase());
 
 let sharedContext: TTSAudioContext | null = null;
 
@@ -309,15 +336,16 @@ export class WebAudioPlayer {
   }
 
   #isReadyForMore(session: PlayerSession): boolean {
+    const hidden =
+      (typeof document !== 'undefined' && document.visibilityState === 'hidden') ||
+      isMobileBackgroundRiskPlatform();
     const unfinished = session.chunks.reduce((n, c) => n + (c.ended ? 0 : 1), 0);
-    const limit =
-      typeof document !== 'undefined' && document.visibilityState === 'hidden'
-        ? MAX_PENDING_HIDDEN
-        : MAX_PENDING_VISIBLE;
+    const limit = hidden ? MAX_PENDING_HIDDEN : MAX_PENDING_VISIBLE;
     if (unfinished >= limit) return false;
     if (this.#ctx && session.chunks.length > 0) {
+      const maxAheadSec = hidden ? MAX_AHEAD_SEC_HIDDEN : MAX_AHEAD_SEC;
       const aheadSec = session.nextStartTime - this.#ctx.currentTime;
-      if (aheadSec >= MAX_AHEAD_SEC) return false;
+      if (aheadSec >= maxAheadSec) return false;
     }
     return true;
   }

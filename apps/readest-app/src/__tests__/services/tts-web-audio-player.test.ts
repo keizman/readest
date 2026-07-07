@@ -12,8 +12,25 @@ const setVisibility = (value: 'visible' | 'hidden') => {
   });
 };
 
+const ANDROID_UA =
+  'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36';
+const originalUA = navigator.userAgent;
+
+const setAndroidTauriApp = (enabled: boolean) => {
+  Object.defineProperty(navigator, 'userAgent', {
+    value: enabled ? ANDROID_UA : originalUA,
+    configurable: true,
+  });
+  if (enabled) {
+    process.env['NEXT_PUBLIC_APP_PLATFORM'] = 'tauri';
+  } else {
+    delete process.env['NEXT_PUBLIC_APP_PLATFORM'];
+  }
+};
+
 afterEach(() => {
   setVisibility('visible');
+  setAndroidTauriApp(false);
 });
 
 const setup = () => {
@@ -109,19 +126,19 @@ describe('WebAudioPlayer backpressure', () => {
     expect(await wait).toBe(true);
   });
 
-  test('hidden visibility deepens the pending-chunk budget to 16', async () => {
+  test('hidden visibility deepens the pending-chunk budget beyond the visible limit', async () => {
     setVisibility('hidden');
     const { player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
-    for (let i = 0; i < 4; i++) {
+    // 9 would block a visible session (MAX_PENDING_VISIBLE is 8); still ready hidden.
+    for (let i = 0; i < 9; i++) {
       player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
     }
     expect(await player.waitUntilReady(gen)).toBe(true);
   });
 
-  test('seconds cap blocks scheduling far ahead even under the chunk budget', async () => {
-    setVisibility('hidden');
+  test('seconds cap blocks scheduling far ahead even under the chunk budget while visible', async () => {
     const { ctx, player, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
@@ -133,7 +150,92 @@ describe('WebAudioPlayer backpressure', () => {
       return r;
     });
     await Promise.resolve();
-    expect(resolved).toBeNull(); // 61s ahead > 60s cap, though only 2 < 5 chunks
+    expect(resolved).toBeNull(); // 61s ahead > 60s visible cap, though only 2 < 8 chunks
+    await ctx.advanceTo(SAFETY + 30);
+    expect(await wait).toBe(true);
+  });
+
+  // Regression: background CPU/network throttling can slow a batch's
+  // fetch+decode well past real time. The visible-mode 60s seconds-cap was
+  // the actual ceiling on background resilience — no amount of upstream
+  // fetch lookahead helps if the player itself refuses to hold more than
+  // 60s of already-prepared audio queued up. Hidden sessions get a much
+  // deeper (300s) window instead.
+  test('hidden sessions allow scheduling far past the visible seconds cap', async () => {
+    setVisibility('hidden');
+    const { player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(30), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(31), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    // 61s ahead would block a visible session, but is well under the hidden cap.
+    expect(await player.waitUntilReady(gen)).toBe(true);
+  });
+
+  test('hidden sessions still cap scheduling once the deeper seconds budget is exhausted', async () => {
+    setVisibility('hidden');
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(150), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(151), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    let resolved: boolean | null = null;
+    const wait = player.waitUntilReady(gen).then((r) => {
+      resolved = r;
+      return r;
+    });
+    await Promise.resolve();
+    expect(resolved).toBeNull(); // 301s ahead > 300s hidden cap
+    await ctx.advanceTo(SAFETY + 150);
+    expect(await wait).toBe(true);
+  });
+
+  // Regression: Android's WebView can throttle the main thread within
+  // seconds of an app-switch, well before `visibilitychange` fires and
+  // before any buffer built up reactively. The native Android app is
+  // treated as always at that risk, so it gets the deep hidden-tier budgets
+  // even while `document.visibilityState` still reports 'visible'.
+  test('Android native app deepens the pending-chunk budget even while visible', async () => {
+    setAndroidTauriApp(true);
+    const { player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    // 9 would block a visible session (MAX_PENDING_VISIBLE is 8); still ready.
+    for (let i = 0; i < 9; i++) {
+      player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    }
+    expect(await player.waitUntilReady(gen)).toBe(true);
+  });
+
+  test('Android native app allows scheduling far past the visible seconds cap', async () => {
+    setAndroidTauriApp(true);
+    const { player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(30), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(31), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    // 61s ahead would block a visible session, but is well under the hidden cap.
+    expect(await player.waitUntilReady(gen)).toBe(true);
+  });
+
+  test('non-Android tauri app keeps the visible-tier budget (iOS has AVAudioSession instead)', async () => {
+    // Only android should opt into the always-deep budget; the same UA
+    // string without NEXT_PUBLIC_APP_PLATFORM=tauri means "mobile web", not
+    // the native app with a WebView subject to app-switch throttling.
+    Object.defineProperty(navigator, 'userAgent', { value: ANDROID_UA, configurable: true });
+    delete process.env['NEXT_PUBLIC_APP_PLATFORM'];
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(30), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.scheduleChunk(gen, makeBuffer(31), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    let resolved: boolean | null = null;
+    const wait = player.waitUntilReady(gen).then((r) => {
+      resolved = r;
+      return r;
+    });
+    await Promise.resolve();
+    expect(resolved).toBeNull();
     await ctx.advanceTo(SAFETY + 30);
     expect(await wait).toBe(true);
   });
