@@ -79,6 +79,7 @@ export const releaseUnblockAudio = (): void => {
 // ---------------------------------------------------------------------------
 
 type BridgeMediaSession = TauriMediaSession | MediaSession;
+type MediaMetadataText = Pick<MediaMetadataInit, 'title' | 'artist' | 'album'>;
 
 export class TTSMediaBridge {
   #resolveMediaSession: () => BridgeMediaSession | null;
@@ -90,6 +91,10 @@ export class TTSMediaBridge {
   #onSpeakMark: ((e: Event) => void) | null = null;
   #onStateChange: ((e: Event) => void) | null = null;
   #coverArtwork = '';
+  #lastMetadataSignature = '';
+  #lastArtworkSrc = '';
+  #webMetadata: MediaMetadata | null = null;
+  #webArtworkSrc = '';
   #privacyActive = false;
 
   constructor(resolveMediaSession: () => BridgeMediaSession | null = getMediaSession) {
@@ -116,12 +121,16 @@ export class TTSMediaBridge {
     this.#privacyActive = !!privacyTitle;
 
     if (this.#mediaSession instanceof TauriMediaSession) {
-      const artwork = await this.#resolveArtwork();
-      await this.#mediaSession.setActive({ active: true });
-      await this.#mediaSession.updateMetadata({
+      const initialMetadata = {
         title: privacyTitle || meta.title,
         artist: privacyTitle || meta.author,
         album: privacyTitle || meta.title,
+      };
+      this.#rememberMetadata(initialMetadata, this.#getArtworkSrc());
+      const artwork = await this.#resolveArtwork();
+      await this.#mediaSession.setActive({ active: true });
+      await this.#mediaSession.updateMetadata({
+        ...initialMetadata,
         artwork,
       });
     }
@@ -179,6 +188,10 @@ export class TTSMediaBridge {
     this.#lastSectionLabel = undefined;
     this.#previousSectionLabel = undefined;
     this.#coverArtwork = '';
+    this.#lastMetadataSignature = '';
+    this.#lastArtworkSrc = '';
+    this.#webMetadata = null;
+    this.#webArtworkSrc = '';
     this.#privacyActive = false;
   }
 
@@ -197,9 +210,31 @@ export class TTSMediaBridge {
     return isBookMasked(settings, bookHash) ? meta.title : null;
   }
 
+  #getArtworkSrc(): string {
+    return this.#meta?.coverImageUrl || '/icon.png';
+  }
+
+  #makeMetadataSignature(metadata: MediaMetadataText, artworkSrc: string): string {
+    return `${metadata.title}\u0000${metadata.artist}\u0000${metadata.album}\u0000${artworkSrc}`;
+  }
+
+  #rememberMetadata(
+    metadata: MediaMetadataText,
+    artworkSrc: string,
+  ): { unchanged: boolean; artworkChanged: boolean } {
+    const signature = this.#makeMetadataSignature(metadata, artworkSrc);
+    const unchanged = signature === this.#lastMetadataSignature;
+    const artworkChanged = artworkSrc !== this.#lastArtworkSrc;
+    if (!unchanged) {
+      this.#lastMetadataSignature = signature;
+      this.#lastArtworkSrc = artworkSrc;
+    }
+    return { unchanged, artworkChanged };
+  }
+
   async #resolveArtwork(): Promise<string> {
     if (this.#coverArtwork) return this.#coverArtwork;
-    const source = this.#meta?.coverImageUrl || '/icon.png';
+    const source = this.#getArtworkSrc();
     let artwork = '';
     try {
       artwork = await fetchImageAsBase64(source);
@@ -283,27 +318,38 @@ export class TTSMediaBridge {
       this.#previousSectionLabel = this.#lastSectionLabel;
     }
     if (!metadata.shouldUpdate) return;
+    const artworkSrc = this.#getArtworkSrc();
+    const { unchanged, artworkChanged } = this.#rememberMetadata(metadata, artworkSrc);
+    if (unchanged) return;
 
     if (mediaSession instanceof TauriMediaSession) {
       await mediaSession.updateMetadata({
         title: metadata.title,
         artist: metadata.artist,
         album: metadata.album,
-        artwork: privacyChanged ? await this.#resolveArtwork() : '',
+        artwork: artworkChanged || privacyChanged ? await this.#resolveArtwork() : '',
       });
     } else {
-      mediaSession.metadata = new MediaMetadata({
-        title: metadata.title,
-        artist: metadata.artist,
-        album: metadata.album,
-        artwork: [
-          {
-            src: meta.coverImageUrl || '/icon.png',
-            sizes: '512x512',
-            type: 'image/png',
-          },
-        ],
-      });
+      if (!this.#webMetadata || this.#webArtworkSrc !== artworkSrc) {
+        this.#webMetadata = new MediaMetadata({
+          title: metadata.title,
+          artist: metadata.artist,
+          album: metadata.album,
+          artwork: [
+            {
+              src: artworkSrc,
+              sizes: '512x512',
+              type: 'image/png',
+            },
+          ],
+        });
+        this.#webArtworkSrc = artworkSrc;
+      } else {
+        this.#webMetadata.title = metadata.title;
+        this.#webMetadata.artist = metadata.artist;
+        this.#webMetadata.album = metadata.album;
+      }
+      mediaSession.metadata = this.#webMetadata;
     }
   }
 

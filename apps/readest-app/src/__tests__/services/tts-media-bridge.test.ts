@@ -5,6 +5,7 @@ vi.mock('@/utils/image', () => ({
 }));
 
 import { TTSMediaBridge } from '@/services/tts/ttsMediaBridge';
+import { TauriMediaSession } from '@/libs/mediaSession';
 import { useSettingsStore } from '@/store/settingsStore';
 import type { TTSController } from '@/services/tts/TTSController';
 
@@ -31,6 +32,7 @@ class FakeController extends EventTarget {
 
 interface FakeWebMediaSession {
   metadata: unknown;
+  metadataSets: unknown[];
   playbackState: string;
   handlers: Map<string, (details: MediaSessionActionDetails) => void>;
   setActionHandler: ReturnType<typeof vi.fn>;
@@ -39,8 +41,9 @@ interface FakeWebMediaSession {
 
 const makeFakeMediaSession = (): FakeWebMediaSession => {
   const handlers = new Map<string, (details: MediaSessionActionDetails) => void>();
-  return {
-    metadata: null,
+  let metadata: unknown = null;
+  const session = {
+    metadataSets: [] as unknown[],
     playbackState: 'none',
     handlers,
     setActionHandler: vi.fn(
@@ -51,6 +54,16 @@ const makeFakeMediaSession = (): FakeWebMediaSession => {
     ),
     setPositionState: vi.fn(),
   };
+  Object.defineProperty(session, 'metadata', {
+    get: () => metadata,
+    set: (value: unknown) => {
+      metadata = value;
+      session.metadataSets.push(value);
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  return session as FakeWebMediaSession;
 };
 
 const meta = (overrides = {}) => ({
@@ -191,5 +204,78 @@ describe('TTSMediaBridge', () => {
     expect(metadata.artist).toBe('Book-123456');
     expect(metadata.album).toBe('Book-123456');
     expect(metadata.artwork?.[0]?.src).toBe('cover.png');
+  });
+
+  test('library privacy does not resend identical lock-screen metadata on every mark', async () => {
+    useSettingsStore.setState({
+      settings: {
+        libraryPrivacyModeEnabled: true,
+        privateBookTitleAliases: {
+          'hash-abc': { title: 'Alice', alias: 'Book-123456' },
+        },
+      } as never,
+    });
+    await bridge.bind(
+      controller as unknown as TTSController,
+      meta({ bookKey: 'hash-abc-reader', bookHash: 'hash-abc', coverImageUrl: 'cover.png' }),
+    );
+
+    controller.emitMark('First sensitive sentence.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    controller.emitMark('Second sensitive sentence.', '1');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(fake.metadataSets).toHaveLength(1);
+  });
+
+  test('web media session reuses the same metadata object for text-only updates', async () => {
+    await bridge.bind(
+      controller as unknown as TTSController,
+      meta({ bookKey: 'hash-abc-reader', coverImageUrl: 'cover.png' }),
+    );
+
+    controller.emitMark('First visible sentence.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    const firstMetadata = fake.metadata as FakeMediaMetadata;
+    controller.emitMark('Second visible sentence.', '1');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(fake.metadataSets).toHaveLength(2);
+    expect(fake.metadataSets[1]).toBe(firstMetadata);
+    expect((fake.metadata as FakeMediaMetadata).title).toBe('Second visible sentence.');
+    expect((fake.metadata as FakeMediaMetadata).artwork?.[0]?.src).toBe('cover.png');
+  });
+
+  test('tauri privacy metadata is sent once while the masked fields stay unchanged', async () => {
+    useSettingsStore.setState({
+      settings: {
+        libraryPrivacyModeEnabled: true,
+        privateBookTitleAliases: {
+          'hash-abc': { title: 'Alice', alias: 'Book-123456' },
+        },
+      } as never,
+    });
+    const tauri = new TauriMediaSession();
+    const updateMetadata = vi.spyOn(tauri, 'updateMetadata').mockResolvedValue(undefined);
+    vi.spyOn(tauri, 'updatePlaybackState').mockResolvedValue(undefined);
+    vi.spyOn(tauri, 'setActive').mockResolvedValue(undefined);
+    const tauriBridge = new TTSMediaBridge(() => tauri);
+    await tauriBridge.bind(
+      controller as unknown as TTSController,
+      meta({ bookKey: 'hash-abc-reader', bookHash: 'hash-abc', coverImageUrl: 'cover.png' }),
+    );
+
+    controller.emitMark('First sensitive sentence.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+    controller.emitMark('Second sensitive sentence.', '1');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(updateMetadata).toHaveBeenCalledTimes(1);
+    expect(updateMetadata).toHaveBeenLastCalledWith({
+      title: 'Book-123456',
+      artist: 'Book-123456',
+      album: 'Book-123456',
+      artwork: 'data:image/png;base64,x',
+    });
   });
 });
