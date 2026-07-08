@@ -546,6 +546,46 @@ describe('EdgeTTSClient', () => {
       }
     });
 
+    test('releases normal preload after the first batch while later batches keep warming', async () => {
+      await client.init();
+      parsedMarks = [
+        { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+        { name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
+      ];
+      const resolvers: Array<(value: MockAudioData) => void> = [];
+      createAudioDataBehavior = vi.fn(
+        () =>
+          new Promise<MockAudioData>((resolve) => {
+            resolvers.push(resolve);
+          }),
+      );
+
+      const iterator = client.speakMarks(
+        [
+          { offset: 0, name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
+          { offset: 120, name: '1', text: `${'b'.repeat(119)}.`, language: 'en' },
+        ],
+        new AbortController().signal,
+        true,
+        false,
+      );
+      const pending = iterator.next();
+
+      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(2));
+      resolvers[0]!({ data: new ArrayBuffer(8), boundaries: [] });
+      try {
+        await expect(
+          Promise.race([
+            pending.then(() => 'released'),
+            new Promise((resolve) => setTimeout(() => resolve('blocked'), 20)),
+          ]),
+        ).resolves.toBe('released');
+      } finally {
+        resolvers[1]?.({ data: new ArrayBuffer(8), boundaries: [] });
+        await pending.catch(() => {});
+      }
+    });
+
     test('skips pure Chinese ellipsis without requesting Edge audio', async () => {
       await client.init();
       parsedMarks = [{ name: '0', text: '……', language: 'zh' }];

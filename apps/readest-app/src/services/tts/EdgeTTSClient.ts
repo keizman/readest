@@ -399,11 +399,11 @@ export class EdgeTTSClient implements TTSClient {
     // back to playback-time one-by-one synthesis.
     const batches = buildBatches(marks, startup);
     const criticalCount = this.#criticalPreloadBatches(batches.length);
-    // Startup playback should unblock as soon as the deliberately small first
-    // batch is warm. Start the next critical batch immediately so cache fill is
-    // still pipelined, but do not let a slow/timeout second WS request delay
-    // first audio indefinitely.
-    const blockingCount = startup ? Math.min(1, criticalCount) : criticalCount;
+    // Playback should unblock as soon as the first batch is warm. Start the
+    // next critical batch immediately so cache fill is still pipelined, but do
+    // not let a slow/timeout second WS request add to the audible gap before
+    // the current sentence/paragraph can start.
+    const blockingCount = Math.min(1, criticalCount);
     const preloadBatch = async (batch: TTSMark[]) => {
       const voiceLang = batch[0]!.language;
       const voiceId = await this.getVoiceIdFromLang(voiceLang);

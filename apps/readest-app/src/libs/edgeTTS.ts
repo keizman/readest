@@ -429,16 +429,57 @@ export class EdgeSpeechTTS {
   // its own WSS connection for the same audio.
   private static inflight = new Map<
     string,
-    Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }>
+    { promise: Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> }
   >();
   // Self-hosted HTTPS TTS cannot absorb concurrent synthesis; serialize network
   // fetches so preload, playback, and lookahead share one in-flight request.
   private static httpsRequestQueue: Promise<unknown> = Promise.resolve();
   private static wsInFlight = 0;
-  private static wsWaiters: Array<{ wake: () => boolean; priority: WsSlotPriority }> = [];
+  private static wsWaiters: Array<{
+    wake: () => boolean;
+    priority: WsSlotPriority;
+    cacheKey?: string;
+  }> = [];
 
   private static rejectIfAborted(signal?: AbortSignal): void {
     if (signal?.aborted) throw wsAbortError(signal);
+  }
+
+  private static awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    EdgeSpeechTTS.rejectIfAborted(signal);
+    if (!signal) return promise;
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => signal.removeEventListener('abort', onAbort);
+      const finishResolve = (value: T) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+      const finishReject = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const onAbort = () => finishReject(wsAbortError(signal));
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(finishResolve, finishReject);
+    });
+  }
+
+  private static promoteWsWaiter(cacheKey: string): void {
+    const index = EdgeSpeechTTS.wsWaiters.findIndex(
+      (waiter) => waiter.cacheKey === cacheKey && waiter.priority === 'low',
+    );
+    if (index < 0) return;
+    const [entry] = EdgeSpeechTTS.wsWaiters.splice(index, 1);
+    if (!entry) return;
+    entry.priority = 'high';
+    const insertAt = EdgeSpeechTTS.wsWaiters.findIndex((waiter) => waiter.priority === 'low');
+    if (insertAt === -1) EdgeSpeechTTS.wsWaiters.push(entry);
+    else EdgeSpeechTTS.wsWaiters.splice(insertAt, 0, entry);
   }
 
   private static enqueueHttpsRequest<T>(fn: () => Promise<T>): Promise<T> {
@@ -453,6 +494,7 @@ export class EdgeSpeechTTS {
   private static acquireWsSlot(
     signal?: AbortSignal,
     priority: WsSlotPriority = 'low',
+    cacheKey?: string,
   ): Promise<void> {
     EdgeSpeechTTS.rejectIfAborted(signal);
     if (EdgeSpeechTTS.wsInFlight < TTS_WS_MAX_CONCURRENT) {
@@ -461,7 +503,11 @@ export class EdgeSpeechTTS {
     }
     return new Promise((resolve, reject) => {
       let aborted = false;
-      let entry: { wake: () => boolean; priority: WsSlotPriority } | null = null;
+      let entry: {
+        wake: () => boolean;
+        priority: WsSlotPriority;
+        cacheKey?: string;
+      } | null = null;
       const onAbort = () => {
         aborted = true;
         if (entry) {
@@ -477,17 +523,18 @@ export class EdgeSpeechTTS {
         resolve();
         return true;
       };
-      entry = { wake, priority };
+      entry = { wake, priority, cacheKey };
+      const queuedEntry = entry;
       signal?.addEventListener('abort', onAbort, { once: true });
       // 'high' priority (the sentence about to play) jumps ahead of any
       // queued background prefetch so an urgent fetch never waits behind
       // unrelated lookahead work fighting for the same WS slots.
       if (priority === 'high') {
         const insertAt = EdgeSpeechTTS.wsWaiters.findIndex((w) => w.priority === 'low');
-        if (insertAt === -1) EdgeSpeechTTS.wsWaiters.push(entry);
-        else EdgeSpeechTTS.wsWaiters.splice(insertAt, 0, entry);
+        if (insertAt === -1) EdgeSpeechTTS.wsWaiters.push(queuedEntry);
+        else EdgeSpeechTTS.wsWaiters.splice(insertAt, 0, queuedEntry);
       } else {
-        EdgeSpeechTTS.wsWaiters.push(entry);
+        EdgeSpeechTTS.wsWaiters.push(queuedEntry);
       }
     });
   }
@@ -504,9 +551,12 @@ export class EdgeSpeechTTS {
     fn: () => Promise<T>,
     signal?: AbortSignal,
     priority: WsSlotPriority = 'low',
+    cacheKey?: string,
   ): Promise<T> {
-    return EdgeSpeechTTS.acquireWsSlot(signal, priority).then(async () => {
-      EdgeSpeechTTS.rejectIfAborted(signal);
+    // The consumer signal gates slot acquisition (queued waiters are dropped on
+    // abort) but must not tear down a shared inflight fetch once the slot is
+    // held — callers detach via awaitWithAbort on the inflight promise instead.
+    return EdgeSpeechTTS.acquireWsSlot(signal, priority, cacheKey).then(async () => {
       try {
         return await fn();
       } finally {
@@ -1018,9 +1068,11 @@ export class EdgeSpeechTTS {
       return { blob: cachedBlob, boundaries: EdgeSpeechTTS.boundariesCache.get(cacheKey) ?? [] };
     }
     const pending = EdgeSpeechTTS.inflight.get(cacheKey);
-    if (pending) return pending;
+    if (pending) {
+      if (priority === 'high') EdgeSpeechTTS.promoteWsWaiter(cacheKey);
+      return EdgeSpeechTTS.awaitWithAbort(pending.promise, signal);
+    }
     const fetchFromNetwork = async (): Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> => {
-      EdgeSpeechTTS.rejectIfAborted(signal);
       const cachedAfterQueue = EdgeSpeechTTS.audioCache.get(cacheKey);
       if (cachedAfterQueue) {
         return {
@@ -1028,9 +1080,16 @@ export class EdgeSpeechTTS {
           boundaries: EdgeSpeechTTS.boundariesCache.get(cacheKey) ?? [],
         };
       }
-      const { response, boundaries } = await this.#fetchEdgeSpeech(payload, signal);
+      const { response, boundaries } = await this.#fetchEdgeSpeech(payload);
       const arrayBuffer = await response.arrayBuffer();
       const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+      const previousBlob = EdgeSpeechTTS.audioCache.get(cacheKey);
+      if (previousBlob) {
+        EdgeSpeechTTS.audioCacheBytes = Math.max(
+          0,
+          EdgeSpeechTTS.audioCacheBytes - previousBlob.size,
+        );
+      }
       EdgeSpeechTTS.audioCache.set(cacheKey, blob);
       EdgeSpeechTTS.audioCacheBytes += blob.size;
       EdgeSpeechTTS.boundariesCache.set(cacheKey, boundaries);
@@ -1041,14 +1100,19 @@ export class EdgeSpeechTTS {
       this.protocol === 'https'
         ? EdgeSpeechTTS.enqueueHttpsRequest(fetchFromNetwork)
         : this.wsTarget === 'self-hosted'
-          ? EdgeSpeechTTS.runWithWsSlot(fetchFromNetwork, signal, priority)
+          ? EdgeSpeechTTS.runWithWsSlot(fetchFromNetwork, signal, priority, cacheKey)
           : fetchFromNetwork();
-    EdgeSpeechTTS.inflight.set(cacheKey, promise);
-    try {
-      return await promise;
-    } finally {
-      EdgeSpeechTTS.inflight.delete(cacheKey);
-    }
+    const entry = { promise };
+    EdgeSpeechTTS.inflight.set(cacheKey, entry);
+    promise.then(
+      () => {
+        if (EdgeSpeechTTS.inflight.get(cacheKey) === entry) EdgeSpeechTTS.inflight.delete(cacheKey);
+      },
+      () => {
+        if (EdgeSpeechTTS.inflight.get(cacheKey) === entry) EdgeSpeechTTS.inflight.delete(cacheKey);
+      },
+    );
+    return EdgeSpeechTTS.awaitWithAbort(promise, signal);
   }
 
   // Audio bytes for Web Audio decoding. The cache keeps a Blob and every call
@@ -1062,6 +1126,9 @@ export class EdgeSpeechTTS {
     priority: WsSlotPriority = 'low',
   ): Promise<{ data: ArrayBuffer; boundaries: TTSWordBoundary[] }> {
     const { blob, boundaries } = await this.#fetchAndCache(payload, signal, priority);
-    return { data: await blob.arrayBuffer(), boundaries };
+    EdgeSpeechTTS.rejectIfAborted(signal);
+    const data = await blob.arrayBuffer();
+    EdgeSpeechTTS.rejectIfAborted(signal);
+    return { data, boundaries };
   }
 }
