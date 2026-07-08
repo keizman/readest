@@ -96,6 +96,7 @@ export class TTSMediaBridge {
   #webMetadata: MediaMetadata | null = null;
   #webArtworkSrc = '';
   #privacyActive = false;
+  #mediaPlaybackPlaying = false;
 
   constructor(resolveMediaSession: () => BridgeMediaSession | null = getMediaSession) {
     this.#resolveMediaSession = resolveMediaSession;
@@ -115,6 +116,7 @@ export class TTSMediaBridge {
     this.unbind();
     this.#controller = controller;
     this.#meta = meta;
+    this.#mediaPlaybackPlaying = controller.state === 'playing';
     this.#mediaSession = this.#resolveMediaSession();
     if (!this.#mediaSession) return;
     const privacyTitle = this.#getPrivacyTitle();
@@ -132,7 +134,6 @@ export class TTSMediaBridge {
       await this.#mediaSession.updateMetadata({
         ...initialMetadata,
         artwork,
-        refreshNotification: true,
       });
     }
 
@@ -194,6 +195,7 @@ export class TTSMediaBridge {
     this.#webMetadata = null;
     this.#webArtworkSrc = '';
     this.#privacyActive = false;
+    this.#mediaPlaybackPlaying = false;
   }
 
   async refreshMetadata(): Promise<void> {
@@ -324,15 +326,14 @@ export class TTSMediaBridge {
     if (unchanged) return;
 
     if (mediaSession instanceof TauriMediaSession) {
-      const shouldRefreshNotification = artworkChanged || privacyChanged;
+      const shouldSendArtwork = artworkChanged || privacyChanged;
       const payload = {
         title: metadata.title,
         artist: metadata.artist,
         album: metadata.album,
-        refreshNotification: shouldRefreshNotification,
       } as const;
       await mediaSession.updateMetadata(
-        shouldRefreshNotification ? { ...payload, artwork: await this.#resolveArtwork() } : payload,
+        shouldSendArtwork ? { ...payload, artwork: await this.#resolveArtwork() } : payload,
       );
     } else {
       if (!this.#webMetadata || this.#webArtworkSrc !== artworkSrc) {
@@ -360,6 +361,23 @@ export class TTSMediaBridge {
 
   // Clamped, never skipped: skipping when the position overshoots an
   // estimated duration would freeze the lock-screen scrubber.
+  #getMediaPlaybackPlaying(ctrl: TTSController): boolean {
+    if (ctrl.state === 'playing') {
+      this.#mediaPlaybackPlaying = true;
+      return true;
+    }
+    if (ctrl.state === 'stopped' && !ctrl.terminated) {
+      // Paragraph/chapter handoff briefly reports stopped while the next
+      // utterance is queued. Keep the OS media session in the previous playing
+      // state so Android does not emit a pause/play pulse between sentences.
+      return this.#mediaPlaybackPlaying;
+    }
+    if (ctrl.state.includes('paused') || ctrl.terminated || ctrl.state === 'stopped') {
+      this.#mediaPlaybackPlaying = false;
+    }
+    return this.#mediaPlaybackPlaying;
+  }
+
   async #updatePositionState(): Promise<void> {
     const mediaSession = this.#mediaSession;
     const ctrl = this.#controller;
@@ -370,10 +388,9 @@ export class TTSMediaBridge {
     const position = Math.min(Math.max(info.position, 0), info.duration);
     if (mediaSession instanceof TauriMediaSession) {
       await mediaSession.updatePlaybackState({
-        playing: ctrl.state === 'playing',
+        playing: this.#getMediaPlaybackPlaying(ctrl),
         position: Math.round(position * 1000),
         duration: Math.round(info.duration * 1000),
-        refreshNotification: false,
       });
     } else if ('setPositionState' in mediaSession) {
       try {
@@ -392,13 +409,11 @@ export class TTSMediaBridge {
     // Transit 'stopped' flickers on every paragraph advance; only surface
     // playing/paused flips to the OS.
     if (ctrl.state === 'stopped' && !ctrl.terminated) return;
+    const playing = this.#getMediaPlaybackPlaying(ctrl);
     if (mediaSession instanceof TauriMediaSession) {
-      await mediaSession.updatePlaybackState({
-        playing: ctrl.state === 'playing',
-        refreshNotification: true,
-      });
+      await mediaSession.updatePlaybackState({ playing });
     } else {
-      mediaSession.playbackState = ctrl.state === 'playing' ? 'playing' : 'paused';
+      mediaSession.playbackState = playing ? 'playing' : 'paused';
     }
   }
 }

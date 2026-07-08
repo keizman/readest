@@ -1,5 +1,5 @@
 import { describe, test, expect, vi } from 'vitest';
-import { LRUCache } from '@/utils/lru';
+import { FIFOCache, LRUCache } from '@/utils/lru';
 
 describe('LRUCache', () => {
   describe('constructor', () => {
@@ -479,5 +479,87 @@ describe('LRUCache', () => {
         ['d', 4],
       ]);
     });
+  });
+});
+
+describe('FIFOCache', () => {
+  test('evicts oldest-inserted entry regardless of access frequency', () => {
+    const cache = new FIFOCache<string, number>(3);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    cache.set('c', 3);
+    // Access 'a' — in LRU this would protect it, in FIFO it does not
+    cache.get('a');
+    cache.get('a');
+    cache.get('a');
+    cache.set('d', 4); // should evict 'a' (oldest insertion), not 'b' or 'c'
+    expect(cache.has('a')).toBe(false);
+    expect(cache.has('b')).toBe(true);
+    expect(cache.has('c')).toBe(true);
+    expect(cache.has('d')).toBe(true);
+  });
+
+  test('prefetched future entries survive while played entries get evicted', () => {
+    // Simulates TTS playback: items added in order 1..5, then 1 and 2 are
+    // accessed (played). When 6 is added, 1 must be evicted, not 5.
+    const cache = new FIFOCache<number, string>(5);
+    for (let i = 1; i <= 5; i++) cache.set(i, `s${i}`);
+    cache.get(1); // "play" sentence 1
+    cache.get(2); // "play" sentence 2
+    cache.set(6, 's6'); // evicts 1 (oldest insertion)
+    expect(cache.has(1)).toBe(false);
+    expect(cache.has(5)).toBe(true); // future sentence survives
+    expect(cache.has(6)).toBe(true);
+  });
+
+  test('get returns without promoting: eviction order is pure insertion order', () => {
+    const evicted: number[] = [];
+    const cache = new FIFOCache<number, string>(2, (k) => evicted.push(k));
+    cache.set(1, 'a');
+    cache.set(2, 'b');
+    cache.get(1); // no promotion
+    cache.set(3, 'c'); // evicts 1 (first inserted), not 2
+    cache.set(4, 'd'); // evicts 2
+    expect(evicted).toEqual([1, 2]);
+  });
+
+  test('set on existing key updates value in-place without changing order', () => {
+    const cache = new FIFOCache<string, number>(2);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    cache.set('a', 99); // update — should NOT promote 'a'
+    cache.set('c', 3); // should evict 'a' (still oldest)
+    expect(cache.has('a')).toBe(false);
+    expect(cache.has('b')).toBe(true);
+    expect(cache.has('c')).toBe(true);
+  });
+
+  test('entries returns newest-first (mirrors LRUCache API)', () => {
+    const cache = new FIFOCache<string, number>(3);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    cache.set('c', 3);
+    expect(cache.entries()).toEqual([
+      ['c', 3],
+      ['b', 2],
+      ['a', 1],
+    ]);
+  });
+
+  test('onEvict callback fires on capacity eviction and explicit delete', () => {
+    const onEvict = vi.fn();
+    const cache = new FIFOCache<string, number>(2, onEvict);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    cache.set('c', 3); // evicts 'a'
+    expect(onEvict).toHaveBeenCalledWith('a', 1);
+    cache.delete('b');
+    expect(onEvict).toHaveBeenCalledWith('b', 2);
+    expect(onEvict).toHaveBeenCalledTimes(2);
+  });
+
+  test('throws when capacity is 0 or negative', () => {
+    expect(() => new FIFOCache<string, number>(0)).toThrow();
+    expect(() => new FIFOCache<string, number>(-1)).toThrow();
   });
 });

@@ -902,6 +902,11 @@ export class TTSController extends EventTarget {
           this.#consecutiveSpeakErrors = 0;
           resolve();
           await this.forward();
+        } else if (lastCode === 'interrupted') {
+          // Audio output device lost (e.g. Bluetooth headphones disconnected):
+          // stop cleanly rather than continuing on a different output device.
+          resolve();
+          await this.stop();
         } else if (
           lastCode === 'error' &&
           (canSkipOnError || canSkipEdgeError) &&

@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -30,14 +31,12 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import app.tauri.plugin.JSObject
-import kotlinx.coroutines.*
 
 class MediaPlaybackService : MediaBrowserServiceCompat() {
     private var mediaSession: MediaSessionCompat? = null
     private lateinit var player: ExoPlayer
     private lateinit var stateBuilder: PlaybackStateCompat.Builder
     private lateinit var audioManager: AudioManager
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // True only between session activation (TTS playback started) and
     // deactivation. Android Auto can bind this service at any time to browse,
@@ -74,6 +73,15 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         var currentArtist: String = "Reading your content"
         var currentArtwork: Bitmap? = null
 
+        // Estimated section timeline (Edge/WebAudio engine only) in milliseconds.
+        // Drives the lock-screen scrubber: position is the thumb, duration is
+        // the track length. Native TextToSpeech has no timeline and leaves
+        // duration at 0, so the scrubber simply does not appear there.
+        @Volatile
+        var currentPositionMs: Long = 0L
+        @Volatile
+        var currentDurationMs: Long = 0L
+
         @Volatile
         private var instance: MediaPlaybackService? = null
 
@@ -85,6 +93,32 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         fun requestDeactivation() {
             val service = instance ?: return
             Handler(Looper.getMainLooper()).post { service.deactivateSession() }
+        }
+
+        // Deliver metadata/state updates to the live service in-process rather
+        // than via startService(): once the app is backgrounded, startService()
+        // is rejected with "app is in background" (the Android 8+ background
+        // service-start restriction), which silently dropped every playback
+        // update and can visibly recreate the lock-screen media card. A direct
+        // call on the running instance is not a service start, so it is exempt.
+        // The statics are refreshed regardless so a not-yet-created service
+        // picks them up when it activates.
+        fun pushMetadata(title: String, artist: String, artwork: Bitmap?) {
+            currentTitle = title
+            currentArtist = artist
+            if (artwork != null) currentArtwork = artwork
+            val service = instance ?: return
+            Handler(Looper.getMainLooper()).post { service.applyMetadata() }
+        }
+
+        // position/duration are null when the update only reports a play/pause
+        // flip (that payload omits them); keep the last known values so the
+        // scrubber does not snap back to 0 on pause.
+        fun pushPlaybackState(playing: Boolean, position: Long?, duration: Long?) {
+            if (position != null) currentPositionMs = position
+            if (duration != null) currentDurationMs = duration
+            val service = instance ?: return
+            Handler(Looper.getMainLooper()).post { service.applyPlaybackState(playing) }
         }
     }
 
@@ -109,6 +143,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
                 PlaybackStateCompat.ACTION_STOP or
                 PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
                 PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                PlaybackStateCompat.ACTION_SEEK_TO or
                 PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
                 PlaybackStateCompat.ACTION_PLAY_FROM_SEARCH
             )
@@ -200,6 +235,18 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
             pluginEventTrigger?.invoke("media-session-previous", JSObject())
         }
 
+        // Scrubber drag: hand the target back to the JS controller, which owns
+        // the real audio timeline (seekToTime), and optimistically move the
+        // thumb so the lock screen feels responsive before the seek lands.
+        override fun onSeekTo(pos: Long) {
+            currentPositionMs = pos
+            pluginEventTrigger?.invoke("media-session-seek", JSObject().apply { put("position", pos) })
+            val state = if (player.isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+            mediaSession?.setPlaybackState(
+                stateBuilder.setState(state, pos, 1f).build()
+            )
+        }
+
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
             onPlay()
         }
@@ -218,12 +265,78 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         showNotification(state)
     }
 
+    // Last section duration written to the session metadata; the scrubber only
+    // needs a metadata refresh when it actually changes (per section), not on
+    // every position tick.
+    private var appliedDurationMs: Long = -1L
+
+    private fun buildMediaMetadata(): MediaMetadataCompat {
+        return MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, currentTitle)
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentArtist)
+            .putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, currentArtwork)
+            .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, currentDurationMs)
+            .build()
+    }
+
+    // Push the current statics into the live session + notification. Invoked
+    // in-process from Companion.pushMetadata on the main thread.
+    private fun applyMetadata() {
+        appliedDurationMs = currentDurationMs
+        mediaSession?.setMetadata(buildMediaMetadata())
+        notifyChildrenChanged(MEDIA_ROOT_ID)
+        if (sessionActive) {
+            showNotification(
+                if (player.isPlaying) PlaybackStateCompat.STATE_PLAYING
+                else PlaybackStateCompat.STATE_PAUSED
+            )
+        }
+    }
+
+    // Reflect the WebView/TextToSpeech playback state onto the silent
+    // keep-alive player, the media session, and the notification. Invoked
+    // in-process from Companion.pushPlaybackState on the main thread; reads the
+    // preserved position/duration statics.
+    private fun applyPlaybackState(playing: Boolean) {
+        if (!sessionActive) return
+        if (playing && !player.isPlaying) {
+            player.play()
+        } else if (!playing && player.isPlaying) {
+            player.pause()
+        }
+        player.seekTo(currentPositionMs)
+        val state = if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+        mediaSession?.setPlaybackState(
+            stateBuilder.setState(state, currentPositionMs, 1f).build()
+        )
+        // Refresh the scrubber length when the section duration changes.
+        if (currentDurationMs != appliedDurationMs) {
+            appliedDurationMs = currentDurationMs
+            mediaSession?.setMetadata(buildMediaMetadata())
+        }
+        showNotification(state)
+    }
+
     private fun showNotification(playbackState: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(CHANNEL_ID, "Media Controls", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
-        startForeground(NOTIFICATION_ID, buildNotification(playbackState))
+        // Promote with an explicit mediaPlayback type (required/robust on
+        // targetSdk 34+); ServiceCompat handles the pre-Q signature. A throw
+        // here means the service never becomes foreground and the OS reclaims
+        // it on idle, so surface it loudly instead of swallowing.
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                buildNotification(playbackState),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            )
+            Log.d("MediaPlaybackService", "startForeground ok (state=$playbackState)")
+        } catch (e: Exception) {
+            Log.e("MediaPlaybackService", "startForeground failed", e)
+        }
     }
 
     private fun buildNotification(playbackState: Int): Notification {
@@ -333,60 +446,6 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
                     stopSelf(startId)
                 }
             }
-            "UPDATE_METADATA" -> {
-                currentTitle = intent.getStringExtra("title") ?: currentTitle
-                currentArtist = intent.getStringExtra("artist") ?: currentArtist
-                val refreshNotification = intent.getBooleanExtra("refreshNotification", true)
-                // Unmarshal the artwork Bitmap off the main thread; copying its
-                // pixel buffer out of the Parcel can stall the UI thread and trip
-                // an ANR for large covers.
-                serviceScope.launch {
-                    val newArtwork = withContext(Dispatchers.Default) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra("artwork", Bitmap::class.java)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra("artwork")
-                        }
-                    }
-                    if (newArtwork != null) {
-                        currentArtwork = newArtwork
-                    }
-                    if (!isActive) return@launch
-                    val metadataBuilder = MediaMetadataCompat.Builder()
-                        .putString(MediaMetadataCompat.METADATA_KEY_TITLE, currentTitle)
-                        .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentArtist)
-                        .putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, currentArtwork)
-                    mediaSession?.setMetadata(metadataBuilder.build())
-                    notifyChildrenChanged(MEDIA_ROOT_ID)
-                    if (sessionActive && refreshNotification) {
-                        showNotification(if (player.isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED)
-                    }
-                }
-            }
-            "UPDATE_PLAYBACK_STATE" -> {
-                if (sessionActive) {
-                    val isPlaying = intent.getBooleanExtra("playing", false)
-                    val position = intent.getLongExtra("position", 0L) // in milliseconds
-                    val duration = intent.getLongExtra("duration", 0L) // in milliseconds
-                    val refreshNotification = intent.getBooleanExtra("refreshNotification", true)
-
-                    if (isPlaying && !player.isPlaying) {
-                        player.play()
-                    } else if (!isPlaying && player.isPlaying) {
-                        player.pause()
-                    }
-                    player.seekTo(position)
-
-                    val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
-                    mediaSession?.setPlaybackState(
-                        stateBuilder.setState(state, position, 1f).build()
-                    )
-                    if (refreshNotification) {
-                        showNotification(state)
-                    }
-                }
-            }
         }
 
         return super.onStartCommand(intent, flags, startId)
@@ -394,7 +453,6 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
 
     override fun onDestroy() {
         instance = null
-        serviceScope.cancel()
         super.onDestroy()
         player.release()
         mediaSession?.release()

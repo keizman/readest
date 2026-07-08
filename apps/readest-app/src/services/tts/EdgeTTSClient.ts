@@ -119,6 +119,7 @@ type SpeakQueueEvent =
   | { kind: 'chunk-start'; index: number }
   | { kind: 'chunk-skip'; markName: string }
   | { kind: 'session-end' }
+  | { kind: 'interrupted' }
   | { kind: 'error'; message: string };
 
 type BatchPrepareResult =
@@ -319,6 +320,8 @@ export class EdgeTTSClient implements TTSClient {
         queue.push({ kind: 'chunk-start', index: event.chunkIndex });
       } else if (event.type === 'session-end') {
         queue.push({ kind: 'session-end' });
+      } else if (event.type === 'audio-interrupted') {
+        queue.push({ kind: 'interrupted' });
       } else {
         queue.push({ kind: 'error', message: event.message });
       }
@@ -360,6 +363,9 @@ export class EdgeTTSClient implements TTSClient {
           } as TTSMessageEvent;
         } else if (event.kind === 'session-end') {
           yield { code: 'end', message: 'Speak finished' } as TTSMessageEvent;
+          return;
+        } else if (event.kind === 'interrupted') {
+          yield { code: 'interrupted' } as TTSMessageEvent;
           return;
         } else {
           yield { code: 'error', message: event.message } as TTSMessageEvent;

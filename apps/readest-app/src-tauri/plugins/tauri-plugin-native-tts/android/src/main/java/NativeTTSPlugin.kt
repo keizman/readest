@@ -83,7 +83,6 @@ class UpdateMediaSessionMetadataArgs {
   var artist: String? = null
   var album: String? = null
   var artwork: String? = null
-  var refreshNotification: Boolean? = null
 }
 
 @InvokeArg
@@ -91,7 +90,6 @@ class UpdateMediaSessionStateArgs {
   var playing: Boolean? = null
   var position: Int? = null // in milliseconds
   var duration: Int? = null // in milliseconds
-  var refreshNotification: Boolean? = null
 }
 
 @InvokeArg
@@ -499,21 +497,14 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         val args = invoke.parseArgs(UpdateMediaSessionMetadataArgs::class.java)
         val title = args.title ?: ""
         val artist = args.artist ?: ""
-        val album = args.album ?: ""
-        val refreshNotification = args.refreshNotification ?: true
 
         coroutineScope.launch {
             try {
                 val artworkBitmap = args.artwork?.let { loadArtworkFromUrl(it) }
-                val intent = Intent(activity, MediaPlaybackService::class.java).apply {
-                    action = "UPDATE_METADATA"
-                    putExtra("title", title)
-                    putExtra("artist", artist)
-                    putExtra("album", album)
-                    putExtra("artwork", artworkBitmap)
-                    putExtra("refreshNotification", refreshNotification)
-                }
-                activity.startService(intent)
+                // In-process update on the running service; never startService()
+                // — that throws "app is in background" once backgrounded and
+                // can visibly tear down/recreate the media card on lock screen.
+                MediaPlaybackService.pushMetadata(title, artist, artworkBitmap)
                 invoke.resolve()
             } catch (e: Exception) {
                 invoke.reject("Failed to update metadata: ${e.message}")
@@ -523,21 +514,19 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun update_media_session_state(invoke: Invoke) {
-        var args = invoke.parseArgs(UpdateMediaSessionStateArgs::class.java)
+        val args = invoke.parseArgs(UpdateMediaSessionStateArgs::class.java)
         val isPlaying = args.playing ?: false
-        val position = args.position ?: 0
-        val duration = args.duration ?: 0
-        val refreshNotification = args.refreshNotification ?: true
 
         try {
-            val intent = Intent(activity, MediaPlaybackService::class.java).apply {
-                action = "UPDATE_PLAYBACK_STATE"
-                putExtra("playing", isPlaying)
-                putExtra("position", position)
-                putExtra("duration", duration)
-                putExtra("refreshNotification", refreshNotification)
-            }
-            activity.startService(intent)
+            // In-process update on the running service; never startService()
+            // — that throws "app is in background" once backgrounded. position
+            // and duration are null on a bare play/pause flip; the service
+            // keeps the last known values so the scrubber does not reset.
+            MediaPlaybackService.pushPlaybackState(
+                isPlaying,
+                args.position?.toLong(),
+                args.duration?.toLong(),
+            )
             invoke.resolve()
         } catch (e: Exception) {
             invoke.reject("Failed to update playback state: ${e.message}")

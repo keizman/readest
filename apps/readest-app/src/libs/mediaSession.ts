@@ -8,14 +8,12 @@ export interface MediaMetadata {
   artist?: string;
   album?: string;
   artwork?: string;
-  refreshNotification?: boolean;
 }
 
 export interface PlaybackState {
   playing: boolean;
   position?: number; // in milliseconds
   duration?: number; // in milliseconds
-  refreshNotification?: boolean;
 }
 
 export interface MediaSessionState {
@@ -115,15 +113,30 @@ export class TauriMediaSession {
   }
 
   async setActive(sessionState: MediaSessionState) {
-    try {
-      if (sessionState.active) {
-        if (sessionState.keepAppInForeground) {
-          await this.requestPostNotificationPermission();
-        }
-        await this.initializeListeners();
-      } else {
-        await this.cleanupListeners();
+    if (sessionState.active) {
+      // The foreground-service media notification is the lock-screen control;
+      // on Android 13+ it is silently suppressed unless POST_NOTIFICATIONS is
+      // granted. Request it on every activation (no-op once decided).
+      // Best-effort: it must never block or abort the foreground-service start
+      // below, so it gets its own catch.
+      try {
+        await this.requestPostNotificationPermission();
+      } catch (error) {
+        console.warn('POST_NOTIFICATIONS request failed:', error);
       }
+      try {
+        await this.initializeListeners();
+      } catch (error) {
+        console.warn('Media session listener init failed:', error);
+      }
+    } else {
+      try {
+        await this.cleanupListeners();
+      } catch (error) {
+        console.warn('Media session listener cleanup failed:', error);
+      }
+    }
+    try {
       await invoke('plugin:native-tts|set_media_session_active', {
         payload: sessionState,
       });

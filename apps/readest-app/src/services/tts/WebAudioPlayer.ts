@@ -63,7 +63,8 @@ export interface ChunkTiming {
 export type WebAudioPlayerEvent =
   | { type: 'chunk-start'; chunkIndex: number }
   | { type: 'session-end' }
-  | { type: 'context-error'; message: string };
+  | { type: 'context-error'; message: string }
+  | { type: 'audio-interrupted' };
 
 interface ScheduledChunk {
   index: number;
@@ -148,6 +149,8 @@ export class WebAudioPlayer {
   #generation = 0;
   #session: PlayerSession | null = null;
   #userPaused = false;
+  #knownOutputDeviceIds: string[] = [];
+  #deviceChangeHandler: (() => void) | null = null;
 
   constructor(createContext?: () => TTSAudioContext) {
     this.#createContext = createContext ?? getSharedContext;
@@ -189,6 +192,7 @@ export class WebAudioPlayer {
       endedEmitted: false,
       waiters: [],
     };
+    this.#registerDeviceChangeListener();
     console.log(`[TTS] session ${generation} start`);
     return generation;
   }
@@ -246,6 +250,7 @@ export class WebAudioPlayer {
     const session = this.#session;
     if (!session) return;
     this.#session = null;
+    this.#unregisterDeviceChangeListener();
     for (const chunk of session.chunks) {
       chunk.source.onended = null;
       try {
@@ -363,21 +368,53 @@ export class WebAudioPlayer {
     session.onEvent({ type: 'session-end' });
   }
 
+  #registerDeviceChangeListener(): void {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices) return;
+    // Snapshot current output devices so we can detect removals on change.
+    navigator.mediaDevices
+      .enumerateDevices()
+      .then((devices) => {
+        this.#knownOutputDeviceIds = devices
+          .filter((d) => d.kind === 'audiooutput')
+          .map((d) => d.deviceId);
+      })
+      .catch(() => {});
+    this.#deviceChangeHandler = () => this.#handleDeviceChange();
+    navigator.mediaDevices.addEventListener('devicechange', this.#deviceChangeHandler);
+  }
+
+  #unregisterDeviceChangeListener(): void {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices || !this.#deviceChangeHandler)
+      return;
+    navigator.mediaDevices.removeEventListener('devicechange', this.#deviceChangeHandler);
+    this.#deviceChangeHandler = null;
+    this.#knownOutputDeviceIds = [];
+  }
+
+  #handleDeviceChange(): void {
+    if (!this.#session || this.#userPaused) return;
+    navigator.mediaDevices
+      .enumerateDevices()
+      .then((devices) => {
+        const newIds = devices.filter((d) => d.kind === 'audiooutput').map((d) => d.deviceId);
+        const outputDeviceRemoved = this.#knownOutputDeviceIds.some((id) => !newIds.includes(id));
+        this.#knownOutputDeviceIds = newIds;
+        if (outputDeviceRemoved && this.#session && !this.#userPaused) {
+          console.log('[TTS] audio output device removed; stopping playback');
+          this.#session.onEvent({ type: 'audio-interrupted' });
+        }
+      })
+      .catch(() => {});
+  }
+
   #handleStateChange(): void {
     const ctx = this.#ctx;
     if (!ctx) return;
     if (ctx.state === 'running' || this.#userPaused) return;
     if (!this.#session) return;
-    // Unexpected suspension (iOS 'interrupted', route change) during live
-    // playback: try to keep going. If the OS refuses, the next user action
-    // surfaces the failure through resumeContext().
-    console.log(`[TTS] audio context ${ctx.state}; attempting auto-resume`);
-    ctx.resume().catch((err) => {
-      console.warn('[TTS] audio context auto-resume failed', err);
-      this.#session?.onEvent({
-        type: 'context-error',
-        message: `AudioContext ${ctx.state}`,
-      });
-    });
+    // Unexpected AudioContext suspension (e.g. Bluetooth disconnect on iOS,
+    // incoming call): stop rather than silently resuming to another output.
+    console.log(`[TTS] audio context ${ctx.state}; stopping playback`);
+    this.#session.onEvent({ type: 'audio-interrupted' });
   }
 }

@@ -327,27 +327,26 @@ describe('WebAudioPlayer pause/resume and interruption', () => {
     expect(ctx.state).toBe('running');
   });
 
-  test('auto-resumes on unexpected suspension while a session is live', async () => {
-    const { ctx, player, onEvent } = setup();
+  test('reports unexpected suspension as an audio interruption while a session is live', async () => {
+    const { ctx, player, events, onEvent } = setup();
     await player.ensureContext();
     const gen = player.startSession(onEvent);
     player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    const before = ctx.resumeCalls;
-    ctx.setState('interrupted');
-    await Promise.resolve();
-    expect(ctx.resumeCalls).toBeGreaterThan(before);
-  });
-
-  test('user pause suppresses auto-resume', async () => {
-    const { ctx, player, onEvent } = setup();
-    await player.ensureContext();
-    const gen = player.startSession(onEvent);
-    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
-    await player.pauseContext();
     const before = ctx.resumeCalls;
     ctx.setState('interrupted');
     await Promise.resolve();
     expect(ctx.resumeCalls).toBe(before);
+    expect(events.at(-1)).toEqual({ type: 'audio-interrupted' });
+  });
+
+  test('user pause suppresses audio-interrupted event on state change', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    player.startSession(onEvent);
+    await player.pauseContext();
+    ctx.setState('interrupted');
+    await Promise.resolve();
+    expect(events.filter((e) => e.type === 'audio-interrupted')).toHaveLength(0);
   });
 
   test('resumeContext throws when the context refuses to run again', async () => {

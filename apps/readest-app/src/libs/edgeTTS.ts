@@ -1,7 +1,7 @@
 import { md5 } from 'js-md5';
 import WebSocket from 'isomorphic-ws';
 import { randomMd5 } from '@/utils/misc';
-import { LRUCache } from '@/utils/lru';
+import { FIFOCache } from '@/utils/lru';
 import { genSSML } from '@/utils/ssml';
 import { getEdgeTTSBaseUrl, getEdgeTTSWsUrl, isTauriAppPlatform } from '@/services/environment';
 
@@ -410,8 +410,8 @@ export class EdgeSpeechTTS {
     EdgeSpeechTTS.audioCacheBytes = Math.max(0, EdgeSpeechTTS.audioCacheBytes - blob.size);
     EdgeSpeechTTS.boundariesCache.delete(key);
   };
-  private static audioCache = new LRUCache<string, Blob>(800, EdgeSpeechTTS.onAudioCacheEvict);
-  private static boundariesCache = new LRUCache<string, TTSWordBoundary[]>(800);
+  private static audioCache = new FIFOCache<string, Blob>(800, EdgeSpeechTTS.onAudioCacheEvict);
+  private static boundariesCache = new FIFOCache<string, TTSWordBoundary[]>(800);
   private static trimAudioCache = () => {
     while (
       EdgeSpeechTTS.audioCacheBytes > TTS_AUDIO_CACHE_MAX_BYTES &&

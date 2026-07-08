@@ -276,11 +276,10 @@ describe('TTSMediaBridge', () => {
       artist: 'Book-123456',
       album: 'Book-123456',
       artwork: 'data:image/png;base64,x',
-      refreshNotification: true,
     });
   });
 
-  test('tauri sentence metadata updates do not rebuild the foreground notification', async () => {
+  test('tauri sentence metadata updates avoid resending artwork on text-only changes', async () => {
     const tauri = new TauriMediaSession();
     const updateMetadata = vi.spyOn(tauri, 'updateMetadata').mockResolvedValue(undefined);
     const updatePlaybackState = vi.spyOn(tauri, 'updatePlaybackState').mockResolvedValue(undefined);
@@ -300,13 +299,60 @@ describe('TTSMediaBridge', () => {
       title: 'First visible sentence.',
       artist: 'Alice',
       album: 'Carroll',
-      refreshNotification: false,
     });
     expect(updatePlaybackState).toHaveBeenCalledWith({
       playing: true,
       position: 12000,
       duration: 60000,
-      refreshNotification: false,
+    });
+  });
+
+  test('tauri playback-state-only updates omit position so native keeps the scrubber stable', async () => {
+    const tauri = new TauriMediaSession();
+    const updatePlaybackState = vi.spyOn(tauri, 'updatePlaybackState').mockResolvedValue(undefined);
+    vi.spyOn(tauri, 'updateMetadata').mockResolvedValue(undefined);
+    vi.spyOn(tauri, 'setActive').mockResolvedValue(undefined);
+    const tauriBridge = new TTSMediaBridge(() => tauri);
+    await tauriBridge.bind(
+      controller as unknown as TTSController,
+      meta({ bookKey: 'hash-abc-reader' }),
+    );
+    updatePlaybackState.mockClear();
+
+    controller.emitState('paused');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(updatePlaybackState).toHaveBeenCalledWith({ playing: false });
+  });
+
+  test('tauri privacy position updates keep playing during paragraph handoff', async () => {
+    useSettingsStore.setState({
+      settings: {
+        libraryPrivacyModeEnabled: true,
+        privateBookTitleAliases: {
+          'hash-abc': { title: 'Alice', alias: 'Book-123456' },
+        },
+      } as never,
+    });
+    const tauri = new TauriMediaSession();
+    const updatePlaybackState = vi.spyOn(tauri, 'updatePlaybackState').mockResolvedValue(undefined);
+    vi.spyOn(tauri, 'updateMetadata').mockResolvedValue(undefined);
+    vi.spyOn(tauri, 'setActive').mockResolvedValue(undefined);
+    const tauriBridge = new TTSMediaBridge(() => tauri);
+    await tauriBridge.bind(
+      controller as unknown as TTSController,
+      meta({ bookKey: 'hash-abc-reader', bookHash: 'hash-abc', coverImageUrl: 'cover.png' }),
+    );
+    updatePlaybackState.mockClear();
+
+    controller.emitState('stopped');
+    controller.emitMark('Next masked sentence.', '0');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(updatePlaybackState).toHaveBeenLastCalledWith({
+      playing: true,
+      position: 12000,
+      duration: 60000,
     });
   });
 });

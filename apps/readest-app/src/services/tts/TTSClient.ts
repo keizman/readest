@@ -1,6 +1,6 @@
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 
-type TTSMessageCode = 'boundary' | 'error' | 'end';
+type TTSMessageCode = 'boundary' | 'error' | 'end' | 'interrupted';
 
 export interface TTSMessageEvent {
   code: TTSMessageCode;
