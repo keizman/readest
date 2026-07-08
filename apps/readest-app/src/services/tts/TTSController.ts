@@ -10,6 +10,7 @@ import {
   TTSVoice,
 } from './types';
 import { createRejectFilter } from '@/utils/node';
+import { WsSlotPriority } from '@/libs/edgeTTS';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
@@ -646,7 +647,9 @@ export class TTSController extends EventTarget {
       const { marks } = parseSSMLMarks(ssml, this.ttsLang);
       const speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
       if (speakableMarks.length === 0) return;
-      await this.#preloadMarks(speakableMarks, signal, startup);
+      // Explicit preload of imminent content: warm at 'high' (near) priority so
+      // it is not starved by the low-priority deep look-ahead prefetch.
+      await this.#preloadMarks(speakableMarks, signal, startup, 'high');
       return;
     }
     const iter = startup
@@ -655,9 +658,15 @@ export class TTSController extends EventTarget {
     for await (const _ of iter);
   }
 
-  async #preloadMarks(marks: TTSMark[], signal: AbortSignal, startup = false) {
+  async #preloadMarks(
+    marks: TTSMark[],
+    signal: AbortSignal,
+    startup = false,
+    priority: WsSlotPriority = 'low',
+    awaitAll = false,
+  ) {
     if (marks.length === 0 || this.ttsClient !== this.ttsEdgeClient) return;
-    const iter = this.ttsEdgeClient.speakMarks(marks, signal, true, startup);
+    const iter = this.ttsEdgeClient.speakMarks(marks, signal, true, startup, priority, awaitAll);
     for await (const _ of iter);
   }
 
@@ -686,7 +695,11 @@ export class TTSController extends EventTarget {
     this.#prefetchInFlight = false;
   }
 
-  async #preloadRawParagraphs(rawSsmls: string[], signal: AbortSignal): Promise<void> {
+  async #preloadRawParagraphs(
+    rawSsmls: string[],
+    signal: AbortSignal,
+    distanceBase = 0,
+  ): Promise<void> {
     let nextIndex = 0;
     const worker = async () => {
       for (;;) {
@@ -697,7 +710,19 @@ export class TTSController extends EventTarget {
         if (!ssml || signal.aborted) continue;
         const marks: TTSMark[] = [];
         this.#appendSpeakableMarksFromSSML(marks, ssml);
-        await this.#preloadMarks(marks, signal);
+        // Bounded, session-relative distance (paragraphs ahead of the currently
+        // playing paragraph). Resets every prefetch walk, so it never grows
+        // unbounded — it is only a diagnostic to see how far ahead a fetch is
+        // relative to the playhead (e.g. "dist=+37 while playing dist=0" points
+        // straight at a runaway look-ahead).
+        if (marks.length > 0) {
+          console.log('[TTS] prefetch', { dist: distanceBase + index, marks: marks.length });
+        }
+        // Deep look-ahead: 'low' priority (yields the reserved slot to the
+        // playhead) and awaitAll so each paragraph fully completes before the
+        // walk advances — no detached background fills accumulating behind the
+        // current sentence.
+        await this.#preloadMarks(marks, signal, false, 'low', true);
       }
     };
     await Promise.all(
@@ -751,7 +776,7 @@ export class TTSController extends EventTarget {
       tts.prev();
     }
 
-    await this.#preloadRawParagraphs(rawSsmls, signal);
+    await this.#preloadRawParagraphs(rawSsmls, signal, 0);
 
     // A chapter boundary must not shrink the offline window. Build isolated
     // TTS iterators for following sections, so look-ahead can continue without
@@ -791,7 +816,11 @@ export class TTSController extends EventTarget {
         sectionRawSsmls.push(raw);
         raw = sectionTTS.next();
       }
-      await this.#preloadRawParagraphs(sectionRawSsmls, signal);
+      await this.#preloadRawParagraphs(
+        sectionRawSsmls,
+        signal,
+        paragraphCount - sectionRawSsmls.length,
+      );
     }
   }
 
@@ -867,7 +896,12 @@ export class TTSController extends EventTarget {
           if (this.ttsClient === this.ttsEdgeClient) {
             // Paragraph-local marks guarantee preload and playback produce the
             // same Edge batch keys and keep foliate's cursor authoritative.
-            await this.#preloadMarks(speakableMarks, signal, startup);
+            // This is the sentence about to play, so warm it at 'high' priority:
+            // it must never queue behind the low-priority deep look-ahead
+            // prefetch for the shared WS slots (that priority inversion was a
+            // primary cause of the current sentence stalling while far-ahead
+            // sentences were being fetched).
+            await this.#preloadMarks(speakableMarks, signal, startup, 'high');
           } else {
             await this.preloadSSML(ssml, signal, startup);
           }

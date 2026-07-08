@@ -65,6 +65,11 @@ const PIPELINE_LOOKAHEAD_VISIBLE = 8;
 // MAX_AHEAD_SEC_HIDDEN (300s): even short (~10s) batches need ~30 in flight
 // to fill that window, and each is a small MP3-derived buffer.
 const PIPELINE_LOOKAHEAD_HIDDEN = 32;
+// If a single playhead batch preparation (fetch + decode) stays pending longer
+// than this, log a diagnostic. It is a warning only: the WS layer's own
+// per-request timeout + retry guarantees the await eventually settles, so this
+// never changes playback behavior — it just makes a slow network visible.
+const BATCH_PREPARE_STALL_WARN_MS = 8000;
 // REVERTED: an earlier attempt made Android always request this deep
 // lookahead (see WebAudioPlayer.ts's comment on the removed
 // isMobileBackgroundRiskPlatform) even while visible, to get ahead of
@@ -295,9 +300,11 @@ export class EdgeTTSClient implements TTSClient {
     signal: AbortSignal,
     preload = false,
     startup = false,
+    preloadPriority: WsSlotPriority = 'low',
+    preloadAwaitAll = false,
   ) {
     if (preload) {
-      yield* this.#preload(speakableMarks, signal, startup);
+      yield* this.#preload(speakableMarks, signal, startup, preloadPriority, preloadAwaitAll);
       return;
     }
 
@@ -392,7 +399,13 @@ export class EdgeTTSClient implements TTSClient {
     return Math.min(batchCount, TTS_WS_MAX_CONCURRENT);
   }
 
-  async *#preload(marks: TTSMark[], signal: AbortSignal, startup: boolean) {
+  async *#preload(
+    marks: TTSMark[],
+    signal: AbortSignal,
+    startup: boolean,
+    priority: WsSlotPriority = 'low',
+    awaitAll = false,
+  ) {
     // Preload by batch so LRU keys match playback requests. The first
     // TTS_WS_MAX_CONCURRENT batches are warmed before playback; later batches
     // keep filling in a single background worker so long paragraphs do not fall
@@ -412,6 +425,7 @@ export class EdgeTTSClient implements TTSClient {
       const audio = await this.#createAudioDataWithRetry(
         this.getPayload(voiceLang, text, voiceId),
         signal,
+        priority,
       );
       if (!audio) return;
       const { perMark } = partitionBatch(batch, audio.boundaries);
@@ -450,7 +464,20 @@ export class EdgeTTSClient implements TTSClient {
         await runBatch(index);
       }
     };
-    void runBackgroundBatches();
+    // Deep look-ahead prefetch (awaitAll) must finish every batch of this
+    // paragraph before the caller moves to the next one, so the walk truly
+    // processes one paragraph at a time. Detaching here is what let each
+    // paragraph's remaining batches keep fetching after the walk had already
+    // advanced: a 100-paragraph prefetch could pile up hundreds of concurrent
+    // low-priority fetches, saturate the shared WS slots, and starve the
+    // playhead until playback wedged ("stuck after the current sentence
+    // finished"). The current-paragraph startup preload keeps detaching
+    // (awaitAll === false) so first audio is never delayed by later batches.
+    if (awaitAll) {
+      await runBackgroundBatches();
+    } else {
+      void runBackgroundBatches();
+    }
     yield {
       code: 'end',
       message: 'Preload finished',
@@ -595,7 +622,24 @@ export class EdgeTTSClient implements TTSClient {
         const lookahead = isPageHidden() ? PIPELINE_LOOKAHEAD_HIDDEN : PIPELINE_LOOKAHEAD_VISIBLE;
         startPreparationsThrough(batchIndex + lookahead - 1);
         if (signal.aborted || this.#activeGeneration !== generation) break;
-        const result = await preparations[batchIndex]!;
+        // Observability watchdog: the playhead batch is fetched at 'high'
+        // priority against a reserved WS slot, and every fetch has its own hard
+        // timeout (WS_REQUEST_TIMEOUT_MS) with a bounded retry, so this await
+        // cannot hang forever. If it still takes unexpectedly long the network
+        // (not the client) is the bottleneck — surface it instead of silently
+        // stalling, which is what makes "playback froze" diagnosable in logs.
+        const stallTimer = setTimeout(() => {
+          console.warn(
+            `[TTS] batch ${batchIndex} prepare still pending after ` +
+              `${BATCH_PREPARE_STALL_WARN_MS}ms — likely network/bandwidth, not client queue`,
+          );
+        }, BATCH_PREPARE_STALL_WARN_MS);
+        let result: BatchPrepareResult;
+        try {
+          result = await preparations[batchIndex]!;
+        } finally {
+          clearTimeout(stallTimer);
+        }
         if (result.kind === 'fatal') {
           queue.push({ kind: 'error', message: result.message });
           return;

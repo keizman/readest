@@ -104,4 +104,51 @@ describe('EdgeSpeechTTS audio cache inflight sharing', () => {
     });
     expect(h.sockets).toHaveLength(1);
   });
+
+  test('reserves a slot for high-priority playback so low prefetch cannot occupy both', async () => {
+    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const tts = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'self-hosted' });
+    const mk = (text: string) => ({
+      lang: 'zh-CN',
+      text,
+      voice: 'zh-CN-YunxiNeural',
+      rate: 1,
+      pitch: 1,
+    });
+
+    // Low request A takes the single slot available to background prefetch.
+    const lowA = tts
+      .createAudioData(mk('sentence-A'), new AbortController().signal, 'low')
+      .catch((error: unknown) => error);
+    const socketA = await waitForSocketReady(0);
+
+    // Low request B must NOT open a socket: the one low slot is taken and the
+    // other is reserved for the playhead, so B waits instead of saturating the
+    // shared WS concurrency (TTS_WS_MAX_CONCURRENT === 2).
+    const lowB = tts
+      .createAudioData(mk('sentence-B'), new AbortController().signal, 'low')
+      .catch((error: unknown) => error);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.sockets).toHaveLength(1);
+
+    // A high request jumps straight onto the reserved slot even while A runs —
+    // it never has to wait for an in-flight low fetch to finish.
+    const high = tts.createAudioData(mk('sentence-C'), new AbortController().signal, 'high');
+    const socketC = await waitForSocketReady(1);
+    expect(h.sockets).toHaveLength(2);
+
+    // Finishing A frees the lone low slot; B can start immediately while high
+    // is still in flight because high occupies the other slot, not an extra
+    // low-prefetch slot.
+    finishSocketWithAudio(socketA);
+    await lowA;
+    const socketB = await waitForSocketReady(2);
+    expect(h.sockets).toHaveLength(3);
+
+    finishSocketWithAudio(socketC);
+    await high;
+    finishSocketWithAudio(socketB);
+    await lowB;
+  });
 });

@@ -435,6 +435,7 @@ export class EdgeSpeechTTS {
   // fetches so preload, playback, and lookahead share one in-flight request.
   private static httpsRequestQueue: Promise<unknown> = Promise.resolve();
   private static wsInFlight = 0;
+  private static wsLowInFlight = 0;
   private static wsWaiters: Array<{
     wake: () => boolean;
     priority: WsSlotPriority;
@@ -491,14 +492,39 @@ export class EdgeSpeechTTS {
     return run;
   }
 
+  // A playback-critical 'high' request may use every slot, but background
+  // 'low' prefetch is capped one below the max so at least one slot is always
+  // reserved for the playhead. This guarantees a 'high' request never waits for
+  // an in-flight 'low' fetch to finish (it can only ever queue behind other
+  // 'high' work) — the deep look-ahead prefetch can no longer occupy both slots
+  // and starve the current sentence during a bandwidth squeeze. With
+  // TTS_WS_MAX_CONCURRENT === 2 this means deep prefetch runs strictly one at a
+  // time, which is exactly the throttle we want while the network is tight.
+  private static wsLowSlotLimit(): number {
+    return Math.max(1, TTS_WS_MAX_CONCURRENT - 1);
+  }
+
+  private static canAcquireWsSlot(priority: WsSlotPriority): boolean {
+    if (EdgeSpeechTTS.wsInFlight >= TTS_WS_MAX_CONCURRENT) return false;
+    if (priority === 'low' && EdgeSpeechTTS.wsLowInFlight >= EdgeSpeechTTS.wsLowSlotLimit()) {
+      return false;
+    }
+    return true;
+  }
+
+  private static markWsSlotAcquired(priority: WsSlotPriority): void {
+    EdgeSpeechTTS.wsInFlight++;
+    if (priority === 'low') EdgeSpeechTTS.wsLowInFlight++;
+  }
+
   private static acquireWsSlot(
     signal?: AbortSignal,
     priority: WsSlotPriority = 'low',
     cacheKey?: string,
   ): Promise<void> {
     EdgeSpeechTTS.rejectIfAborted(signal);
-    if (EdgeSpeechTTS.wsInFlight < TTS_WS_MAX_CONCURRENT) {
-      EdgeSpeechTTS.wsInFlight++;
+    if (EdgeSpeechTTS.canAcquireWsSlot(priority)) {
+      EdgeSpeechTTS.markWsSlotAcquired(priority);
       return Promise.resolve();
     }
     return new Promise((resolve, reject) => {
@@ -519,7 +545,7 @@ export class EdgeSpeechTTS {
       const wake = () => {
         signal?.removeEventListener('abort', onAbort);
         if (aborted) return false;
-        EdgeSpeechTTS.wsInFlight++;
+        EdgeSpeechTTS.markWsSlotAcquired(priority);
         resolve();
         return true;
       };
@@ -539,11 +565,20 @@ export class EdgeSpeechTTS {
     });
   }
 
-  private static releaseWsSlot(): void {
+  private static releaseWsSlot(priority: WsSlotPriority): void {
     EdgeSpeechTTS.wsInFlight = Math.max(0, EdgeSpeechTTS.wsInFlight - 1);
+    if (priority === 'low') {
+      EdgeSpeechTTS.wsLowInFlight = Math.max(0, EdgeSpeechTTS.wsLowInFlight - 1);
+    }
+    // Wake the highest-priority waiter the reserved-slot rule still admits.
+    // Waiters are kept in priority order (high ahead of low), so once the front
+    // waiter cannot be admitted — a 'low' waiter while the low-prefetch cap is
+    // already met — nothing behind it can be either.
     while (EdgeSpeechTTS.wsWaiters.length > 0) {
-      const { wake } = EdgeSpeechTTS.wsWaiters.shift()!;
-      if (wake()) break;
+      const next = EdgeSpeechTTS.wsWaiters[0]!;
+      if (!EdgeSpeechTTS.canAcquireWsSlot(next.priority)) break;
+      EdgeSpeechTTS.wsWaiters.shift();
+      if (next.wake()) break;
     }
   }
 
@@ -560,7 +595,7 @@ export class EdgeSpeechTTS {
       try {
         return await fn();
       } finally {
-        EdgeSpeechTTS.releaseWsSlot();
+        EdgeSpeechTTS.releaseWsSlot(priority);
       }
     });
   }
