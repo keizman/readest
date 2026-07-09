@@ -3,8 +3,7 @@ import WebSocket from 'isomorphic-ws';
 import { randomMd5 } from '@/utils/misc';
 import { FIFOCache } from '@/utils/lru';
 import { genSSML } from '@/utils/ssml';
-import { getEdgeTTSBaseUrl, isTauriAppPlatform } from '@/services/environment';
-import { ttsWsLoadBalancer } from '@/libs/ttsWsLoadBalancer';
+import { getEdgeTTSBaseUrl, getEdgeTTSWsUrl, isTauriAppPlatform } from '@/services/environment';
 
 // Cloudflare Workers expose a global `WebSocketPair` that is not available in
 // browsers or Node.js. The Node `ws` package (used transitively via
@@ -645,16 +644,14 @@ export class EdgeSpeechTTS {
     EdgeSpeechTTS.rejectIfAborted(signal);
     const connectId = randomMd5();
     const useBingDirect = this.wsTarget === 'bing';
-    // For Bing-direct the URL embeds auth params and is computed once up-front.
-    // For self-hosted the URL is supplied per-attempt by the load balancer.
-    const bingUrl = useBingDirect
+    const url = useBingDirect
       ? `${EDGE_SPEECH_URL}?${new URLSearchParams({
           ConnectionId: connectId,
           TrustedClientToken: EDGE_API_TOKEN,
           'Sec-MS-GEC': await generateSecMsGec(),
           'Sec-MS-GEC-Version': `1-${CHROMIUM_FULL_VERSION}`,
         }).toString()}`
-      : '';
+      : getEdgeTTSWsUrl();
     const date = new Date().toString();
     const baseHeaders: Record<string, string> = useBingDirect
       ? {
@@ -728,356 +725,344 @@ export class EdgeSpeechTTS {
     const content = genSendContent(contentHeaders, ssml);
     const config = genSendContent(configHeaders, configContent);
 
-    // Inner function that opens a WS connection to `wsUrl` and returns audio.
-    // For Bing-direct this is called once with the pre-built bingUrl.
-    // For self-hosted the load balancer calls it, retrying with the next
-    // healthy endpoint if the connection or request fails.
-    const connectWithUrl = (wsUrl: string): Promise<EdgeSpeechAudio> => {
-      if (isTauriAppPlatform()) {
-        return new Promise(async (resolve, reject) => {
-          let settled = false;
-          let disconnect: (() => void) | undefined;
-          let timeoutId: ReturnType<typeof setTimeout> | undefined;
-          const finish = (fn: 'resolve' | 'reject', value?: unknown) => {
-            if (settled) return;
-            settled = true;
-            if (timeoutId !== undefined) clearTimeout(timeoutId);
-            detachAbort?.();
-            disconnect?.();
-            if (fn === 'resolve') resolve(value as EdgeSpeechAudio);
-            else reject(value);
+    if (isTauriAppPlatform()) {
+      return new Promise(async (resolve, reject) => {
+        let settled = false;
+        let disconnect: (() => void) | undefined;
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const finish = (fn: 'resolve' | 'reject', value?: unknown) => {
+          if (settled) return;
+          settled = true;
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
+          detachAbort?.();
+          disconnect?.();
+          if (fn === 'resolve') resolve(value as EdgeSpeechAudio);
+          else reject(value);
+        };
+        let detachAbort: (() => void) | undefined;
+        if (signal?.aborted) return finish('reject', wsAbortError(signal));
+        if (signal) {
+          const onAbort = () => finish('reject', wsAbortError(signal));
+          signal.addEventListener('abort', onAbort, { once: true });
+          detachAbort = () => signal.removeEventListener('abort', onAbort);
+        }
+        // The connection plugin reports disconnects as a 'Close' message
+        // rather than throwing, and a reset mid-stream may deliver neither a
+        // 'Close' message nor an error — this timeout is the last resort so a
+        // dropped socket retries instead of wedging playback indefinitely.
+        timeoutId = setTimeout(
+          () => finish('reject', new Error('Edge TTS WebSocket timed out.')),
+          WS_REQUEST_TIMEOUT_MS,
+        );
+        try {
+          const TauriWebSocket = (await import('@tauri-apps/plugin-websocket')).default;
+          const ws = await TauriWebSocket.connect(url, { headers: baseHeaders });
+          disconnect = () => {
+            void ws.disconnect();
           };
-          let detachAbort: (() => void) | undefined;
-          if (signal?.aborted) return finish('reject', wsAbortError(signal));
-          if (signal) {
-            const onAbort = () => finish('reject', wsAbortError(signal));
-            signal.addEventListener('abort', onAbort, { once: true });
-            detachAbort = () => signal.removeEventListener('abort', onAbort);
-          }
-          // The connection plugin reports disconnects as a 'Close' message
-          // rather than throwing, and a reset mid-stream may deliver neither a
-          // 'Close' message nor an error — this timeout is the last resort so a
-          // dropped socket retries instead of wedging playback indefinitely.
-          timeoutId = setTimeout(
-            () => finish('reject', new Error('Edge TTS WebSocket timed out.')),
-            WS_REQUEST_TIMEOUT_MS,
-          );
-          try {
-            const TauriWebSocket = (await import('@tauri-apps/plugin-websocket')).default;
-            const ws = await TauriWebSocket.connect(wsUrl, { headers: baseHeaders });
-            disconnect = () => {
-              void ws.disconnect();
-            };
-            let audioData = new ArrayBuffer(0);
-            const boundaries: TTSWordBoundary[] = [];
-            const messageUnlisten = await ws.addListener((msg) => {
-              if (msg.type === 'Text') {
-                const { headers, body } = getHeadersAndData(msg.data as string);
-                if (headers['Path'] === 'audio.metadata') {
-                  boundaries.push(...parseAudioMetadataBody(body.trim()));
-                } else if (headers['Path'] === 'turn.end') {
-                  messageUnlisten();
-                  if (!audioData.byteLength) {
-                    return finish('reject', new Error('No audio data received.'));
-                  }
-                  finish('resolve', { response: new Response(audioData), boundaries });
-                }
-              } else if (msg.type === 'Binary') {
-                let buffer: ArrayBufferLike;
-                if (msg.data instanceof Uint8Array) {
-                  buffer = msg.data.buffer;
-                } else {
-                  buffer = new Uint8Array(msg.data).buffer;
-                }
-                const dataView = new DataView(buffer);
-                const headerLength = dataView.getInt16(0);
-                if (buffer.byteLength > headerLength + 2) {
-                  const newBody = buffer.slice(2 + headerLength);
-                  const merged = new Uint8Array(audioData.byteLength + newBody.byteLength);
-                  merged.set(new Uint8Array(audioData), 0);
-                  merged.set(new Uint8Array(newBody), audioData.byteLength);
-                  audioData = merged.buffer;
-                }
-              } else if (msg.type === 'Close') {
-                // The socket reset or the server hung up before turn.end. This
-                // was previously silently ignored, which left the promise (and
-                // the whole scheduler awaiting it) parked forever whenever a
-                // connection dropped mid-synthesis — the "stuck, next sentence
-                // never plays" failure. Reject with a retryable error (not the
-                // permanent "no audio data" message) so #createAudioDataWithRetry
-                // opens a fresh connection instead of hanging.
-                if (!audioData.byteLength) {
-                  finish('reject', new Error('No audio data received.'));
-                } else {
-                  finish(
-                    'reject',
-                    new Error(`Edge TTS WebSocket closed unexpectedly (code ${msg.data?.code}).`),
-                  );
-                }
-              }
-            });
-            await ws.send(config);
-            await ws.send(content);
-          } catch (error) {
-            finish('reject', new Error(`WebSocket error occurred: ${error}`));
-          }
-        });
-      } else if (isCloudflareWorkers()) {
-        // The Workers path backs the HTTPS proxy route. It captures both the
-        // audio body and the word boundaries (audio.metadata frames) so the
-        // route can forward boundaries via the WORD_BOUNDARIES_HEADER.
-        return new Promise<EdgeSpeechAudio>((resolve, reject) => {
-          (async () => {
-            try {
-              // Cloudflare Workers cannot use the `ws` npm package because it
-              // relies on `http.createConnection`. Instead, WebSockets are
-              // opened by calling `fetch()` with an `Upgrade: websocket`
-              // header. The response has status 101 and a `webSocket`
-              // property that must be `accept()`ed before sending data.
-              const upgradeUrl = wsUrl
-                .replace(/^wss:\/\//i, 'https://')
-                .replace(/^ws:\/\//i, 'http://');
-              const upgradeResponse = (await fetch(upgradeUrl, {
-                headers: {
-                  ...baseHeaders,
-                  Upgrade: 'websocket',
-                },
-              })) as UpgradeResponse;
-
-              if (upgradeResponse.status !== 101 || !upgradeResponse.webSocket) {
-                return reject(
-                  new Error(`WebSocket upgrade failed with status ${upgradeResponse.status}`),
-                );
-              }
-
-              const ws = upgradeResponse.webSocket;
-              let audioData = new ArrayBuffer(0);
-              const boundaries: TTSWordBoundary[] = [];
-              let settled = false;
-              const timeoutId = setTimeout(() => {
-                if (settled) return;
-                settled = true;
-                reject(new Error('Edge TTS WebSocket timed out.'));
-              }, WS_REQUEST_TIMEOUT_MS);
-              // Cloudflare Workers deliver binary WebSocket frames as `Blob`,
-              // whose conversion to bytes (`blob.arrayBuffer()`) is async.
-              // Chain every binary message through this promise so frames are
-              // appended in receive order and `turn.end` (or `close`) can
-              // await the tail before finalizing the audio payload.
-              let pendingBinary: Promise<void> = Promise.resolve();
-
-              const appendBinary = (buffer: ArrayBufferLike) => {
-                const dataView = new DataView(buffer);
-                const headerLength = dataView.getInt16(0);
-                if (buffer.byteLength > headerLength + 2) {
-                  const newBody = new Uint8Array(buffer).slice(2 + headerLength);
-                  const merged = new Uint8Array(audioData.byteLength + newBody.byteLength);
-                  merged.set(new Uint8Array(audioData), 0);
-                  merged.set(newBody, audioData.byteLength);
-                  audioData = merged.buffer;
-                }
-              };
-
-              const enqueueBinary = (
-                getBuffer: () => Promise<ArrayBufferLike> | ArrayBufferLike,
-              ) => {
-                pendingBinary = pendingBinary.then(async () => {
-                  if (settled) return;
-                  const buffer = await getBuffer();
-                  if (settled) return;
-                  appendBinary(buffer);
-                });
-              };
-
-              const finalize = () => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timeoutId);
-                if (!audioData.byteLength) {
-                  reject(new Error('No audio data received.'));
-                } else {
-                  resolve({ response: new Response(audioData), boundaries });
-                }
-              };
-              const failFast = (error: Error) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timeoutId);
-                reject(error);
-              };
-
-              const onMessage = (event: { data: unknown }) => {
-                if (settled) return;
-                const data = event.data;
-                if (typeof data === 'string') {
-                  const { headers, body } = getHeadersAndData(data);
-                  if (headers['Path'] === 'audio.metadata') {
-                    boundaries.push(...parseAudioMetadataBody(body.trim()));
-                    return;
-                  }
-                  if (headers['Path'] === 'turn.end') {
-                    // Wait for any in-flight Blob decodes to complete before
-                    // deciding whether audio was received.
-                    pendingBinary
-                      .then(() => {
-                        try {
-                          ws.close();
-                        } catch {
-                          // ignore close failures
-                        }
-                        finalize();
-                      })
-                      .catch(() => failFast(new Error('No audio data received.')));
-                  }
-                  return;
-                }
-                if (data instanceof ArrayBuffer) {
-                  enqueueBinary(() => data);
-                  return;
-                }
-                if (data instanceof Uint8Array) {
-                  enqueueBinary(() =>
-                    data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
-                  );
-                  return;
-                }
-                if (typeof Blob !== 'undefined' && data instanceof Blob) {
-                  // Cloudflare Workers path: convert Blob -> ArrayBuffer asynchronously.
-                  enqueueBinary(() => (data as Blob).arrayBuffer());
-                  return;
-                }
-              };
-
-              ws.addEventListener('message', onMessage);
-              ws.addEventListener('close', () => {
-                if (settled) return;
-                // Drain any pending Blob decodes that may still be in-flight.
-                pendingBinary
-                  .then(() => finalize())
-                  .catch(() => failFast(new Error('No audio data received.')));
-              });
-              ws.addEventListener('error', () => {
-                failFast(new Error('WebSocket error occurred.'));
-              });
-
-              ws.accept();
-              ws.send(config);
-              ws.send(content);
-            } catch (error) {
-              reject(
-                new Error(
-                  `WebSocket error occurred: ${error instanceof Error ? error.message : String(error)}`,
-                ),
-              );
-            }
-          })();
-        });
-      } else {
-        return new Promise((resolve, reject) => {
-          let settled = false;
-          let timeoutId: ReturnType<typeof setTimeout> | undefined;
-          const finish = (fn: 'resolve' | 'reject', value?: unknown) => {
-            if (settled) return;
-            settled = true;
-            if (timeoutId !== undefined) clearTimeout(timeoutId);
-            detachAbort?.();
-            if (fn === 'resolve') resolve(value as EdgeSpeechAudio);
-            else reject(value);
-          };
-          let detachAbort: (() => void) | undefined;
-          if (signal?.aborted) return finish('reject', wsAbortError(signal));
-
-          // Some abnormal resets deliver neither a 'close' nor an 'error' event
-          // promptly (or at all); this timeout is the backstop so the request
-          // always eventually settles and retries instead of wedging playback.
-          timeoutId = setTimeout(
-            () => finish('reject', new Error('Edge TTS WebSocket timed out.')),
-            WS_REQUEST_TIMEOUT_MS,
-          );
-
-          // In browsers isomorphic-ws is the native WebSocket, whose second
-          // argument is a subprotocol list — passing an options object throws
-          // SyntaxError. Custom headers are only supported (and only needed)
-          // in Node, where `ws` accepts (url, options).
-          const ws =
-            typeof window === 'undefined'
-              ? new WebSocket(wsUrl, { headers: baseHeaders })
-              : new WebSocket(wsUrl);
-          ws.binaryType = 'arraybuffer';
-          if (signal) {
-            const onAbort = () => {
-              try {
-                ws.close();
-              } catch {
-                // ignore close failures
-              }
-              finish('reject', wsAbortError(signal));
-            };
-            signal.addEventListener('abort', onAbort, { once: true });
-            detachAbort = () => signal.removeEventListener('abort', onAbort);
-          }
-
           let audioData = new ArrayBuffer(0);
           const boundaries: TTSWordBoundary[] = [];
-
-          ws.addEventListener('open', () => {
-            ws.send(config);
-            ws.send(content);
-          });
-
-          ws.addEventListener('message', (event: WebSocket.MessageEvent) => {
-            if (typeof event.data === 'string') {
-              const { headers, body } = getHeadersAndData(event.data);
+          const messageUnlisten = await ws.addListener((msg) => {
+            if (msg.type === 'Text') {
+              const { headers, body } = getHeadersAndData(msg.data as string);
               if (headers['Path'] === 'audio.metadata') {
                 boundaries.push(...parseAudioMetadataBody(body.trim()));
               } else if (headers['Path'] === 'turn.end') {
-                try {
-                  ws.close();
-                } catch {
-                  // ignore close failures
-                }
+                messageUnlisten();
                 if (!audioData.byteLength) {
                   return finish('reject', new Error('No audio data received.'));
                 }
                 finish('resolve', { response: new Response(audioData), boundaries });
               }
-            } else if (event.data instanceof ArrayBuffer) {
-              const dataView = new DataView(event.data);
+            } else if (msg.type === 'Binary') {
+              let buffer: ArrayBufferLike;
+              if (msg.data instanceof Uint8Array) {
+                buffer = msg.data.buffer;
+              } else {
+                buffer = new Uint8Array(msg.data).buffer;
+              }
+              const dataView = new DataView(buffer);
               const headerLength = dataView.getInt16(0);
-              if (event.data.byteLength > headerLength + 2) {
-                const newBody = event.data.slice(2 + headerLength);
+              if (buffer.byteLength > headerLength + 2) {
+                const newBody = buffer.slice(2 + headerLength);
                 const merged = new Uint8Array(audioData.byteLength + newBody.byteLength);
                 merged.set(new Uint8Array(audioData), 0);
                 merged.set(new Uint8Array(newBody), audioData.byteLength);
                 audioData = merged.buffer;
               }
+            } else if (msg.type === 'Close') {
+              // The socket reset or the server hung up before turn.end. This
+              // was previously silently ignored, which left the promise (and
+              // the whole scheduler awaiting it) parked forever whenever a
+              // connection dropped mid-synthesis — the "stuck, next sentence
+              // never plays" failure. Reject with a retryable error (not the
+              // permanent "no audio data" message) so #createAudioDataWithRetry
+              // opens a fresh connection instead of hanging.
+              if (!audioData.byteLength) {
+                finish('reject', new Error('No audio data received.'));
+              } else {
+                finish(
+                  'reject',
+                  new Error(`Edge TTS WebSocket closed unexpectedly (code ${msg.data?.code}).`),
+                );
+              }
             }
           });
+          await ws.send(config);
+          await ws.send(content);
+        } catch (error) {
+          finish('reject', new Error(`WebSocket error occurred: ${error}`));
+        }
+      });
+    } else if (isCloudflareWorkers()) {
+      // The Workers path backs the HTTPS proxy route. It captures both the
+      // audio body and the word boundaries (audio.metadata frames) so the
+      // route can forward boundaries via the WORD_BOUNDARIES_HEADER.
+      return new Promise<EdgeSpeechAudio>((resolve, reject) => {
+        (async () => {
+          try {
+            // Cloudflare Workers cannot use the `ws` npm package because it
+            // relies on `http.createConnection`. Instead, WebSockets are
+            // opened by calling `fetch()` with an `Upgrade: websocket`
+            // header. The response has status 101 and a `webSocket`
+            // property that must be `accept()`ed before sending data.
+            const upgradeUrl = url.replace(/^wss:\/\//i, 'https://');
+            const upgradeResponse = (await fetch(upgradeUrl, {
+              headers: {
+                ...baseHeaders,
+                Upgrade: 'websocket',
+              },
+            })) as UpgradeResponse;
 
-          ws.addEventListener('close', () => {
-            // A clean-looking close before turn.end (connection reset, proxy
-            // idle-kill, server restart) used to be ignored here whenever some
-            // audio had already arrived, leaving this promise — and the
-            // scheduler awaiting it — parked forever with no further chunks
-            // ever scheduled. Always settle: reject with a retryable error
-            // (distinct from the permanent "no audio data" case) so the retry
-            // path opens a fresh connection instead of stalling playback.
-            if (settled) return;
-            if (!audioData.byteLength) {
-              finish('reject', new Error('No audio data received.'));
-            } else {
-              finish('reject', new Error('Edge TTS WebSocket closed unexpectedly.'));
+            if (upgradeResponse.status !== 101 || !upgradeResponse.webSocket) {
+              return reject(
+                new Error(`WebSocket upgrade failed with status ${upgradeResponse.status}`),
+              );
             }
-          });
 
-          ws.addEventListener('error', () => {
-            finish('reject', new Error('WebSocket error occurred.'));
-          });
+            const ws = upgradeResponse.webSocket;
+            let audioData = new ArrayBuffer(0);
+            const boundaries: TTSWordBoundary[] = [];
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              reject(new Error('Edge TTS WebSocket timed out.'));
+            }, WS_REQUEST_TIMEOUT_MS);
+            // Cloudflare Workers deliver binary WebSocket frames as `Blob`,
+            // whose conversion to bytes (`blob.arrayBuffer()`) is async.
+            // Chain every binary message through this promise so frames are
+            // appended in receive order and `turn.end` (or `close`) can
+            // await the tail before finalizing the audio payload.
+            let pendingBinary: Promise<void> = Promise.resolve();
+
+            const appendBinary = (buffer: ArrayBufferLike) => {
+              const dataView = new DataView(buffer);
+              const headerLength = dataView.getInt16(0);
+              if (buffer.byteLength > headerLength + 2) {
+                const newBody = new Uint8Array(buffer).slice(2 + headerLength);
+                const merged = new Uint8Array(audioData.byteLength + newBody.byteLength);
+                merged.set(new Uint8Array(audioData), 0);
+                merged.set(newBody, audioData.byteLength);
+                audioData = merged.buffer;
+              }
+            };
+
+            const enqueueBinary = (getBuffer: () => Promise<ArrayBufferLike> | ArrayBufferLike) => {
+              pendingBinary = pendingBinary.then(async () => {
+                if (settled) return;
+                const buffer = await getBuffer();
+                if (settled) return;
+                appendBinary(buffer);
+              });
+            };
+
+            const finalize = () => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeoutId);
+              if (!audioData.byteLength) {
+                reject(new Error('No audio data received.'));
+              } else {
+                resolve({ response: new Response(audioData), boundaries });
+              }
+            };
+            const failFast = (error: Error) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeoutId);
+              reject(error);
+            };
+
+            const onMessage = (event: { data: unknown }) => {
+              if (settled) return;
+              const data = event.data;
+              if (typeof data === 'string') {
+                const { headers, body } = getHeadersAndData(data);
+                if (headers['Path'] === 'audio.metadata') {
+                  boundaries.push(...parseAudioMetadataBody(body.trim()));
+                  return;
+                }
+                if (headers['Path'] === 'turn.end') {
+                  // Wait for any in-flight Blob decodes to complete before
+                  // deciding whether audio was received.
+                  pendingBinary
+                    .then(() => {
+                      try {
+                        ws.close();
+                      } catch {
+                        // ignore close failures
+                      }
+                      finalize();
+                    })
+                    .catch(() => failFast(new Error('No audio data received.')));
+                }
+                return;
+              }
+              if (data instanceof ArrayBuffer) {
+                enqueueBinary(() => data);
+                return;
+              }
+              if (data instanceof Uint8Array) {
+                enqueueBinary(() =>
+                  data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+                );
+                return;
+              }
+              if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                // Cloudflare Workers path: convert Blob -> ArrayBuffer asynchronously.
+                enqueueBinary(() => (data as Blob).arrayBuffer());
+                return;
+              }
+            };
+
+            ws.addEventListener('message', onMessage);
+            ws.addEventListener('close', () => {
+              if (settled) return;
+              // Drain any pending Blob decodes that may still be in-flight.
+              pendingBinary
+                .then(() => finalize())
+                .catch(() => failFast(new Error('No audio data received.')));
+            });
+            ws.addEventListener('error', () => {
+              failFast(new Error('WebSocket error occurred.'));
+            });
+
+            ws.accept();
+            ws.send(config);
+            ws.send(content);
+          } catch (error) {
+            reject(
+              new Error(
+                `WebSocket error occurred: ${error instanceof Error ? error.message : String(error)}`,
+              ),
+            );
+          }
+        })();
+      });
+    } else {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const finish = (fn: 'resolve' | 'reject', value?: unknown) => {
+          if (settled) return;
+          settled = true;
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
+          detachAbort?.();
+          if (fn === 'resolve') resolve(value as EdgeSpeechAudio);
+          else reject(value);
+        };
+        let detachAbort: (() => void) | undefined;
+        if (signal?.aborted) return finish('reject', wsAbortError(signal));
+
+        // Some abnormal resets deliver neither a 'close' nor an 'error' event
+        // promptly (or at all); this timeout is the backstop so the request
+        // always eventually settles and retries instead of wedging playback.
+        timeoutId = setTimeout(
+          () => finish('reject', new Error('Edge TTS WebSocket timed out.')),
+          WS_REQUEST_TIMEOUT_MS,
+        );
+
+        // In browsers isomorphic-ws is the native WebSocket, whose second
+        // argument is a subprotocol list — passing an options object throws
+        // SyntaxError. Custom headers are only supported (and only needed)
+        // in Node, where `ws` accepts (url, options).
+        const ws =
+          typeof window === 'undefined'
+            ? new WebSocket(url, { headers: baseHeaders })
+            : new WebSocket(url);
+        ws.binaryType = 'arraybuffer';
+        if (signal) {
+          const onAbort = () => {
+            try {
+              ws.close();
+            } catch {
+              // ignore close failures
+            }
+            finish('reject', wsAbortError(signal));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+          detachAbort = () => signal.removeEventListener('abort', onAbort);
+        }
+
+        let audioData = new ArrayBuffer(0);
+        const boundaries: TTSWordBoundary[] = [];
+
+        ws.addEventListener('open', () => {
+          ws.send(config);
+          ws.send(content);
         });
-      }
-    }; // end connectWithUrl
 
-    return useBingDirect ? connectWithUrl(bingUrl) : ttsWsLoadBalancer.fetch(connectWithUrl);
+        ws.addEventListener('message', (event: WebSocket.MessageEvent) => {
+          if (typeof event.data === 'string') {
+            const { headers, body } = getHeadersAndData(event.data);
+            if (headers['Path'] === 'audio.metadata') {
+              boundaries.push(...parseAudioMetadataBody(body.trim()));
+            } else if (headers['Path'] === 'turn.end') {
+              try {
+                ws.close();
+              } catch {
+                // ignore close failures
+              }
+              if (!audioData.byteLength) {
+                return finish('reject', new Error('No audio data received.'));
+              }
+              finish('resolve', { response: new Response(audioData), boundaries });
+            }
+          } else if (event.data instanceof ArrayBuffer) {
+            const dataView = new DataView(event.data);
+            const headerLength = dataView.getInt16(0);
+            if (event.data.byteLength > headerLength + 2) {
+              const newBody = event.data.slice(2 + headerLength);
+              const merged = new Uint8Array(audioData.byteLength + newBody.byteLength);
+              merged.set(new Uint8Array(audioData), 0);
+              merged.set(new Uint8Array(newBody), audioData.byteLength);
+              audioData = merged.buffer;
+            }
+          }
+        });
+
+        ws.addEventListener('close', () => {
+          // A clean-looking close before turn.end (connection reset, proxy
+          // idle-kill, server restart) used to be ignored here whenever some
+          // audio had already arrived, leaving this promise — and the
+          // scheduler awaiting it — parked forever with no further chunks
+          // ever scheduled. Always settle: reject with a retryable error
+          // (distinct from the permanent "no audio data" case) so the retry
+          // path opens a fresh connection instead of stalling playback.
+          if (settled) return;
+          if (!audioData.byteLength) {
+            finish('reject', new Error('No audio data received.'));
+          } else {
+            finish('reject', new Error('Edge TTS WebSocket closed unexpectedly.'));
+          }
+        });
+
+        ws.addEventListener('error', () => {
+          finish('reject', new Error('WebSocket error occurred.'));
+        });
+      });
+    }
   }
 
   async #fetchEdgeSpeech(payload: EdgeTTSPayload, signal?: AbortSignal): Promise<EdgeSpeechAudio> {

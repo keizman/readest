@@ -36,20 +36,11 @@ vi.mock('isomorphic-ws', () => ({
   },
 }));
 
-const TEST_WS_URL = 'ws://localhost/consumer/speech/synthesize/readaloud/edge/v1';
-
 vi.mock('@/services/environment', () => ({
   getAPIBaseUrl: () => 'http://localhost/api',
   getEdgeTTSBaseUrl: () => 'http://localhost',
-  getEdgeTTSWsUrl: () => TEST_WS_URL,
-  EDGE_TTS_WS_PATH: '/consumer/speech/synthesize/readaloud/edge/v1',
+  getEdgeTTSWsUrl: () => 'ws://localhost/consumer/speech/synthesize/readaloud/edge/v1',
   isTauriAppPlatform: () => false,
-}));
-
-vi.mock('@/libs/ttsWsLoadBalancer', () => ({
-  ttsWsLoadBalancer: {
-    fetch: (fetchFn: (url: string) => Promise<unknown>) => fetchFn(TEST_WS_URL),
-  },
 }));
 
 vi.mock('@/utils/supabase', () => ({
