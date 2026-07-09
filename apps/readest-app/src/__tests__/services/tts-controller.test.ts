@@ -14,6 +14,7 @@ const edgeTTSState = vi.hoisted(() => ({
 
 vi.mock('@/libs/edgeTTS', () => ({
   hasTTSPrefetchCapacity: () => edgeTTSState.hasPrefetchCapacity,
+  getEdgeTTSWsMaxConcurrent: () => 2,
 }));
 
 vi.mock('@/services/tts/WebSpeechClient', () => ({
@@ -1448,7 +1449,7 @@ describe('TTSController', () => {
       expect(callOrder).not.toContain('next-after-async');
     });
 
-    test('buffers at least five minutes even when the text has many short paragraphs', async () => {
+    test('buffers deep look-ahead even when the text has many short paragraphs', async () => {
       await controller.init();
       const paragraph = Array.from({ length: 20 }, () => 'word').join(' ');
       const paragraphs = Array.from({ length: 50 }, () => `<speak>${paragraph}</speak>`);
@@ -1469,7 +1470,10 @@ describe('TTSController', () => {
       // and forces playback to synthesize them again.
       expect(speakMarksSpy.mock.calls.length).toBeGreaterThanOrEqual(45);
       expect(speakMarksSpy.mock.calls.every((call) => call[0].length === 1)).toBe(true);
-      expect(mockView.tts!.prev).toHaveBeenCalledTimes(speakMarksSpy.mock.calls.length);
+      // The current-section cursor is rewound exactly once per gathered
+      // paragraph (the deeper walk into following sections uses isolated TTS
+      // iterators and never touches view.tts).
+      expect(mockView.tts!.prev).toHaveBeenCalledTimes(50);
     });
 
     test('prefetches paragraphs even when audio cache byte-count exceeds capacity', async () => {

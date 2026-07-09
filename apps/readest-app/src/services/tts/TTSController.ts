@@ -10,7 +10,7 @@ import {
   TTSVoice,
 } from './types';
 import { createRejectFilter } from '@/utils/node';
-import { WsSlotPriority } from '@/libs/edgeTTS';
+import { getEdgeTTSWsMaxConcurrent, WsSlotPriority } from '@/libs/edgeTTS';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
@@ -34,15 +34,20 @@ import {
 // across sessions.
 let ttsPositionSequence = 0;
 
-// Keep at least five minutes of wall-clock speech ready in the Edge LRU cache.
-// Duration is estimated per paragraph (CJK chars vs. words), so English and
-// short dialogue receive the same real playback buffer as dense CJK prose.
-// 100 paragraphs is still below the 800-entry cache in the worst short-block
-// case, while avoiding the old 16-paragraph cap that held under two minutes of
-// English dialogue. Prefetch continues into following sections when needed.
-const PREFETCH_TARGET_SECONDS = 5 * 60;
-const PREFETCH_MAX_PARAGRAPHS = 100;
-const PREFETCH_PARALLELISM = 1;
+// Deep look-ahead prefetch sized to genuinely fill the Edge audio cache
+// rather than stopping at a few minutes: two hours of speech at Edge's
+// 48 kbit/s MP3 is ~43 MB, comfortably inside TTS_AUDIO_CACHE_MAX_BYTES
+// (64 MB) and the entry caps, so the whole window stays cached without
+// evicting unplayed audio. Duration is estimated per paragraph (CJK chars vs.
+// words), so English and short dialogue receive the same real playback buffer
+// as dense CJK prose. Prefetch continues into following sections when needed.
+const PREFETCH_TARGET_SECONDS = 2 * 60 * 60;
+const PREFETCH_MAX_PARAGRAPHS = 1500;
+// Paragraph-level prefetch workers, scaled to the WS backend pool so N relays
+// are all kept busy filling the cache. Capped at the pool's low-priority slot
+// budget (one slot is always reserved for the playhead's 'high' requests, and
+// 'high' jumps the wait queue), so a deeper prefetch can never starve playback.
+const prefetchParallelism = (): number => Math.max(1, getEdgeTTSWsMaxConcurrent() - 1);
 
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
 // utterance it cannot synthesize offline — typically a specific unsupported
@@ -726,7 +731,7 @@ export class TTSController extends EventTarget {
       }
     };
     await Promise.all(
-      Array.from({ length: Math.min(PREFETCH_PARALLELISM, rawSsmls.length) }, () => worker()),
+      Array.from({ length: Math.min(prefetchParallelism(), rawSsmls.length) }, () => worker()),
     );
   }
 

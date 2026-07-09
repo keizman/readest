@@ -37,6 +37,7 @@ vi.mock('@/libs/edgeTTS', () => {
     EDGE_TTS_MAX_RATE: 2.0,
     EDGE_TTS_PROTOCOL: 'wss',
     TTS_WS_MAX_CONCURRENT: 2,
+    getEdgeTTSWsMaxConcurrent: () => 2,
     TTS_AUDIO_CACHE_MAX_BYTES: 20 * 60 * 6 * 1024,
     getTTSAudioCacheBytes: () => 0,
     hasTTSPrefetchCapacity: () => true,

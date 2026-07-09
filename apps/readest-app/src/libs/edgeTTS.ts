@@ -431,8 +431,13 @@ export class EdgeSpeechTTS {
     EdgeSpeechTTS.audioCacheBytes = Math.max(0, EdgeSpeechTTS.audioCacheBytes - blob.size);
     EdgeSpeechTTS.boundariesCache.delete(key);
   };
-  private static audioCache = new FIFOCache<string, Blob>(800, EdgeSpeechTTS.onAudioCacheEvict);
-  private static boundariesCache = new FIFOCache<string, TTSWordBoundary[]>(800);
+  // Entry caps sized well above what TTS_AUDIO_CACHE_MAX_BYTES can hold
+  // (~1000 typical batches at 64 MB), so the byte cap — which
+  // hasTTSPrefetchCapacity() gates prefetch on — is the effective limit and
+  // the deep look-ahead can genuinely fill the cache instead of churning
+  // against an entry-count ceiling.
+  private static audioCache = new FIFOCache<string, Blob>(2000, EdgeSpeechTTS.onAudioCacheEvict);
+  private static boundariesCache = new FIFOCache<string, TTSWordBoundary[]>(2000);
   private static trimAudioCache = () => {
     while (
       EdgeSpeechTTS.audioCacheBytes > TTS_AUDIO_CACHE_MAX_BYTES &&

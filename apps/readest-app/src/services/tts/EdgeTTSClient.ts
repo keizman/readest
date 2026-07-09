@@ -6,6 +6,7 @@ import {
   EdgeTTSPayload,
   EDGE_TTS_MAX_RATE,
   EDGE_TTS_PROTOCOL,
+  getEdgeTTSWsMaxConcurrent,
   isTTSPayloadCached,
   TTS_WS_MAX_CONCURRENT,
   TTSWordBoundary,
@@ -455,11 +456,23 @@ export class EdgeTTSClient implements TTSClient {
     let nextBackgroundIndex = criticalCount;
     const runBackgroundBatches = async () => {
       await Promise.allSettled(criticalPromises.slice(blockingCount));
-      while (!signal.aborted) {
-        const index = nextBackgroundIndex++;
-        if (index >= batches.length) return;
-        await runBatch(index);
-      }
+      // Fill the remaining batches with as many parallel workers as the WS
+      // backend pool can absorb minus the slot reserved for the playhead —
+      // with N relays configured this keeps all of them busy instead of
+      // trickling one request at a time. The WS slot gate still enforces the
+      // real in-flight cap, and 'high' playback requests jump its queue.
+      const workerCount = Math.min(
+        Math.max(1, getEdgeTTSWsMaxConcurrent() - 1),
+        Math.max(1, batches.length - nextBackgroundIndex),
+      );
+      const backgroundWorker = async () => {
+        while (!signal.aborted) {
+          const index = nextBackgroundIndex++;
+          if (index >= batches.length) return;
+          await runBatch(index);
+        }
+      };
+      await Promise.all(Array.from({ length: workerCount }, () => backgroundWorker()));
     };
     // Deep look-ahead prefetch (awaitAll) must finish every batch of this
     // paragraph before the caller moves to the next one, so the walk truly
