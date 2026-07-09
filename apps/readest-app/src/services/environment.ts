@@ -1,5 +1,7 @@
 import { AppService } from '@/types/system';
 import {
+  EDGE_TTS_API_KEY_HEADER,
+  READEST_EDGE_TTS_API_KEY,
   READEST_EDGE_TTS_BASE_URL,
   READEST_EDGE_TTS_BASE_URLS,
   READEST_NODE_BASE_URL,
@@ -111,6 +113,38 @@ export const getEdgeTTSWsUrls = (): string[] => {
       : getEdgeTTSBaseUrls().map(toEdgeTTSWsUrl);
   // Dedup so a backend is never probed twice in one request.
   return Array.from(new Set(raw.filter(Boolean)));
+};
+
+// Shared secret for self-hosted Edge TTS (header X-Readest-TTS-Key).
+// Empty string disables sending auth (only useful if server auth is off).
+export const getEdgeTTSApiKey = (): string =>
+  process.env['NEXT_PUBLIC_EDGE_TTS_API_KEY'] ?? READEST_EDGE_TTS_API_KEY;
+
+export { EDGE_TTS_API_KEY_HEADER };
+
+/** Headers to attach on self-hosted HTTP / WS upgrade requests. */
+export const getEdgeTTSAuthHeaders = (): Record<string, string> => {
+  const key = getEdgeTTSApiKey();
+  if (!key) return {};
+  return { [EDGE_TTS_API_KEY_HEADER]: key };
+};
+
+/**
+ * Append `?key=` for environments that cannot set WebSocket request headers
+ * (browser native WebSocket). Safe no-op when key is empty or already present.
+ */
+export const withEdgeTTSAuthQuery = (wsUrl: string): string => {
+  const key = getEdgeTTSApiKey();
+  if (!key) return wsUrl;
+  try {
+    const parsed = new URL(wsUrl);
+    if (!parsed.searchParams.has('key')) {
+      parsed.searchParams.set('key', key);
+    }
+    return parsed.toString();
+  } catch {
+    return wsUrl;
+  }
 };
 
 export const isMacPlatform = () =>

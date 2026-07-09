@@ -837,6 +837,12 @@ export const READEST_EDGE_TTS_BASE_URLS = [
 export const READEST_EDGE_TTS_BASE_URL =
   READEST_EDGE_TTS_BASE_URLS[0] ?? 'http://175.178.236.127:57880';
 
+// Shared secret sent as `X-Readest-TTS-Key` on every self-hosted TTS request.
+// Must match the server DEFAULT_API_KEY / READEST_TTS_API_KEY / --api-key.
+// Override at build time with NEXT_PUBLIC_EDGE_TTS_API_KEY.
+export const READEST_EDGE_TTS_API_KEY = 'rdst_tts_7f3a9c2e1b84d6f0a5e8c3b1';
+export const EDGE_TTS_API_KEY_HEADER = 'X-Readest-TTS-Key';
+
 export const SHARE_BASE_URL = `${READEST_WEB_BASE_URL}/s`;
 export const SHARE_EXPIRATION_DAYS = [1, 3, 7] as const;
 

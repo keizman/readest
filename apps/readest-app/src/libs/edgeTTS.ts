@@ -3,7 +3,13 @@ import WebSocket from 'isomorphic-ws';
 import { randomMd5 } from '@/utils/misc';
 import { FIFOCache } from '@/utils/lru';
 import { genSSML } from '@/utils/ssml';
-import { getEdgeTTSBaseUrl, getEdgeTTSWsUrl, isTauriAppPlatform } from '@/services/environment';
+import {
+  getEdgeTTSAuthHeaders,
+  getEdgeTTSBaseUrl,
+  getEdgeTTSWsUrl,
+  isTauriAppPlatform,
+  withEdgeTTSAuthQuery,
+} from '@/services/environment';
 import { edgeTTSBackends } from '@/libs/edgeTTSBackends';
 
 // Cloudflare Workers expose a global `WebSocketPair` that is not available in
@@ -622,6 +628,7 @@ export class EdgeSpeechTTS {
       headers: {
         'Content-Type': 'application/json',
         [TTS_ACCEPT_ENCODING_HEADER]: TTS_ACCEPT_ENCODING_VALUE,
+        ...getEdgeTTSAuthHeaders(),
       },
       body: JSON.stringify({
         input: text,
@@ -649,7 +656,7 @@ export class EdgeSpeechTTS {
     // `wsUrl` is the balancer-selected self-hosted backend for this attempt;
     // fall back to the single-URL derivation when the caller doesn't pass one
     // (bing direct, or a self-hosted call outside the balancing wrapper).
-    const url =
+    const rawUrl =
       wsUrl ??
       (useBingDirect
         ? `${EDGE_SPEECH_URL}?${new URLSearchParams({
@@ -659,6 +666,9 @@ export class EdgeSpeechTTS {
             'Sec-MS-GEC-Version': `1-${CHROMIUM_FULL_VERSION}`,
           }).toString()}`
         : getEdgeTTSWsUrl());
+    // Self-hosted backends require X-Readest-TTS-Key. Tauri/Node can send it
+    // as a handshake header; browsers cannot, so also put ?key= on the URL.
+    const url = useBingDirect ? rawUrl : withEdgeTTSAuthQuery(rawUrl);
     const date = new Date().toString();
     const baseHeaders: Record<string, string> = useBingDirect
       ? {
@@ -674,7 +684,7 @@ export class EdgeSpeechTTS {
           'Sec-WebSocket-Version': '13',
           Cookie: `muid=${generateMuid()};`,
         }
-      : {};
+      : { ...getEdgeTTSAuthHeaders() };
     const configHeaders = {
       'Content-Type': 'application/json; charset=utf-8',
       Path: 'speech.config',

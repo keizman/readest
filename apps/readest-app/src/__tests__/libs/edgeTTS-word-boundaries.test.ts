@@ -41,6 +41,9 @@ vi.mock('@/services/environment', () => ({
   getEdgeTTSBaseUrl: () => 'http://localhost',
   getEdgeTTSWsUrl: () => 'ws://localhost/consumer/speech/synthesize/readaloud/edge/v1',
   getEdgeTTSWsUrls: () => ['ws://localhost/consumer/speech/synthesize/readaloud/edge/v1'],
+  getEdgeTTSApiKey: () => 'test-key',
+  getEdgeTTSAuthHeaders: () => ({ 'X-Readest-TTS-Key': 'test-key' }),
+  withEdgeTTSAuthQuery: (url: string) => url,
   isTauriAppPlatform: () => false,
 }));
 
