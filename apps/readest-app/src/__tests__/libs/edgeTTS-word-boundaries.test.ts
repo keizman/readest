@@ -40,6 +40,7 @@ vi.mock('@/services/environment', () => ({
   getAPIBaseUrl: () => 'http://localhost/api',
   getEdgeTTSBaseUrl: () => 'http://localhost',
   getEdgeTTSWsUrl: () => 'ws://localhost/consumer/speech/synthesize/readaloud/edge/v1',
+  getEdgeTTSWsUrls: () => ['ws://localhost/consumer/speech/synthesize/readaloud/edge/v1'],
   isTauriAppPlatform: () => false,
 }));
 

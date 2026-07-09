@@ -1,6 +1,7 @@
 import { AppService } from '@/types/system';
 import {
   READEST_EDGE_TTS_BASE_URL,
+  READEST_EDGE_TTS_BASE_URLS,
   READEST_NODE_BASE_URL,
   READEST_WEB_BASE_URL,
 } from './constants';
@@ -24,24 +25,92 @@ export const getBaseUrl = () =>
 export const getNodeBaseUrl = () =>
   process.env['NEXT_PUBLIC_NODE_BASE_URL'] ?? READEST_NODE_BASE_URL;
 
-// Base URL of the self-hosted Edge TTS server. Overridable at build time via
-// NEXT_PUBLIC_EDGE_TTS_BASE_URL; otherwise defaults to the hosted instance.
-export const getEdgeTTSBaseUrl = () =>
-  process.env['NEXT_PUBLIC_EDGE_TTS_BASE_URL'] ?? READEST_EDGE_TTS_BASE_URL;
-
-// WebSocket endpoint for self-hosted Edge TTS (Edge read-aloud protocol).
-// Override with NEXT_PUBLIC_EDGE_TTS_WS_URL; otherwise derived from getEdgeTTSBaseUrl().
+// WebSocket path for self-hosted Edge TTS (Edge read-aloud protocol).
 export const EDGE_TTS_WS_PATH = '/consumer/speech/synthesize/readaloud/edge/v1';
 
-export const getEdgeTTSWsUrl = (): string => {
-  const explicit = process.env['NEXT_PUBLIC_EDGE_TTS_WS_URL'];
-  if (explicit) return explicit;
-  const parsed = new URL(getEdgeTTSBaseUrl());
+const splitCsv = (value: string): string[] =>
+  value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+/**
+ * Normalize a TTS base entry to an absolute HTTP(S) origin.
+ * Accepts:
+ *   - full URL:  http://1.2.3.4:57880  /  https://tts.example.com
+ *   - bare host: 1.2.3.4:57880  /  tts.example.com:57880  (http:// assumed)
+ *   - ws/wss URL: converted back to http/https base (path stripped)
+ */
+export const normalizeEdgeTTSBaseUrl = (raw: string): string => {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  try {
+    const withScheme = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(trimmed) ? trimmed : `http://${trimmed}`;
+    const parsed = new URL(withScheme);
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+    else if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+    parsed.pathname = '';
+    parsed.search = '';
+    parsed.hash = '';
+    // URL.origin drops non-default ports correctly; keep trailing-slash free.
+    return parsed.origin;
+  } catch {
+    return trimmed;
+  }
+};
+
+// Convert an HTTP(S) base URL to its Edge read-aloud WebSocket URL.
+export const toEdgeTTSWsUrl = (baseUrl: string): string => {
+  const parsed = new URL(normalizeEdgeTTSBaseUrl(baseUrl));
   parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
   parsed.pathname = EDGE_TTS_WS_PATH;
   parsed.search = '';
   parsed.hash = '';
   return parsed.toString();
+};
+
+// Base URL of the self-hosted Edge TTS server (HTTPS fallback path).
+// Override: NEXT_PUBLIC_EDGE_TTS_BASE_URL; else first entry of the pool.
+export const getEdgeTTSBaseUrl = () =>
+  normalizeEdgeTTSBaseUrl(
+    process.env['NEXT_PUBLIC_EDGE_TTS_BASE_URL'] ??
+      getEdgeTTSBaseUrls()[0] ??
+      READEST_EDGE_TTS_BASE_URL,
+  );
+
+export const getEdgeTTSWsUrl = (): string => {
+  const explicit = process.env['NEXT_PUBLIC_EDGE_TTS_WS_URL'];
+  if (explicit) return explicit;
+  return toEdgeTTSWsUrl(getEdgeTTSBaseUrl());
+};
+
+// Full set of interchangeable self-hosted Edge TTS HTTP base URLs.
+// Supports any count (1..N). Precedence:
+//   1. NEXT_PUBLIC_EDGE_TTS_BASE_URLS (comma-separated)
+//   2. NEXT_PUBLIC_EDGE_TTS_BASE_URL  (single, back-compat)
+//   3. READEST_EDGE_TTS_BASE_URLS     (constants.ts — default edit point)
+export const getEdgeTTSBaseUrls = (): string[] => {
+  const explicitList = process.env['NEXT_PUBLIC_EDGE_TTS_BASE_URLS'];
+  const raw = explicitList
+    ? splitCsv(explicitList)
+    : process.env['NEXT_PUBLIC_EDGE_TTS_BASE_URL']
+      ? [process.env['NEXT_PUBLIC_EDGE_TTS_BASE_URL'] as string]
+      : [...READEST_EDGE_TTS_BASE_URLS];
+  return Array.from(new Set(raw.map(normalizeEdgeTTSBaseUrl).filter(Boolean)));
+};
+
+// WS URLs the load balancer rotates over (any count). Prefer configuring
+// HTTP bases (getEdgeTTSBaseUrls) and let this derive ws://.../edge/v1.
+// Direct override: NEXT_PUBLIC_EDGE_TTS_WS_URLS / NEXT_PUBLIC_EDGE_TTS_WS_URL.
+export const getEdgeTTSWsUrls = (): string[] => {
+  const explicitWsList = process.env['NEXT_PUBLIC_EDGE_TTS_WS_URLS'];
+  const raw = explicitWsList
+    ? splitCsv(explicitWsList)
+    : process.env['NEXT_PUBLIC_EDGE_TTS_WS_URL']
+      ? [process.env['NEXT_PUBLIC_EDGE_TTS_WS_URL'] as string]
+      : getEdgeTTSBaseUrls().map(toEdgeTTSWsUrl);
+  // Dedup so a backend is never probed twice in one request.
+  return Array.from(new Set(raw.filter(Boolean)));
 };
 
 export const isMacPlatform = () =>

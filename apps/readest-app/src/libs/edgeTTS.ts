@@ -4,6 +4,7 @@ import { randomMd5 } from '@/utils/misc';
 import { FIFOCache } from '@/utils/lru';
 import { genSSML } from '@/utils/ssml';
 import { getEdgeTTSBaseUrl, getEdgeTTSWsUrl, isTauriAppPlatform } from '@/services/environment';
+import { edgeTTSBackends } from '@/libs/edgeTTSBackends';
 
 // Cloudflare Workers expose a global `WebSocketPair` that is not available in
 // browsers or Node.js. The Node `ws` package (used transitively via
@@ -640,18 +641,24 @@ export class EdgeSpeechTTS {
   async #fetchEdgeSpeechWs(
     { lang, text, voice, rate }: EdgeTTSPayload,
     signal?: AbortSignal,
+    wsUrl?: string,
   ): Promise<EdgeSpeechAudio> {
     EdgeSpeechTTS.rejectIfAborted(signal);
     const connectId = randomMd5();
     const useBingDirect = this.wsTarget === 'bing';
-    const url = useBingDirect
-      ? `${EDGE_SPEECH_URL}?${new URLSearchParams({
-          ConnectionId: connectId,
-          TrustedClientToken: EDGE_API_TOKEN,
-          'Sec-MS-GEC': await generateSecMsGec(),
-          'Sec-MS-GEC-Version': `1-${CHROMIUM_FULL_VERSION}`,
-        }).toString()}`
-      : getEdgeTTSWsUrl();
+    // `wsUrl` is the balancer-selected self-hosted backend for this attempt;
+    // fall back to the single-URL derivation when the caller doesn't pass one
+    // (bing direct, or a self-hosted call outside the balancing wrapper).
+    const url =
+      wsUrl ??
+      (useBingDirect
+        ? `${EDGE_SPEECH_URL}?${new URLSearchParams({
+            ConnectionId: connectId,
+            TrustedClientToken: EDGE_API_TOKEN,
+            'Sec-MS-GEC': await generateSecMsGec(),
+            'Sec-MS-GEC-Version': `1-${CHROMIUM_FULL_VERSION}`,
+          }).toString()}`
+        : getEdgeTTSWsUrl());
     const date = new Date().toString();
     const baseHeaders: Record<string, string> = useBingDirect
       ? {
@@ -1065,6 +1072,44 @@ export class EdgeSpeechTTS {
     }
   }
 
+  // Try the self-hosted backends in balancer-preferred order, opening a fresh
+  // WS to the next one only after the current attempt fails. This runs inside
+  // the shared inflight/WS-slot machinery of #fetchAndCache, so failover is
+  // strictly sequential for a given payload — a request is never sent to two
+  // backends at once, and duplicate payloads still share one inflight promise.
+  async #fetchEdgeSpeechWsBalanced(
+    payload: EdgeTTSPayload,
+    signal?: AbortSignal,
+  ): Promise<EdgeSpeechAudio> {
+    // Bing direct has no pool; keep its self-contained URL/auth handling.
+    if (this.wsTarget !== 'self-hosted') {
+      return this.#fetchEdgeSpeechWs(payload, signal);
+    }
+
+    const candidates = edgeTTSBackends.orderedCandidates();
+    if (candidates.length === 0) {
+      // No configured pool (shouldn't happen) — fall back to the single URL.
+      return this.#fetchEdgeSpeechWs(payload, signal);
+    }
+
+    let lastError: unknown;
+    for (const url of candidates) {
+      EdgeSpeechTTS.rejectIfAborted(signal);
+      try {
+        const result = await this.#fetchEdgeSpeechWs(payload, signal, url);
+        edgeTTSBackends.reportSuccess(url);
+        return result;
+      } catch (error) {
+        // A user-initiated abort is not a backend fault; surface it without
+        // benching the backend or failing over.
+        if (signal?.aborted) throw error;
+        edgeTTSBackends.reportFailure(url);
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error('All Edge TTS backends failed.');
+  }
+
   async #fetchEdgeSpeech(payload: EdgeTTSPayload, signal?: AbortSignal): Promise<EdgeSpeechAudio> {
     if (this.protocol === 'https') {
       // The HTTPS proxy streams the audio body and carries word boundaries in
@@ -1075,7 +1120,7 @@ export class EdgeSpeechTTS {
         boundaries: parseWordBoundariesHeader(response.headers.get(WORD_BOUNDARIES_HEADER)),
       };
     } else {
-      return this.#fetchEdgeSpeechWs(payload, signal);
+      return this.#fetchEdgeSpeechWsBalanced(payload, signal);
     }
   }
 

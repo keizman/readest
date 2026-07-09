@@ -815,10 +815,27 @@ export const DOWNLOAD_READEST_URL = 'https://readest.com?utm_source=readest_web'
 export const READEST_WEB_BASE_URL = 'https://web.readest.com';
 export const READEST_NODE_BASE_URL = 'https://node.readest.com';
 
-// Self-hosted Edge TTS server (see edge-tts/server/readest_tts_server.py).
-// HTTP: POST `${base}/api/tts/edge` -> audio/mpeg + word boundaries.
-// WSS:  `${wsBase}/consumer/speech/synthesize/readaloud/edge/v1` (Edge protocol).
-export const READEST_EDGE_TTS_BASE_URL = 'http://175.178.236.127:57880';
+// ── Edge TTS backend pool ──────────────────────────────────────────────────
+// THE place to add/remove self-hosted TTS servers for WS load-balancing.
+// Just append another entry — N backends are fully supported (round-robin +
+// per-URL 10min cooldown + sequential failover). No other code changes needed.
+//
+// Formats accepted (see environment.normalizeEdgeTTSBaseUrl):
+//   'http://47.112.207.44:57880'   // preferred
+//   '47.112.207.44:57880'          // bare host:port (http:// assumed)
+//
+// Build-time override (comma-separated, same formats):
+//   NEXT_PUBLIC_EDGE_TTS_BASE_URLS=http://a:57880,http://b:57880,c:57880
+// See edge-tts/server/readest_tts_server.py and libs/edgeTTSBackends.ts.
+export const READEST_EDGE_TTS_BASE_URLS = [
+  'http://47.112.207.44:57880',
+  'http://175.178.236.127:57880',
+  'http://47.112.207.44:57881',
+];
+
+// HTTPS single-base fallback (POST /api/tts/edge). Defaults to first pool entry.
+export const READEST_EDGE_TTS_BASE_URL =
+  READEST_EDGE_TTS_BASE_URLS[0] ?? 'http://175.178.236.127:57880';
 
 export const SHARE_BASE_URL = `${READEST_WEB_BASE_URL}/s`;
 export const SHARE_EXPIRATION_DAYS = [1, 3, 7] as const;
