@@ -358,8 +358,22 @@ export const hashTTSPayload = (payload: EdgeTTSPayload): string => {
 
 export type EDGE_TTS_PROTOCOL = 'wss' | 'https';
 
-// Max concurrent self-hosted WS synthesis requests (preload + playback share this).
-export const TTS_WS_MAX_CONCURRENT = 2;
+// Concurrent self-hosted WS synthesis requests one relay can absorb without
+// degrading (preload + playback share these slots). This is the *per-backend*
+// budget; the effective pool-wide limit scales with the number of configured
+// relays (see getEdgeTTSWsMaxConcurrent). Kept exported under the historical
+// name so the startup preload / tests still read a stable single-relay value.
+export const TTS_WS_MAX_CONCURRENT = 4;
+
+// Pool-wide max concurrent self-hosted WS requests. The round-robin balancer
+// (edgeTTSBackends) spreads simultaneous requests across every healthy relay,
+// so N backends can safely keep N * per-backend requests in flight. With three
+// relays this is 6, which is what "unlocks" the deep look-ahead pipeline that
+// was previously bottlenecked at a single relay's budget. Falls back to one
+// relay's budget when only a single URL is configured (or the pool is empty,
+// e.g. bing-direct, where the WS slot gate is not used at all).
+export const getEdgeTTSWsMaxConcurrent = (): number =>
+  TTS_WS_MAX_CONCURRENT * Math.max(1, edgeTTSBackends.getBackendUrls().length);
 
 // Backstop for a synthesis request that never resolves because the socket
 // closes/hangs without ever delivering a close or error event (observed with
@@ -503,16 +517,17 @@ export class EdgeSpeechTTS {
   // 'low' prefetch is capped one below the max so at least one slot is always
   // reserved for the playhead. This guarantees a 'high' request never waits for
   // an in-flight 'low' fetch to finish (it can only ever queue behind other
-  // 'high' work) — the deep look-ahead prefetch can no longer occupy both slots
-  // and starve the current sentence during a bandwidth squeeze. With
-  // TTS_WS_MAX_CONCURRENT === 2 this means deep prefetch runs strictly one at a
-  // time, which is exactly the throttle we want while the network is tight.
+  // 'high' work) — the deep look-ahead prefetch can no longer occupy every slot
+  // and starve the current sentence during a bandwidth squeeze. The cap scales
+  // with the pool size: with three relays the pool-wide max is 6, so deep
+  // prefetch may run up to 5 fetches in parallel (one slot reserved) instead of
+  // the single-relay throttle of one at a time.
   private static wsLowSlotLimit(): number {
-    return Math.max(1, TTS_WS_MAX_CONCURRENT - 1);
+    return Math.max(1, getEdgeTTSWsMaxConcurrent() - 1);
   }
 
   private static canAcquireWsSlot(priority: WsSlotPriority): boolean {
-    if (EdgeSpeechTTS.wsInFlight >= TTS_WS_MAX_CONCURRENT) return false;
+    if (EdgeSpeechTTS.wsInFlight >= getEdgeTTSWsMaxConcurrent()) return false;
     if (priority === 'low' && EdgeSpeechTTS.wsLowInFlight >= EdgeSpeechTTS.wsLowSlotLimit()) {
       return false;
     }

@@ -830,6 +830,7 @@ export const READEST_NODE_BASE_URL = 'https://node.readest.com';
 export const READEST_EDGE_TTS_BASE_URLS = [
   'http://47.112.207.44:57880',
   'http://175.178.236.127:57880',
+  'http://47.112.207.44:57882',
   'http://47.112.207.44:57881',
 ];
 

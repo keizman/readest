@@ -136,8 +136,8 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
     expect(cached.boundaries).toEqual(boundaries);
   });
 
-  test('caps low-priority prefetch to one WS slot and reserves one for playback', async () => {
-    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+  test('caps low-priority prefetch and reserves one slot for playback', async () => {
+    const { EdgeSpeechTTS, TTS_WS_MAX_CONCURRENT } = await import('@/libs/edgeTTS');
     const tts = new EdgeSpeechTTS('wss');
     const payload = (text: string) => ({
       lang: 'en',
@@ -146,13 +146,15 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
       rate: 1.0,
       pitch: 1.0,
     });
+    const lowLimit = Math.max(1, TTS_WS_MAX_CONCURRENT - 1);
 
-    const p1 = tts.createAudioData(payload('one'));
-    const p2 = tts.createAudioData(payload('two'));
-    const p3High = tts.createAudioData(payload('three'), undefined, 'high');
-    // Only one low slot is available, so the second low request queues while the
-    // reserved slot is taken immediately by the high-priority playback fetch.
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(2));
+    // Fill every low slot, queue one more low, and take the reserved high slot.
+    const lowPs = Array.from({ length: lowLimit }, (_, i) =>
+      tts.createAudioData(payload(`low-${i}`)),
+    );
+    const queuedLow = tts.createAudioData(payload('queued-low'));
+    const highP = tts.createAudioData(payload('playback-high'), undefined, 'high');
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(lowLimit + 1));
 
     const finish = (index: number) => {
       const ws = wsState.instances[index]!;
@@ -160,19 +162,19 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
       ws.emit('message', { data: makeBinaryAudioFrame(new Uint8Array([index])) });
       ws.emit('message', { data: 'Path:turn.end\r\n\r\n' });
     };
+    // Free one low slot so the queued low can start; high is already on reserved.
     finish(0);
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(3));
-    finish(1);
-    finish(2);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(lowLimit + 2));
+    for (let i = 1; i < wsState.instances.length; i++) finish(i);
 
-    const [r1, r2, r3] = await Promise.all([p1, p2, p3High]);
-    expect(new Uint8Array(r1.data)[0]).toBe(0); // socket 0: first low
-    expect(new Uint8Array(r3.data)[0]).toBe(1); // socket 1: high (reserved slot)
-    expect(new Uint8Array(r2.data)[0]).toBe(2); // socket 2: queued low
+    const results = await Promise.all([...lowPs, queuedLow, highP]);
+    expect(results).toHaveLength(lowLimit + 2);
+    // High was on the reserved slot (index lowLimit before queued low opened).
+    expect(new Uint8Array(results[results.length - 1]!.data)[0]).toBe(lowLimit);
   });
 
   test('aborted queued WS request does not block later audio from starting', async () => {
-    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const { EdgeSpeechTTS, TTS_WS_MAX_CONCURRENT } = await import('@/libs/edgeTTS');
     const tts = new EdgeSpeechTTS('wss');
     const payload = (text: string) => ({
       lang: 'en',
@@ -181,18 +183,26 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
       rate: 1.0,
       pitch: 1.0,
     });
+    const lowLimit = Math.max(1, TTS_WS_MAX_CONCURRENT - 1);
     const abortQueued = new AbortController();
 
-    const p1 = tts.createAudioData(payload('abort-queue-one'));
-    const p2 = tts.createAudioData(payload('abort-queue-two'));
-    const p3 = tts
-      .createAudioData(payload('abort-queue-three'), abortQueued.signal)
+    // Saturate low slots so subsequent requests queue.
+    const activeLows = Array.from({ length: lowLimit }, (_, i) =>
+      tts.createAudioData(payload(`abort-active-${i}`)),
+    );
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(lowLimit));
+
+    const aborted = tts
+      .createAudioData(payload('abort-queued'), abortQueued.signal)
       .catch((error) => error);
-    const p4 = tts.createAudioData(payload('abort-queue-four'));
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(1));
+    const later = tts.createAudioData(payload('abort-later'));
+    await Promise.resolve();
+    await Promise.resolve();
+    // Still only the active low sockets — both aborted and later are queued.
+    expect(wsState.instances.length).toBe(lowLimit);
 
     abortQueued.abort();
-    await expect(p3).resolves.toBeInstanceOf(Error);
+    await expect(aborted).resolves.toBeInstanceOf(Error);
 
     const finish = (index: number) => {
       const ws = wsState.instances[index]!;
@@ -201,13 +211,10 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
       ws.emit('message', { data: 'Path:turn.end\r\n\r\n' });
     };
     finish(0);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(lowLimit + 1));
+    for (let i = 1; i < wsState.instances.length; i++) finish(i);
 
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(2));
-    finish(1);
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(3));
-    finish(2);
-
-    await expect(Promise.all([p1, p2, p4])).resolves.toHaveLength(3);
+    await expect(Promise.all([...activeLows, later])).resolves.toHaveLength(lowLimit + 1);
   });
 
   test('rejects (does not hang forever) when the WS resets after partial audio arrives', async () => {
@@ -292,7 +299,7 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
   });
 
   test('a high-priority request jumps ahead of queued low-priority (background prefetch) requests', async () => {
-    const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
+    const { EdgeSpeechTTS, TTS_WS_MAX_CONCURRENT } = await import('@/libs/edgeTTS');
     const tts = new EdgeSpeechTTS('wss');
     const payload = (text: string) => ({
       lang: 'en',
@@ -301,6 +308,7 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
       rate: 1.0,
       pitch: 1.0,
     });
+    const lowLimit = Math.max(1, TTS_WS_MAX_CONCURRENT - 1);
     const open = (index: number) => wsState.instances[index]!.emit('open');
     const complete = (index: number) => {
       const ws = wsState.instances[index]!;
@@ -308,37 +316,30 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
       ws.emit('message', { data: 'Path:turn.end\r\n\r\n' });
     };
 
-    // One low-priority prefetch takes the single background slot.
-    const pSlotOne = tts.createAudioData(payload('prefetch-slot-one'));
-    const pSlotTwo = tts.createAudioData(payload('prefetch-slot-two'));
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(1));
-    open(0);
+    // Fill every low prefetch slot.
+    const activeLows = Array.from({ length: lowLimit }, (_, i) =>
+      tts.createAudioData(payload(`prefetch-slot-${i}`)),
+    );
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(lowLimit));
+    for (let i = 0; i < lowLimit; i++) open(i);
 
-    // Another background prefetch queues behind the lone low slot.
+    // Another background prefetch queues; playback uses the reserved slot now.
     const pQueuedLow = tts.createAudioData(payload('prefetch-queued-low'));
-    // The imminent-playback fetch uses the reserved slot immediately.
     const pQueuedHigh = tts.createAudioData(payload('playback-queued-high'), undefined, 'high');
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(2));
-    open(1);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(lowLimit + 1));
+    open(lowLimit);
 
-    // The playback-critical request must be on the reserved slot, not behind
-    // the earlier-queued background prefetch request.
-    const highWs = wsState.instances[1]!;
+    // Playback-critical request must be on the reserved slot, not behind the
+    // earlier-queued background prefetch request.
+    const highWs = wsState.instances[lowLimit]!;
     expect(String(highWs.sent[1])).toContain('playback-queued-high');
     expect(String(highWs.sent[1])).not.toContain('prefetch-queued-low');
 
     complete(0);
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(3));
-    open(2);
-    // The second low prefetch must finish before the third queued low can open:
-    // only one low slot is available at a time.
-    complete(2);
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(4));
-    open(3);
-    complete(1);
-    complete(3);
-
-    await Promise.all([pSlotOne, pSlotTwo, pQueuedLow, pQueuedHigh]);
+    await vi.waitFor(() => expect(wsState.instances.length).toBe(lowLimit + 2));
+    open(lowLimit + 1);
+    for (let i = 1; i < wsState.instances.length; i++) complete(i);
+    await Promise.all([...activeLows, pQueuedLow, pQueuedHigh]);
   });
 
   test('resolves with empty boundaries when no metadata frames arrive', async () => {
