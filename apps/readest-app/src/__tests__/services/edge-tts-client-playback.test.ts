@@ -654,25 +654,34 @@ describe('EdgeTTSClient Web Audio playback', () => {
   });
 
   test('a no-audio mark is skipped and the session continues', async () => {
+    // Speakable empty-audio is retried (5x) then skipped; second mark plays.
     parsedMarks = [
       { name: '0', text: 'a'.repeat(80), language: 'en' },
       { name: '1', text: 'Second sentence.', language: 'en' },
     ];
     createAudioDataBehavior = async (text: string) => {
-      if (text.length === 80) throw new Error('No audio data received.');
+      if (text.includes('a'.repeat(20))) throw new Error('No audio data received.');
       return audioOf(1);
     };
     const client = await startClient();
-    // startup splits into separate batches so the 80-char failure is isolated
-    const { events, done } = collectSpeak(client, new AbortController().signal, { startup: true });
-    await flush();
-    await flush();
-    await ctx().advanceTo(5);
+    // startup splits into separate batches so the failure is isolated
+    const { events, done } = collectSpeak(client, new AbortController().signal, {
+      startup: true,
+    });
+    // Do not advance the clock until the second batch has actually scheduled
+    // audio (first batch spends ~2.5s in retry backoff before skip).
+    await vi.waitFor(
+      () => {
+        expect(FakeAudioContext.instances[0]?.sources.length ?? 0).toBeGreaterThan(0);
+      },
+      { timeout: 15000 },
+    );
+    await ctx().advanceTo(10);
     await done;
     const codes = events.map((e) => e.code);
     expect(codes.filter((c) => c === 'boundary')).toHaveLength(1);
     expect(codes.at(-1)).toBe('end');
-  });
+  }, 20000);
 
   test('a decode failure is treated like no-audio: warn, skip, continue', async () => {
     parsedMarks = [

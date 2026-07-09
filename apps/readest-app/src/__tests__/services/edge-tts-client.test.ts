@@ -426,14 +426,14 @@ describe('EdgeTTSClient', () => {
       }
     };
 
-    test('retries createAudioData up to 3 times when preload fails', async () => {
+    test('retries createAudioData up to 5 times when preload fails', async () => {
       await client.init();
       parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];
       createAudioDataBehavior = vi.fn(() => Promise.reject(new Error('network error')));
 
       await consumePreload(client, new AbortController().signal);
 
-      expect(createAudioDataBehavior).toHaveBeenCalledTimes(3);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(5);
     });
 
     test('does not retry when the first preload attempt succeeds', async () => {
@@ -461,14 +461,16 @@ describe('EdgeTTSClient', () => {
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(2);
     });
 
-    test('does not retry a permanent no-audio failure', async () => {
+    test('retries no-audio for speakable text (transient upstream empty audio)', async () => {
+      // Upstream Edge sometimes returns empty audio for real sentences; that is
+      // no longer treated as permanent (see isNoAudioSynthesisError + text).
       await client.init();
       parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];
       createAudioDataBehavior = vi.fn(() => Promise.reject(new Error('No audio data received.')));
 
       await consumePreload(client, new AbortController().signal);
 
-      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(5);
     });
 
     test('stops retrying once the signal is aborted', async () => {

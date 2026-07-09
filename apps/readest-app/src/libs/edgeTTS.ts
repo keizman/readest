@@ -1082,11 +1082,10 @@ export class EdgeSpeechTTS {
     }
   }
 
-  // Try the self-hosted backends in balancer-preferred order, opening a fresh
-  // WS to the next one only after the current attempt fails. This runs inside
-  // the shared inflight/WS-slot machinery of #fetchAndCache, so failover is
-  // strictly sequential for a given payload — a request is never sent to two
-  // backends at once, and duplicate payloads still share one inflight promise.
+  // Try self-hosted backends in balancer order. Sequential only (no fan-out).
+  // One abnormal reply is not enough to stop: we fail over to the next URL,
+  // and after a full pass clears / all are benched, the pool resets and we
+  // cycle again up to EDGE_TTS_BALANCE_CYCLES before surfacing the error.
   async #fetchEdgeSpeechWsBalanced(
     payload: EdgeTTSPayload,
     signal?: AbortSignal,
@@ -1096,27 +1095,41 @@ export class EdgeSpeechTTS {
       return this.#fetchEdgeSpeechWs(payload, signal);
     }
 
-    const candidates = edgeTTSBackends.orderedCandidates();
-    if (candidates.length === 0) {
-      // No configured pool (shouldn't happen) — fall back to the single URL.
-      return this.#fetchEdgeSpeechWs(payload, signal);
-    }
-
+    // Full passes over the pool. Each cycle may reset disables when all
+    // backends were benched (see edgeTTSBackends.orderedCandidates).
+    const EDGE_TTS_BALANCE_CYCLES = 3;
     let lastError: unknown;
-    for (const url of candidates) {
-      EdgeSpeechTTS.rejectIfAborted(signal);
-      try {
-        const result = await this.#fetchEdgeSpeechWs(payload, signal, url);
-        edgeTTSBackends.reportSuccess(url);
-        return result;
-      } catch (error) {
-        // A user-initiated abort is not a backend fault; surface it without
-        // benching the backend or failing over.
-        if (signal?.aborted) throw error;
-        edgeTTSBackends.reportFailure(url);
-        lastError = error;
+
+    for (let cycle = 0; cycle < EDGE_TTS_BALANCE_CYCLES; cycle++) {
+      const candidates = edgeTTSBackends.orderedCandidates();
+      if (candidates.length === 0) {
+        // No configured pool — fall back to the single-URL derivation.
+        return this.#fetchEdgeSpeechWs(payload, signal);
+      }
+
+      for (const url of candidates) {
+        EdgeSpeechTTS.rejectIfAborted(signal);
+        try {
+          const result = await this.#fetchEdgeSpeechWs(payload, signal, url);
+          edgeTTSBackends.reportSuccess(url);
+          return result;
+        } catch (error) {
+          // User abort is not a backend fault; no failover / no bench.
+          if (signal?.aborted) throw error;
+          const msg = error instanceof Error ? error.message : String(error);
+          const networkLikely =
+            /timed out|timeout|network|failed to fetch|ECONN|ENOTFOUND|offline/i.test(msg);
+          edgeTTSBackends.reportFailure(url, { networkLikely });
+          lastError = error;
+        }
+      }
+
+      // Entire pool failed this cycle — wipe disables and try again.
+      if (cycle < EDGE_TTS_BALANCE_CYCLES - 1) {
+        edgeTTSBackends.resetAll();
       }
     }
+
     throw lastError ?? new Error('All Edge TTS backends failed.');
   }
 

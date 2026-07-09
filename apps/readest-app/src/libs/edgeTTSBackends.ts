@@ -2,30 +2,24 @@ import { getEdgeTTSWsUrls } from '@/services/environment';
 
 // Load balancer for the interchangeable self-hosted Edge TTS WebSocket
 // backends. Each synthesis asks for an ordered list of candidates and tries
-// them in turn (see EdgeSpeechTTS.#fetchEdgeSpeechWsBalanced); a backend that
-// fails is put on a cooldown so later requests skip it until it has had time
-// to recover. The contract the caller relies on:
+// them in turn (see EdgeSpeechTTS.#fetchEdgeSpeechWsBalanced). Contract:
 //
-//   - orderedCandidates() never returns an empty list while any backend is
-//     configured, so playback always has something to try (both-down is the
-//     only real failure the user can see).
-//   - A single dead/unreachable backend is disabled for 10 min, after which it
-//     is offered again; if it works it is re-enabled, otherwise re-disabled.
-//   - Failures that look network-wide (device offline, or multiple backends
-//     failing within a few seconds of each other) use a short cooldown instead
-//     of the full 10 min, and any 'online'/connection-change event clears all
-//     cooldowns. Together these make recovery after a network switch, a weak
-//     signal, or a fast reconnect near-instant instead of a 10 min stall.
+//   - A single abnormal response does NOT bench a backend. Only after
+//     EDGE_TTS_FAILURES_BEFORE_DISABLE consecutive failures is it disabled
+//     for EDGE_TTS_BACKEND_COOLDOWN_MS.
+//   - When every backend is benched, orderedCandidates() clears all disables
+//     and starts over (cycle) so playback never dead-ends on a full cooldown.
+//   - Network-wide blips use a short cooldown; online/connection-change resets.
 //
-// URL list: any length (1..N). Configured in constants.ts READEST_EDGE_TTS_BASE_URLS
-// or NEXT_PUBLIC_EDGE_TTS_BASE_URLS — see getEdgeTTSWsUrls().
-//
-// State is process-global (module singleton) so every EdgeSpeechTTS instance
-// and the shared WS concurrency limiter observe the same health picture.
+// URL list: any length (1..N). See getEdgeTTSWsUrls() / constants.ts.
+// Process-global singleton so every EdgeSpeechTTS shares the same health map.
 
-// A backend that fails in isolation is presumed genuinely down and benched for
-// this long before being offered again.
+// Isolated multi-failure cooldown (one dead relay).
 export const EDGE_TTS_BACKEND_COOLDOWN_MS = 10 * 60 * 1000;
+
+// Soft failures before a backend is actually disabled. One flaky Microsoft
+// "No audio" / timeout must not remove a healthy relay for 10 minutes.
+export const EDGE_TTS_FAILURES_BEFORE_DISABLE = 3;
 
 // Failures that correlate with a network-wide problem recover on this much
 // shorter timer so a blip / handoff does not bench every backend for 10 min.
@@ -93,6 +87,7 @@ class EdgeTTSBackendPool {
     for (const state of this.#states) {
       state.disabledUntil = 0;
       state.consecutiveFailures = 0;
+      state.lastFailureAt = 0;
     }
   }
 
@@ -101,27 +96,36 @@ class EdgeTTSBackendPool {
     return this.#states.map((state) => state.url);
   }
 
+  /** True when every configured backend is currently on cooldown. */
+  allDisabled(): boolean {
+    this.#ensureInit();
+    if (this.#states.length === 0) return false;
+    const t = now();
+    return this.#states.every((s) => s.disabledUntil > t);
+  }
+
   // Ordered candidates for a single synthesis attempt: healthy backends first
-  // (round-robin so load spreads across them), then any benched backends by
-  // soonest recovery as a last resort. The benched fallback guarantees the
-  // list is never empty — when everything is on cooldown (e.g. both went down
-  // together) we still hand back the closest-to-recovery URL so playback keeps
-  // trying instead of hard-failing, and a success there re-enables it.
+  // (round-robin), never soft-including benched ones in the normal path.
+  // If *all* backends are disabled, clear the disable list and cycle so the
+  // request always has a full healthy set to try again.
   orderedCandidates(): string[] {
     this.#ensureInit();
     if (this.#states.length === 0) return [];
     const t = now();
-    const healthy = this.#states.filter((s) => s.disabledUntil <= t);
-    const benched = this.#states
-      .filter((s) => s.disabledUntil > t)
-      .sort((a, b) => a.disabledUntil - b.disabledUntil);
+    let healthy = this.#states.filter((s) => s.disabledUntil <= t);
+
+    if (healthy.length === 0) {
+      // All benched → wipe cooldowns and retry the full pool (循环往复).
+      this.resetAll();
+      healthy = [...this.#states];
+    }
 
     const rotated = this.#rotate(healthy);
     // Advance the round-robin cursor once per request so consecutive requests
     // start from different backends even when a single request only uses one.
     if (healthy.length > 0) this.#rrIndex = (this.#rrIndex + 1) % healthy.length;
 
-    return [...rotated, ...benched].map((s) => s.url);
+    return rotated.map((s) => s.url);
   }
 
   #rotate(states: BackendState[]): BackendState[] {
@@ -145,10 +149,10 @@ class EdgeTTSBackendPool {
     state.consecutiveFailures = 0;
   }
 
-  // Bench a backend after a failed synthesis. `networkLikely` lets the caller
-  // force the short cooldown (e.g. the error was an abort/timeout that clearly
-  // reflects the local link, not the server); by default the pool infers it
-  // from the offline flag and cross-backend failure correlation.
+  // Record a failed synthesis. Soft failures only increment the counter;
+  // the backend stays eligible until EDGE_TTS_FAILURES_BEFORE_DISABLE in a
+  // row. `networkLikely` forces the short cooldown once the threshold is hit
+  // (timeout / offline / correlated multi-backend fail).
   reportFailure(url: string, options?: { networkLikely?: boolean }): void {
     this.#ensureInit();
     const state = this.#find(url);
@@ -157,6 +161,12 @@ class EdgeTTSBackendPool {
     const t = now();
     state.lastFailureAt = t;
     state.consecutiveFailures += 1;
+
+    // One-off flukes (Microsoft empty audio, brief stall) must not bench the
+    // relay. Keep serving it until we have a streak of failures.
+    if (state.consecutiveFailures < EDGE_TTS_FAILURES_BEFORE_DISABLE) {
+      return;
+    }
 
     const others = this.#states.filter((s) => s !== state);
     const correlated = others.some(
@@ -179,6 +189,12 @@ class EdgeTTSBackendPool {
           other.disabledUntil = t + NETWORK_ISSUE_COOLDOWN_MS;
         }
       }
+    }
+
+    // If this disable completed a full outage of the pool, clear immediately
+    // so the next orderedCandidates() / cycle is not empty.
+    if (this.allDisabled()) {
+      this.resetAll();
     }
   }
 }

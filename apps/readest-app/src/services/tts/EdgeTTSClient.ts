@@ -16,6 +16,7 @@ import { AppService } from '@/types/system';
 import {
   collapseRepeatedPausePunctuation,
   hasSpeakableText,
+  isEmptyAudioError,
   isNoAudioSynthesisError,
   parseSSMLMarks,
 } from '@/utils/ssml';
@@ -217,15 +218,14 @@ export class EdgeTTSClient implements TTSClient {
     return boundaries.map((b) => ({ ...b, offset: b.offset * rate, duration: b.duration * rate }));
   };
 
-  // Edge TTS websocket requests fail intermittently; retry a few times before
-  // giving up so a single transient failure doesn't stall playback. The
-  // "No audio data received." failure is permanent for a given sentence, so it
-  // rethrows immediately for the caller's skip path.
+  // Edge / self-hosted relays fail intermittently (empty audio, 500, timeout).
+  // Retry several times; only permanent unspeakable-text no-audio skips early.
+  // Each createAudioData call already fails over across the backend pool.
   #createAudioDataWithRetry = async (
     payload: EdgeTTSPayload,
     signal: AbortSignal,
     priority: WsSlotPriority = 'low',
-    maxAttempts = 3,
+    maxAttempts = 5,
   ): Promise<{ data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined> => {
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -241,16 +241,13 @@ export class EdgeTTSClient implements TTSClient {
         // network error in logs) and needlessly burns a retry-backoff delay
         // for something that will never be retried anyway.
         if (signal.aborted) return undefined;
-        // Pass payload.text through so the punctuation-only-batch branch of
-        // isNoAudioSynthesisError (mirrors the check the caller already does
-        // with batchText) is recognized here too, skipping straight to the
-        // caller's skip path instead of burning retries on a batch that would
-        // fail identically every time.
+        // Permanent only for unspeakable text (…… etc.). Speakable "no audio"
+        // from a flaky upstream is retryable — do not skip the sentence yet.
         if (isNoAudioSynthesisError(err, payload.text)) throw err;
         lastError = err;
         console.warn(`Edge TTS fetch attempt ${attempt}/${maxAttempts} failed`, err);
         if (attempt < maxAttempts) {
-          const shouldRetry = await delayUnlessAborted(200 * attempt, signal);
+          const shouldRetry = await delayUnlessAborted(250 * attempt, signal);
           if (!shouldRetry) return undefined;
         }
       }
@@ -519,7 +516,10 @@ export class EdgeTTSClient implements TTSClient {
       // pipeline exists to remove.
       audio = await this.#createAudioDataWithRetry(payload, signal, 'high');
     } catch (error) {
-      if (isNoAudioSynthesisError(error, batchText)) {
+      // Permanent unspeakable no-audio, OR speakable empty-audio that still
+      // failed after retries: skip the batch so the session can continue
+      // (do not wedge/kill the whole TTS run on one bad sentence).
+      if (isNoAudioSynthesisError(error, batchText) || isEmptyAudioError(error)) {
         console.warn('No audio data received for:', batchText);
         return { kind: 'skip', marks: batch, batchIndex };
       }

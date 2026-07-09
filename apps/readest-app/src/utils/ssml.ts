@@ -78,10 +78,30 @@ export const hasSpeakableText = (text: string): boolean => {
 
 // Edge / self-hosted proxies reject punctuation-only input. Treat these as
 // permanent per-utterance failures so the client skips instead of halting.
+
+/** True when the error message indicates empty audio from Edge / a relay. */
+export const isEmptyAudioError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) return false;
+  const m = error.message.toLowerCase();
+  return m.includes('no audio data received') || m.includes('no audio was received');
+};
+
+/**
+ * True only for *permanent* no-audio outcomes the caller should skip without retry.
+ *
+ * Upstream Edge / our relays intermittently return empty audio for speakable
+ * text (rate limits, blips). Those must stay retryable. Only treat no-audio as
+ * permanent when the text itself is unspeakable (punctuation/whitespace), or
+ * when no text is provided (legacy single-path callers).
+ *
+ * After retries are exhausted, callers should still skip the batch via
+ * {@link isEmptyAudioError} so a single bad sentence does not kill the session.
+ */
 export const isNoAudioSynthesisError = (error: unknown, text?: string): boolean => {
   if (!(error instanceof Error)) return false;
   const m = error.message.toLowerCase();
-  if (m.includes('no audio data received') || m.includes('no audio was received')) {
+  if (isEmptyAudioError(error)) {
+    if (text !== undefined) return !hasSpeakableText(text);
     return true;
   }
   if (text && !hasSpeakableText(text) && /edge tts http request failed: 5/.test(m)) {

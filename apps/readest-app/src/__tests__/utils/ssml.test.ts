@@ -224,9 +224,16 @@ describe('parseSSMLMarks', () => {
   });
 
   describe('isNoAudioSynthesisError', () => {
-    it('matches websocket no-audio errors', () => {
+    it('treats no-audio as permanent only without text or for unspeakable text', () => {
+      // Legacy / no text context: still permanent.
       expect(isNoAudioSynthesisError(new Error('No audio data received.'))).toBe(true);
       expect(isNoAudioSynthesisError(new Error('No audio was received'))).toBe(true);
+      // Speakable text: retryable (upstream flakiness).
+      expect(isNoAudioSynthesisError(new Error('No audio data received.'), '胜利者握拳高呼')).toBe(
+        false,
+      );
+      // Unspeakable: permanent skip.
+      expect(isNoAudioSynthesisError(new Error('No audio data received.'), '……')).toBe(true);
     });
 
     it('matches HTTP 500 only for unspeakable text', () => {

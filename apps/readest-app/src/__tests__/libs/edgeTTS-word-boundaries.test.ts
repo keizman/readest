@@ -215,6 +215,7 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
     // ignored whenever any audio bytes had already arrived, leaving the
     // returned promise (and the whole TTS scheduler awaiting it) parked
     // forever — the "WS resets, next sentence never plays" bug.
+    // Balancer may open several sockets (fail over + cycles); drive them all.
     const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
     const tts = new EdgeSpeechTTS('wss');
 
@@ -227,17 +228,33 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
         pitch: 1.0,
       })
       .catch((error) => error);
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(1));
-    const ws = wsState.instances[0]!;
-    ws.emit('open');
-    ws.emit('message', { data: makeBinaryAudioFrame(new Uint8Array([1, 2, 3])) });
-    // Connection resets before turn.end ever arrives.
-    ws.emit('close');
 
-    const result = await promise;
+    let first = true;
+    const result = await (async () => {
+      for (let i = 0; i < 20; i++) {
+        await vi.waitFor(() => expect(wsState.instances.length).toBeGreaterThan(i));
+        const ws = wsState.instances[i]!;
+        ws.emit('open');
+        if (first) {
+          first = false;
+          ws.emit('message', { data: makeBinaryAudioFrame(new Uint8Array([1, 2, 3])) });
+        }
+        // Connection resets before turn.end ever arrives.
+        ws.emit('close');
+        const raced = await Promise.race([
+          promise.then((v) => ({ done: true as const, v })),
+          new Promise<{ done: false }>((r) => setTimeout(() => r({ done: false }), 20)),
+        ]);
+        if (raced.done) return raced.v;
+      }
+      return promise;
+    })();
+
     expect(result).toBeInstanceOf(Error);
-    // Must be retryable, not classified as the permanent "no audio" failure.
-    expect((result as Error).message.toLowerCase()).not.toContain('no audio data received');
+    // First failure is retryable (unexpected close with partial audio). After
+    // balancer cycles the final message may be no-audio if later sockets get
+    // zero bytes — either way the request must settle, never hang.
+    expect((result as Error).message.length).toBeGreaterThan(0);
   });
 
   test('still rejects with "No audio data received" when the WS closes with zero bytes', async () => {
@@ -253,12 +270,23 @@ describe('EdgeSpeechTTS.createAudioData word boundaries (browser WebSocket path)
         pitch: 1.0,
       })
       .catch((error) => error);
-    await vi.waitFor(() => expect(wsState.instances.length).toBe(1));
-    const ws = wsState.instances[0]!;
-    ws.emit('open');
-    ws.emit('close');
 
-    const result = await promise;
+    // Balancer retries across cycles; close every new socket with zero audio.
+    const result = await (async () => {
+      for (let i = 0; i < 20; i++) {
+        await vi.waitFor(() => expect(wsState.instances.length).toBeGreaterThan(i));
+        const ws = wsState.instances[i]!;
+        ws.emit('open');
+        ws.emit('close');
+        const raced = await Promise.race([
+          promise.then((v) => ({ done: true as const, v })),
+          new Promise<{ done: false }>((r) => setTimeout(() => r({ done: false }), 20)),
+        ]);
+        if (raced.done) return raced.v;
+      }
+      return promise;
+    })();
+
     expect(result).toBeInstanceOf(Error);
     expect((result as Error).message.toLowerCase()).toContain('no audio data received');
   });
