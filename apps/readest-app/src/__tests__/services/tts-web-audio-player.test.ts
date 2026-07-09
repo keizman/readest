@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import { WebAudioPlayer, type WebAudioPlayerEvent } from '@/services/tts/WebAudioPlayer';
 import { FakeAudioContext, makeBuffer } from './tts-fake-audio';
@@ -264,6 +264,96 @@ describe('WebAudioPlayer session end', () => {
     await ctx.advanceTo(SAFETY + 1);
     await ctx.advanceTo(SAFETY + 2);
     expect(events.filter((e) => e.type === 'session-end')).toHaveLength(1);
+  });
+});
+
+describe('WebAudioPlayer early end and paragraph handoff', () => {
+  const LEAD = 0.3; // SESSION_END_EARLY_LEAD_SEC
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test('session-end is announced early while the final chunk tail still plays', async () => {
+    vi.useFakeTimers();
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(gen);
+    expect(events.filter((e) => e.type === 'session-end')).toHaveLength(0);
+    // The audio clock reaches the lead point; the wall-clock timer fires.
+    ctx.currentTime = SAFETY + 2 - LEAD;
+    vi.advanceTimersByTime((SAFETY + 2 - LEAD) * 1000 + 20);
+    expect(events.filter((e) => e.type === 'session-end')).toHaveLength(1);
+    // The tail was NOT stopped: the last words keep playing.
+    expect(ctx.sources[0]!.stopped).toBe(false);
+  });
+
+  test('next session schedules its first chunk at the retired tail end (gapless)', async () => {
+    vi.useFakeTimers();
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(gen);
+    ctx.currentTime = SAFETY + 2 - LEAD;
+    vi.advanceTimersByTime((SAFETY + 2 - LEAD) * 1000 + 20);
+    expect(events.filter((e) => e.type === 'session-end')).toHaveLength(1);
+    // Simulate the next paragraph starting while the tail is audible.
+    const gen2 = player.startSession(() => {});
+    expect(ctx.sources[0]!.stopped).toBe(false);
+    player.scheduleChunk(gen2, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    // Exactly at the old session's end, not at currentTime + safety.
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2, 5);
+  });
+
+  test('early end is suppressed while the user has paused the context', async () => {
+    vi.useFakeTimers();
+    const { player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(gen);
+    await player.pauseContext();
+    vi.advanceTimersByTime(10_000);
+    expect(events.filter((e) => e.type === 'session-end')).toHaveLength(0);
+  });
+
+  test('abort cancels the pending early-end timer', async () => {
+    vi.useFakeTimers();
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(gen);
+    player.abortSession();
+    ctx.currentTime = SAFETY + 2;
+    vi.advanceTimersByTime(10_000);
+    expect(events.filter((e) => e.type === 'session-end')).toHaveLength(0);
+  });
+
+  test('a session that has not announced its end is aborted, not handed off', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    // No endSession: the session is still mid-paragraph (user interrupt).
+    player.startSession(() => {});
+    expect(ctx.sources[0]!.stopped).toBe(true);
+    expect(player.getPlaybackPosition(gen)).toBeNull();
+  });
+
+  test('finishSessionForHandoff retires only naturally-finished sessions', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(player.finishSessionForHandoff()).toBe(false); // still playing
+    player.endSession(gen);
+    await ctx.advanceTo(SAFETY + 1); // onended → session-end announced
+    expect(player.finishSessionForHandoff()).toBe(true);
+    expect(player.finishSessionForHandoff()).toBe(false); // nothing left
   });
 });
 

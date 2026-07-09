@@ -182,7 +182,7 @@ describe('TTSMediaBridge', () => {
     expect(bridge.isBound).toBe(true);
   });
 
-  test('library privacy masks metadata text without replacing the media artwork', async () => {
+  test('library privacy masks metadata text and replaces the cover with the app icon', async () => {
     useSettingsStore.setState({
       settings: {
         libraryPrivacyModeEnabled: true,
@@ -203,7 +203,8 @@ describe('TTSMediaBridge', () => {
     expect(metadata.title).toBe('Book-123456');
     expect(metadata.artist).toBe('Book-123456');
     expect(metadata.album).toBe('Book-123456');
-    expect(metadata.artwork?.[0]?.src).toBe('cover.png');
+    // The real cover identifies the book just as much as its title does.
+    expect(metadata.artwork?.[0]?.src).toBe('/icon.png');
   });
 
   test('library privacy does not resend identical lock-screen metadata on every mark', async () => {

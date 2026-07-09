@@ -386,7 +386,16 @@ export class EdgeTTSClient implements TTSClient {
       if (this.#activeGeneration === generation) {
         this.#activeGeneration = null;
         this.#activeQueue = null;
-        this.#player.abortSession();
+        // Natural paragraph end: session-end is announced up to
+        // SESSION_END_EARLY_LEAD_SEC before the last chunk's audio actually
+        // finishes, so the tail may still be audible here. Hand the session
+        // over (tail keeps playing; the next paragraph's first chunk gets
+        // scheduled at its exact end) instead of aborting, which would cut
+        // the last words off. Aborts (user stop, error, interruption) never
+        // reach the handoff state and stop the audio immediately as before.
+        if (!this.#player.finishSessionForHandoff()) {
+          this.#player.abortSession();
+        }
       }
     }
   }

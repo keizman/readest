@@ -91,6 +91,7 @@ export class TTSMediaBridge {
   #onSpeakMark: ((e: Event) => void) | null = null;
   #onStateChange: ((e: Event) => void) | null = null;
   #coverArtwork = '';
+  #coverArtworkSrc = '';
   #lastMetadataSignature = '';
   #lastArtworkSrc = '';
   #webMetadata: MediaMetadata | null = null;
@@ -190,6 +191,7 @@ export class TTSMediaBridge {
     this.#lastSectionLabel = undefined;
     this.#previousSectionLabel = undefined;
     this.#coverArtwork = '';
+    this.#coverArtworkSrc = '';
     this.#lastMetadataSignature = '';
     this.#lastArtworkSrc = '';
     this.#webMetadata = null;
@@ -214,6 +216,10 @@ export class TTSMediaBridge {
   }
 
   #getArtworkSrc(): string {
+    // Privacy (global library mode or a masked book) must not leak the real
+    // cover to the lock screen either — titles are aliased, so the artwork
+    // falls back to the generic app icon.
+    if (this.#getPrivacyTitle()) return '/icon.png';
     return this.#meta?.coverImageUrl || '/icon.png';
   }
 
@@ -236,8 +242,10 @@ export class TTSMediaBridge {
   }
 
   async #resolveArtwork(): Promise<string> {
-    if (this.#coverArtwork) return this.#coverArtwork;
     const source = this.#getArtworkSrc();
+    // Cache per source: toggling privacy mid-session switches between the
+    // real cover and the generic icon, and the stale bitmap must not win.
+    if (this.#coverArtwork && this.#coverArtworkSrc === source) return this.#coverArtwork;
     let artwork = '';
     try {
       artwork = await fetchImageAsBase64(source);
@@ -251,6 +259,7 @@ export class TTSMediaBridge {
       }
     }
     this.#coverArtwork = artwork;
+    this.#coverArtworkSrc = source;
     return artwork;
   }
 

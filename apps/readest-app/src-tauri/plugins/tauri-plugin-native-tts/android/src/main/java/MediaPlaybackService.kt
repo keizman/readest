@@ -44,17 +44,28 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
     // player, the foreground notification) must be gated on this flag.
     private var sessionActive = false
 
+    // Intended playback state as reported by the JS controller / transport
+    // callbacks. The MediaSession state and the notification must be derived
+    // from THIS, never from the silent keep-alive ExoPlayer's isPlaying: the
+    // player passes through transient buffering states (e.g. around seeks)
+    // whose momentary isPlaying=false used to be mirrored straight onto the
+    // session — flipping the lock-screen card to paused and back (with a full
+    // notification rebuild each way) on every sentence update.
+    private var desiredPlaying = false
+
     private val afChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         Log.i("MediaPlaybackService", "Audio focus changed: $focusChange, $player.isPlaying")
         when (focusChange) {
             AudioManager.AUDIOFOCUS_GAIN -> {
                 player.volume = 1.0f
+                desiredPlaying = true
                 if (!player.isPlaying) player.play()
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 player.volume = 0.3f
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                desiredPlaying = false
                 if (player.isPlaying) player.pause()
             }
         }
@@ -165,6 +176,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
     private fun activateSession() {
         if (!sessionActive) {
             sessionActive = true
+            desiredPlaying = true
 
             val result = audioManager.requestAudioFocus(
                 afChangeListener,
@@ -191,12 +203,14 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         }
         // Always post the notification: activation arrives through
         // startForegroundService, which requires startForeground promptly.
-        showNotification(PlaybackStateCompat.STATE_PLAYING)
+        showNotification(PlaybackStateCompat.STATE_PLAYING, force = true)
     }
 
     private fun deactivateSession() {
         if (!sessionActive) return
         sessionActive = false
+        desiredPlaying = false
+        lastNotifState = -1
 
         player.playWhenReady = false
         player.stop()
@@ -214,12 +228,14 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
 
     private inner class SessionCallback : MediaSessionCompat.Callback() {
         override fun onPlay() {
+            desiredPlaying = true
             player.play()
             pluginEventTrigger?.invoke("media-session-play", JSObject())
             updatePlaybackState()
         }
 
         override fun onPause() {
+            desiredPlaying = false
             player.pause()
             pluginEventTrigger?.invoke("media-session-pause", JSObject())
             updatePlaybackState()
@@ -241,7 +257,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         override fun onSeekTo(pos: Long) {
             currentPositionMs = pos
             pluginEventTrigger?.invoke("media-session-seek", JSObject().apply { put("position", pos) })
-            val state = if (player.isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+            val state = if (desiredPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
             mediaSession?.setPlaybackState(
                 stateBuilder.setState(state, pos, 1f).build()
             )
@@ -258,9 +274,13 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
 
     private fun updatePlaybackState() {
         if (!sessionActive) return
-        val state = if (player.isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+        // desiredPlaying, not player.isPlaying: the keep-alive player's
+        // transient buffering states must not pulse the card (see field doc).
+        // Position: the JS-reported timeline position, not the silent looping
+        // asset's position, which is meaningless for the scrubber.
+        val state = if (desiredPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
         mediaSession?.setPlaybackState(
-            stateBuilder.setState(state, player.currentPosition, 1f).build()
+            stateBuilder.setState(state, currentPositionMs, 1f).build()
         )
         showNotification(state)
     }
@@ -287,7 +307,7 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         notifyChildrenChanged(MEDIA_ROOT_ID)
         if (sessionActive) {
             showNotification(
-                if (player.isPlaying) PlaybackStateCompat.STATE_PLAYING
+                if (desiredPlaying) PlaybackStateCompat.STATE_PLAYING
                 else PlaybackStateCompat.STATE_PAUSED
             )
         }
@@ -299,12 +319,18 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
     // preserved position/duration statics.
     private fun applyPlaybackState(playing: Boolean) {
         if (!sessionActive) return
+        desiredPlaying = playing
         if (playing && !player.isPlaying) {
             player.play()
         } else if (!playing && player.isPlaying) {
             player.pause()
         }
-        player.seekTo(currentPositionMs)
+        // NEVER seek the keep-alive player here. It is a looping silent asset
+        // whose position is irrelevant (the scrubber reads currentPositionMs
+        // via setPlaybackState below), and each seek bounced ExoPlayer
+        // through a buffering state whose isPlaying flip was mirrored to the
+        // session — the paused→playing pulse the lock-screen card showed on
+        // every sentence change.
         val state = if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
         mediaSession?.setPlaybackState(
             stateBuilder.setState(state, currentPositionMs, 1f).build()
@@ -317,7 +343,29 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
         showNotification(state)
     }
 
-    private fun showNotification(playbackState: Int) {
+    // Content of the last posted notification: reposting an identical
+    // notification on every per-sentence position tick makes some launchers /
+    // lock screens re-layout the media card (the "content blinks away and
+    // back" symptom). Only repost when something visible actually changed.
+    private var lastNotifState = -1
+    private var lastNotifTitle: String? = null
+    private var lastNotifArtist: String? = null
+    private var lastNotifArtwork: Bitmap? = null
+
+    private fun showNotification(playbackState: Int, force: Boolean = false) {
+        if (
+            !force &&
+            playbackState == lastNotifState &&
+            currentTitle == lastNotifTitle &&
+            currentArtist == lastNotifArtist &&
+            currentArtwork === lastNotifArtwork
+        ) {
+            return
+        }
+        lastNotifState = playbackState
+        lastNotifTitle = currentTitle
+        lastNotifArtist = currentArtist
+        lastNotifArtwork = currentArtwork
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(CHANNEL_ID, "Media Controls", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -441,7 +489,9 @@ class MediaPlaybackService : MediaBrowserServiceCompat() {
                     // MediaButtonReceiver cold-starts this service with
                     // startForegroundService; honor the foreground contract,
                     // then back out — there is no TTS session to control.
-                    showNotification(PlaybackStateCompat.STATE_PAUSED)
+                    // Forced: the foreground promotion must happen even when
+                    // the dedupe cache says nothing visible changed.
+                    showNotification(PlaybackStateCompat.STATE_PAUSED, force = true)
                     ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                     stopSelf(startId)
                 }

@@ -83,11 +83,24 @@ interface PlayerSession {
   ended: boolean;
   endedEmitted: boolean;
   waiters: Array<(ready: boolean) => void>;
+  earlyEndTimer: ReturnType<typeof setTimeout> | null;
 }
 
 // Small offset so start() never lands in the past between the read of
 // currentTime and the schedule call.
 const SCHEDULE_SAFETY_SEC = 0.03;
+// Announce 'session-end' this far before the final chunk's scheduled end on
+// the audio clock, instead of waiting for its onended callback. The paragraph
+// handoff (session-end → controller.forward → preprocess → cache lookup →
+// decode → reschedule) is a serial JS pipeline that used to run only AFTER
+// the audio had already gone silent — that latency was the audible gap
+// between paragraphs. Emitting early lets the next paragraph prepare while
+// the tail is still playing; startSession()'s natural-end handoff (see
+// finishSessionForHandoff) then schedules the next chunk at exactly the old
+// session's end time, so an early announcement can never truncate or overlap
+// the tail. The onended path stays as the backstop when timers are throttled
+// (backgrounded page) or the context is suspended.
+const SESSION_END_EARLY_LEAD_SEC = 0.3;
 // Keep enough decoded chunks scheduled that delayed main-thread `onended`
 // delivery cannot drain the audio timeline. The page-hidden budget is deeper
 // because Android/WebKit may throttle JS callbacks aggressively after lock.
@@ -148,6 +161,11 @@ export class WebAudioPlayer {
   #ctx: TTSAudioContext | null = null;
   #generation = 0;
   #session: PlayerSession | null = null;
+  // Audio-clock end time of the last naturally-finished session's tail; the
+  // next session starts there instead of "now" so paragraph handoffs are
+  // gapless. Always consumed (and reset) by startSession; a stale value is
+  // harmless because scheduleChunk clamps to the current time anyway.
+  #handoffNextStartTime = 0;
   #userPaused = false;
   #knownOutputDeviceIds: string[] = [];
   #deviceChangeHandler: (() => void) | null = null;
@@ -181,17 +199,27 @@ export class WebAudioPlayer {
   }
 
   startSession(onEvent: (event: WebAudioPlayerEvent) => void): number {
-    this.abortSession();
+    // A naturally-finished predecessor hands its timeline over instead of
+    // being aborted: its scheduled tail keeps playing and the new session's
+    // first chunk is scheduled at exactly its end time — the gapless
+    // paragraph handoff. (The generator's cleanup usually performs the
+    // handoff before this runs, leaving no session but a stored handoff
+    // time — that time must survive, so only a live session gets aborted.)
+    if (this.#session && !this.finishSessionForHandoff()) {
+      this.abortSession();
+    }
     const generation = ++this.#generation;
     this.#session = {
       generation,
       onEvent,
       chunks: [],
-      nextStartTime: 0,
+      nextStartTime: this.#handoffNextStartTime,
       ended: false,
       endedEmitted: false,
       waiters: [],
+      earlyEndTimer: null,
     };
+    this.#handoffNextStartTime = 0;
     this.#registerDeviceChangeListener();
     console.log(`[TTS] session ${generation} start`);
     return generation;
@@ -244,11 +272,34 @@ export class WebAudioPlayer {
     // were all skipped (zero chunks) or whose last onended beat endSession
     // must still end, or auto-advance dead-ends with controls stuck playing.
     this.#maybeEmitSessionEnd(session);
+    if (!session.endedEmitted) this.#armEarlyEnd(session);
+  }
+
+  // Retire a session that finished naturally (scheduler done, session-end
+  // already announced) WITHOUT stopping its still-scheduled tail. Records the
+  // tail's end time so the next startSession continues the timeline
+  // seamlessly. Returns false — caller should abort instead — when the
+  // session is still actively producing or playing un-announced audio.
+  finishSessionForHandoff(): boolean {
+    const session = this.#session;
+    if (!session || !session.ended || !session.endedEmitted) return false;
+    if (session.earlyEndTimer !== null) clearTimeout(session.earlyEndTimer);
+    this.#session = null;
+    this.#unregisterDeviceChangeListener();
+    // No scheduler is waiting on a finished session, but resolve defensively.
+    const waiters = session.waiters;
+    session.waiters = [];
+    for (const waiter of waiters) waiter(false);
+    this.#handoffNextStartTime = session.nextStartTime;
+    console.log(`[TTS] session ${session.generation} handoff`);
+    return true;
   }
 
   abortSession(): void {
+    this.#handoffNextStartTime = 0;
     const session = this.#session;
     if (!session) return;
+    if (session.earlyEndTimer !== null) clearTimeout(session.earlyEndTimer);
     this.#session = null;
     this.#unregisterDeviceChangeListener();
     for (const chunk of session.chunks) {
@@ -364,6 +415,38 @@ export class WebAudioPlayer {
   #maybeEmitSessionEnd(session: PlayerSession): void {
     if (!session.ended || session.endedEmitted) return;
     if (session.chunks.some((c) => !c.ended)) return;
+    session.endedEmitted = true;
+    session.onEvent({ type: 'session-end' });
+  }
+
+  // Wall-clock timer targeting (scheduledEnd - SESSION_END_EARLY_LEAD_SEC) on
+  // the audio clock. Best-effort only: paused/suspended contexts and
+  // throttled timers fall back to the onended path.
+  #armEarlyEnd(session: PlayerSession): void {
+    const ctx = this.#ctx;
+    if (!ctx) return;
+    const fireInSec = session.nextStartTime - SESSION_END_EARLY_LEAD_SEC - ctx.currentTime;
+    if (fireInSec <= 0) return;
+    session.earlyEndTimer = setTimeout(() => this.#tryEarlyEnd(session), fireInSec * 1000);
+  }
+
+  #tryEarlyEnd(session: PlayerSession): void {
+    session.earlyEndTimer = null;
+    if (this.#session !== session || !session.ended || session.endedEmitted) return;
+    const ctx = this.#ctx;
+    if (!ctx) return;
+    // While paused the audio clock is frozen; announcing the end now would
+    // advance paragraphs over silence. Leave it to onended after resume.
+    if (this.#userPaused || ctx.state !== 'running') return;
+    const remainingSec = session.nextStartTime - ctx.currentTime;
+    if (remainingSec > SESSION_END_EARLY_LEAD_SEC + 0.05) {
+      // The audio clock lagged wall time (brief suspension); re-arm.
+      session.earlyEndTimer = setTimeout(
+        () => this.#tryEarlyEnd(session),
+        (remainingSec - SESSION_END_EARLY_LEAD_SEC) * 1000,
+      );
+      return;
+    }
     session.endedEmitted = true;
     session.onEvent({ type: 'session-end' });
   }
