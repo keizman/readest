@@ -166,6 +166,10 @@ export class WebAudioPlayer {
   // gapless. Always consumed (and reset) by startSession; a stale value is
   // harmless because scheduleChunk clamps to the current time anyway.
   #handoffNextStartTime = 0;
+  // Sources retired by finishSessionForHandoff that are still audible on the
+  // shared context. Cleared when a fresh session starts (no gapless handoff)
+  // or when abortSession runs.
+  #orphanedHandoffChunks: ScheduledChunk[] = [];
   #userPaused = false;
   #knownOutputDeviceIds: string[] = [];
   #deviceChangeHandler: (() => void) | null = null;
@@ -207,6 +211,19 @@ export class WebAudioPlayer {
     // time — that time must survive, so only a live session gets aborted.)
     if (this.#session && !this.finishSessionForHandoff()) {
       this.abortSession();
+    }
+    const handoff = this.#handoffNextStartTime;
+    const ctx = this.#ctx;
+    // No gapless continuation: silence any retired tail and start from "now".
+    // When ctx is not ready yet, only clear an explicit zero handoff — a
+    // future handoff time must survive until ensureContext() so paragraph
+    // transitions stay gapless.
+    if (handoff <= 0) {
+      this.#stopOrphanedHandoffAudio();
+      this.#handoffNextStartTime = 0;
+    } else if (ctx && handoff <= ctx.currentTime + SCHEDULE_SAFETY_SEC) {
+      this.#stopOrphanedHandoffAudio();
+      this.#handoffNextStartTime = 0;
     }
     const generation = ++this.#generation;
     this.#session = {
@@ -261,6 +278,14 @@ export class WebAudioPlayer {
     }
     if (chunk.index === 0) {
       session.onEvent({ type: 'chunk-start', chunkIndex: 0 });
+    } else {
+      // When batch N was prepared after batch N-1 already finished, onended
+      // never fires chunk-start for N — the speak consumer would stall on
+      // queue.next() and the line looks frozen even once audio is scheduled.
+      const prev = session.chunks[chunk.index - 1];
+      if (prev?.ended) {
+        session.onEvent({ type: 'chunk-start', chunkIndex: chunk.index });
+      }
     }
   }
 
@@ -291,12 +316,31 @@ export class WebAudioPlayer {
     session.waiters = [];
     for (const waiter of waiters) waiter(false);
     this.#handoffNextStartTime = session.nextStartTime;
+    this.#orphanedHandoffChunks = session.chunks.filter((c) => !c.ended);
     console.log(`[TTS] session ${session.generation} handoff`);
     return true;
   }
 
+  #stopOrphanedHandoffAudio(): void {
+    for (const chunk of this.#orphanedHandoffChunks) {
+      chunk.source.onended = null;
+      try {
+        chunk.source.stop();
+      } catch {
+        // Already ended.
+      }
+      try {
+        chunk.source.disconnect();
+      } catch {
+        // Ignore repeated disconnects.
+      }
+    }
+    this.#orphanedHandoffChunks = [];
+  }
+
   abortSession(): void {
     this.#handoffNextStartTime = 0;
+    this.#stopOrphanedHandoffAudio();
     const session = this.#session;
     if (!session) return;
     if (session.earlyEndTimer !== null) clearTimeout(session.earlyEndTimer);

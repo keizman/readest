@@ -509,7 +509,7 @@ describe('EdgeTTSClient', () => {
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
     });
 
-    test('starts the next startup batch immediately but releases preload after the first batch', async () => {
+    test('starts the next startup batch immediately but releases preload after the first two startup batches', async () => {
       await client.init();
       parsedMarks = [
         { name: '0', text: `${'a'.repeat(119)}.`, language: 'en' },
@@ -536,17 +536,17 @@ describe('EdgeTTSClient', () => {
         expect(createAudioDataBehavior).toHaveBeenCalledTimes(criticalFetches),
       );
       resolvers[0]!({ data: new ArrayBuffer(8), boundaries: [] });
-      try {
-        await expect(
-          Promise.race([
-            pending.then(() => 'released'),
-            new Promise((resolve) => setTimeout(() => resolve('blocked'), 20)),
-          ]),
-        ).resolves.toBe('released');
-      } finally {
-        resolvers[1]?.({ data: new ArrayBuffer(8), boundaries: [] });
-        await pending.catch(() => {});
-      }
+      await expect(
+        Promise.race([
+          pending.then(() => 'released'),
+          new Promise((resolve) => setTimeout(() => resolve('blocked'), 20)),
+        ]),
+      ).resolves.toBe('blocked');
+      resolvers[1]!({ data: new ArrayBuffer(8), boundaries: [] });
+      await expect(pending).resolves.toEqual({
+        done: false,
+        value: { code: 'end', message: 'Preload finished' },
+      });
     });
 
     test('releases normal preload after the first batch while later batches keep warming', async () => {
@@ -574,7 +574,9 @@ describe('EdgeTTSClient', () => {
       );
       const pending = iterator.next();
 
-      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(2));
+      // Only the blocking first batch is launched before release; later batches
+      // start in the background after the playhead can begin.
+      await vi.waitFor(() => expect(createAudioDataBehavior).toHaveBeenCalledTimes(1));
       resolvers[0]!({ data: new ArrayBuffer(8), boundaries: [] });
       try {
         await expect(

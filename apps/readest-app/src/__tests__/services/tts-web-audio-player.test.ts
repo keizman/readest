@@ -355,6 +355,32 @@ describe('WebAudioPlayer early end and paragraph handoff', () => {
     expect(player.finishSessionForHandoff()).toBe(true);
     expect(player.finishSessionForHandoff()).toBe(false); // nothing left
   });
+
+  test('a fresh session after the handoff clock passes starts at now', async () => {
+    const { ctx, player, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(gen);
+    await ctx.advanceTo(SAFETY + 2);
+    expect(player.finishSessionForHandoff()).toBe(true);
+    await ctx.advanceTo(SAFETY + 3);
+    const gen2 = player.startSession(() => {});
+    player.scheduleChunk(gen2, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 3 + SAFETY, 5);
+  });
+
+  test('scheduling a late chunk emits chunk-start when the previous chunk already ended', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(events).toEqual([{ type: 'chunk-start', chunkIndex: 0 }]);
+    await ctx.advanceTo(SAFETY + 1);
+    events.length = 0;
+    player.scheduleChunk(gen, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    expect(events).toEqual([{ type: 'chunk-start', chunkIndex: 1 }]);
+  });
 });
 
 describe('WebAudioPlayer abort', () => {

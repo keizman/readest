@@ -419,11 +419,14 @@ export class EdgeTTSClient implements TTSClient {
     // back to playback-time one-by-one synthesis.
     const batches = buildBatches(marks, startup);
     const criticalCount = this.#criticalPreloadBatches(batches.length);
-    // Playback should unblock as soon as the first batch is warm. Start the
-    // next critical batch immediately so cache fill is still pipelined, but do
-    // not let a slow/timeout second WS request add to the audible gap before
-    // the current sentence/paragraph can start.
-    const blockingCount = Math.min(1, criticalCount);
+    // Startup playback peels the first one or two sentences into separate
+    // batches; warming only the first batch let batch 1 miss the playhead once
+    // parallel deep prefetch saturated the WS pool — the first lines sounded
+    // stuck until a skip restarted the pipeline. Block until the first two
+    // startup batches (or all batches when shorter) are cached before release.
+    const blockingCount = startup
+      ? Math.min(2, criticalCount, batches.length)
+      : Math.min(1, criticalCount);
     const preloadBatch = async (batch: TTSMark[]) => {
       const voiceLang = batch[0]!.language;
       const voiceId = await this.getVoiceIdFromLang(voiceLang);
@@ -460,18 +463,18 @@ export class EdgeTTSClient implements TTSClient {
         console.warn('Error preloading batch', index, err);
       }
     };
-    const criticalPromises = Array.from({ length: criticalCount }, (_, index) => runBatch(index));
-    await Promise.all(criticalPromises.slice(0, blockingCount));
-    let nextBackgroundIndex = criticalCount;
+    // Only launch the batches we will wait on. Starting the full "critical"
+    // window in parallel used to race the playhead's first lines for WS slots
+    // (non-blocking critical + deep-prefetch workers), so lines 1–2 stayed cold.
+    await Promise.all(Array.from({ length: blockingCount }, (_, index) => runBatch(index)));
+    // Remaining work (rest of the paragraph, including non-blocking critical)
+    // starts after release so opening audio is never delayed by it.
+    let nextBackgroundIndex = blockingCount;
     const runBackgroundBatches = async () => {
-      await Promise.allSettled(criticalPromises.slice(blockingCount));
-      // Fill the remaining batches with as many parallel workers as the WS
-      // backend pool can absorb minus the slot reserved for the playhead —
-      // with N relays configured this keeps all of them busy instead of
-      // trickling one request at a time. The WS slot gate still enforces the
-      // real in-flight cap, and 'high' playback requests jump its queue.
+      // Leave headroom for the playhead's 'high' requests; startup used to
+      // spawn one worker per relay and starve the first warm batches.
       const workerCount = Math.min(
-        Math.max(1, getEdgeTTSWsMaxConcurrent() - 1),
+        Math.max(1, getEdgeTTSWsMaxConcurrent() - 2),
         Math.max(1, batches.length - nextBackgroundIndex),
       );
       const backgroundWorker = async () => {
