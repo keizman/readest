@@ -14,7 +14,7 @@ import {
   normalizeFilePathForIndex,
   selectNewImportableFiles,
 } from '@/services/bookService';
-import { navigateToLibrary, navigateToLogin, navigateToReader } from '@/utils/nav';
+import { navigateToLibrary, navigateToReader } from '@/utils/nav';
 import { getBookWithUpdatedMetadata, listFormater } from '@/utils/book';
 import { getImportErrorMessage } from '@/services/errors';
 import { ingestFile } from '@/services/ingestService';
@@ -25,7 +25,7 @@ import { transferManager } from '@/services/transferManager';
 import { getDirPath, getFilename, joinPaths } from '@/utils/path';
 import { parseOpenWithFiles } from '@/helpers/openWith';
 import { isTauriAppPlatform, isWebAppPlatform } from '@/services/environment';
-import { checkForAppUpdates, checkAppReleaseNotes } from '@/helpers/updater';
+
 import { impactFeedback } from '@tauri-apps/plugin-haptics';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 
@@ -307,18 +307,13 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
   usePullToRefresh(
     scrollRef,
     async () => {
-      if (!user) {
-        navigateToLogin(router);
-        return;
-      }
+      // Pull-to-refresh is sync-only; do not send unauthenticated users to login.
+      if (!user) return;
       await pullLibrary(false, true);
       checkOPDSSubscriptions(true);
     },
     async () => {
-      if (!user) {
-        navigateToLogin(router);
-        return;
-      }
+      if (!user) return;
       await pullLibrary(true, true);
       checkOPDSSubscriptions(true);
     },
@@ -422,19 +417,11 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
   });
 
   useEffect(() => {
-    const doCheckAppUpdates = async () => {
-      if (appService?.hasUpdater && settings.autoCheckUpdates) {
-        await checkForAppUpdates(_, true, settings.updateChannel);
-      } else if (appService?.hasUpdater === false) {
-        checkAppReleaseNotes();
-      }
-    };
+    // Auto upgrade / update notice is disabled.
     if (settings.alwaysOnTop) {
       tauriHandleSetAlwaysOnTop(settings.alwaysOnTop);
     }
-    doCheckAppUpdates();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appService?.hasUpdater, settings]);
+  }, [settings.alwaysOnTop]);
 
   useEffect(() => {
     if (appService?.isMobileApp) {
