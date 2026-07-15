@@ -1,7 +1,8 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 import type { FoliateView } from '@/types/view';
 import type { Insets } from '@/types/misc';
-import type { ViewSettings } from '@/types/book';
+import type { Book, ViewSettings } from '@/types/book';
+import type { TOCItem } from '@/libs/document';
 
 vi.mock('@/store/bookDataStore', async () => {
   const { create } = await import('zustand');
@@ -63,6 +64,8 @@ vi.mock('@/services/opds/pseStream', () => ({
 
 import { useReaderStore } from '@/store/readerStore';
 import { useBookDataStore } from '@/store/bookDataStore';
+import { getBookProgress, useReaderProgressStore } from '@/store/readerProgressStore';
+import { useLibraryStore } from '@/store/libraryStore';
 
 /**
  * Helper to seed a minimal ViewState in the store for a given key.
@@ -99,6 +102,11 @@ describe('readerStore', () => {
       hoveredBookKey: null,
     });
     useBookDataStore.setState({ booksData: {} });
+    useReaderProgressStore.setState({ progresses: {} });
+    useLibraryStore.setState({
+      getBookByHash: vi.fn(),
+      updateBookProgress: vi.fn(),
+    });
   });
 
   describe('initial state', () => {
@@ -280,6 +288,79 @@ describe('readerStore', () => {
 
       useReaderStore.getState().setIsSyncing('book-1', false);
       expect(useReaderStore.getState().viewStates['book-1']!.syncing).toBe(false);
+    });
+  });
+
+  describe('setProgress', () => {
+    const seedProgressBook = (
+      progress: [number, number],
+      readingStatus: Book['readingStatus'] = 'reading',
+    ) => {
+      const book: Book = {
+        hash: 'bookid',
+        format: 'EPUB',
+        title: 'Book',
+        author: 'Author',
+        createdAt: 1000,
+        updatedAt: 1000,
+        progress,
+        readingStatus,
+      };
+      const getBookByHash = vi.fn(() => book);
+      const updateBookProgress = vi.fn();
+      useLibraryStore.setState({ getBookByHash, updateBookProgress });
+      seedViewState('bookid-view');
+      useBookDataStore.setState({
+        booksData: {
+          bookid: {
+            id: 'bookid',
+            book,
+            file: null,
+            config: { updatedAt: 1000 },
+            bookDoc: null,
+            isFixedLayout: false,
+          },
+        },
+      });
+      return { getBookByHash, updateBookProgress };
+    };
+
+    const writeProgress = (location: string, currentPageIndex: number) => {
+      useReaderStore
+        .getState()
+        .setProgress(
+          'bookid-view',
+          location,
+          { id: 1, index: 0, href: 'chapter.xhtml', label: 'Chapter' } as TOCItem,
+          { href: 'page.xhtml', label: `${currentPageIndex + 1}` },
+          { current: currentPageIndex, total: 100 },
+          { current: currentPageIndex, total: 100 },
+          { section: 0, total: 0 },
+          {} as Range,
+          0.1,
+        );
+    };
+
+    test('keeps exact reader progress but skips shelf progress rewrite on same page', () => {
+      const { updateBookProgress } = seedProgressBook([10, 100]);
+
+      writeProgress('epubcfi(/2/4)', 9);
+
+      expect(updateBookProgress).not.toHaveBeenCalled();
+      expect(getBookProgress('bookid-view')?.location).toBe('epubcfi(/2/4)');
+      expect(useBookDataStore.getState().booksData['bookid']?.config).toMatchObject({
+        location: 'epubcfi(/2/4)',
+        progress: [10, 100],
+      });
+    });
+
+    test('updates shelf progress when the visible page changes', () => {
+      const { updateBookProgress } = seedProgressBook([10, 100]);
+
+      writeProgress('epubcfi(/2/6)', 10);
+
+      expect(updateBookProgress).toHaveBeenCalledWith('bookid', [11, 100], 'reading');
+      expect(getBookProgress('bookid-view')?.location).toBe('epubcfi(/2/6)');
     });
   });
 

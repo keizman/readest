@@ -387,7 +387,11 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
     const progress: [number, number] = [pageInfo.current + 1, pageInfo.total];
     const progressPercentage = Math.round((progress[0] / progress[1]) * 100);
 
-    // Lightweight library update — O(1) lookup, no array copy, no refreshGroups
+    // Shelf-level progress only stores page/total. TTS can relocate many times
+    // inside the same page as the spoken sentence changes, so avoid rewriting
+    // the large library store unless the visible page tuple or reading status
+    // actually changed. Precise CFI progress is still written below to
+    // bookDataStore + readerProgressStore for autosave/close recovery.
     const { getBookByHash, updateBookProgress } = useLibraryStore.getState();
     const existingBook = getBookByHash(id);
     if (existingBook) {
@@ -398,7 +402,15 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       if (progressPercentage >= 100 && existingBook.readingStatus !== 'finished') {
         newReadingStatus = 'finished';
       }
-      updateBookProgress(id, progress, newReadingStatus);
+      const existingProgress = existingBook.progress;
+      const pageProgressChanged =
+        !existingProgress ||
+        existingProgress[0] !== progress[0] ||
+        existingProgress[1] !== progress[1];
+      const readingStatusChanged = existingBook.readingStatus !== newReadingStatus;
+      if (pageProgressChanged || readingStatusChanged) {
+        updateBookProgress(id, progress, newReadingStatus);
+      }
     }
 
     // Only the primary view persists progress into the shared bookData
