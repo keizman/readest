@@ -80,18 +80,29 @@ export const useProgressAutoSave = (bookKey: string) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [progress?.location, bookKey]);
 
-  // On unmount (book closed / navigated away), flush any pending throttled
-  // library.json write so the shelf reflects this session's last read
-  // position next time it loads. The per-book config.json is already on
-  // disk from the eager save in `saveConfig`, so this only catches the
-  // library-level rollup.
+  // Durability: flush debounced progress + library.json rollup when the
+  // reader unmounts, the app is backgrounded, or the page is closing.
+  // Per-book config.json is already written eagerly inside saveConfig; this
+  // forces the last debounced tick and promotes MRU order into library.json
+  // so force-close does not lose "rough" progress beyond the debounce window.
   useEffect(() => {
-    return () => {
+    const flushAll = () => {
       saveBookConfig.flush();
-      flushPendingLibrarySave().catch(() => {
-        // Best-effort on teardown — failures fall through to next launch's
-        // reconstruction from per-book config.json files.
+      void flushPendingLibrarySave().catch(() => {
+        // Best-effort — per-book config.json remains the crash recovery path.
       });
     };
-  }, []);
+    const onVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        flushAll();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', flushAll);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', flushAll);
+      flushAll();
+    };
+  }, [saveBookConfig]);
 };

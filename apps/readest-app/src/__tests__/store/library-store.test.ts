@@ -76,6 +76,42 @@ describe('libraryStore', () => {
     });
   });
 
+  describe('patchBookFields', () => {
+    test('updates one book without changing order or groups', () => {
+      useLibraryStore
+        .getState()
+        .setLibrary([
+          makeBook({ hash: 'a', groupName: 'G1' }),
+          makeBook({ hash: 'b', groupName: 'G1' }),
+        ]);
+      const groupsBefore = useLibraryStore.getState().groups;
+
+      const updated = useLibraryStore.getState().patchBookFields('b', {
+        progress: [3, 10],
+        updatedAt: 9999,
+      });
+
+      expect(updated?.progress).toEqual([3, 10]);
+      expect(useLibraryStore.getState().library.map((b) => b.hash)).toEqual(['a', 'b']);
+      expect(useLibraryStore.getState().hashIndex.get('b')).toBe(1);
+      expect(useLibraryStore.getState().groups).toBe(groupsBefore);
+    });
+  });
+
+  describe('promoteBookToFront', () => {
+    test('moves a book to index 0 and rebuilds hashIndex', () => {
+      useLibraryStore
+        .getState()
+        .setLibrary([makeBook({ hash: 'a' }), makeBook({ hash: 'b' }), makeBook({ hash: 'c' })]);
+
+      useLibraryStore.getState().promoteBookToFront('c');
+
+      expect(useLibraryStore.getState().library.map((b) => b.hash)).toEqual(['c', 'a', 'b']);
+      expect(useLibraryStore.getState().hashIndex.get('c')).toBe(0);
+      expect(useLibraryStore.getState().hashIndex.get('a')).toBe(1);
+    });
+  });
+
   describe('getBookByHash', () => {
     test('returns the book for a known hash', () => {
       const books = [makeBook({ hash: 'a', title: 'Book A' }), makeBook({ hash: 'b' })];

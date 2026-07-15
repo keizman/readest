@@ -317,7 +317,9 @@ describe('bookDataStore', () => {
       expect(after).not.toBe(before);
     });
 
-    test('moves the saved book to the front of the library', async () => {
+    test('patches progress in place without MRU reorder on every save', async () => {
+      // Reorder is deferred to library.json flush so large shelves do not pay
+      // O(n) rebuild work on every progress autosave (reading/TTS freezes).
       const saveBookConfig = vi.fn().mockResolvedValue(undefined);
       const saveLibraryBooks = vi.fn().mockResolvedValue(undefined);
       const envConfig = makeEnvConfig({ saveBookConfig, saveLibraryBooks });
@@ -336,14 +338,14 @@ describe('bookDataStore', () => {
       await useBookDataStore.getState().saveConfig(envConfig, 'c', data.config!, FAKE_SETTINGS);
 
       const library = useLibraryStore.getState().library;
-      expect(library.map((b) => b.hash)).toEqual(['c', 'a', 'b']);
-      // hashIndex should be rebuilt to match the new order
-      expect(useLibraryStore.getState().hashIndex.get('c')).toBe(0);
-      expect(useLibraryStore.getState().hashIndex.get('a')).toBe(1);
-      expect(useLibraryStore.getState().hashIndex.get('b')).toBe(2);
+      expect(library.map((b) => b.hash)).toEqual(['a', 'b', 'c']);
+      expect(library[2]!.progress).toEqual([5, 100]);
+      // hashIndex unchanged (same positions)
+      expect(useLibraryStore.getState().hashIndex.get('c')).toBe(2);
+      expect(useLibraryStore.getState().hashIndex.get('a')).toBe(0);
     });
 
-    test('updates visibleLibrary to match the new library order', async () => {
+    test('promotes the saved book to the front when library.json is flushed', async () => {
       const saveBookConfig = vi.fn().mockResolvedValue(undefined);
       const saveLibraryBooks = vi.fn().mockResolvedValue(undefined);
       const envConfig = makeEnvConfig({ saveBookConfig, saveLibraryBooks });
@@ -360,7 +362,13 @@ describe('bookDataStore', () => {
       useBookDataStore.setState({ booksData: { c: data } });
 
       await useBookDataStore.getState().saveConfig(envConfig, 'c', data.config!, FAKE_SETTINGS);
+      expect(useLibraryStore.getState().library.map((b) => b.hash)).toEqual(['a', 'b', 'c']);
 
+      await flushPendingLibrarySave();
+
+      const library = useLibraryStore.getState().library;
+      expect(library.map((b) => b.hash)).toEqual(['c', 'a', 'b']);
+      expect(useLibraryStore.getState().hashIndex.get('c')).toBe(0);
       const visible = useLibraryStore.getState().getVisibleLibrary();
       expect(visible.map((b) => b.hash)).toEqual(['c', 'a']);
     });

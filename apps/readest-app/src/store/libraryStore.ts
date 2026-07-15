@@ -35,6 +35,17 @@ interface LibraryState {
     progress: [number, number],
     readingStatus: ReadingStatus | undefined,
   ) => void;
+  /**
+   * Patch a single book at its current index without rebuild-heavy work.
+   * Skips refreshGroups (O(n) MD5). Does not change shelf order.
+   * Used by reading progress autosave so large libraries do not freeze TTS.
+   */
+  patchBookFields: (hash: string, fields: Partial<Book>) => Book | undefined;
+  /**
+   * Move a book to the front of the library (MRU) without refreshGroups.
+   * Prefer calling this on session end / library.json flush, not every page turn.
+   */
+  promoteBookToFront: (hash: string) => void;
   updateBook: (envConfig: EnvConfigType, book: Book) => Promise<void>;
   updateBooks: (
     envConfig: EnvConfigType,
@@ -121,6 +132,35 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       library: newLibrary,
       visibleLibrary: newLibrary.filter((b) => !b.deletedAt),
     });
+  },
+
+  patchBookFields: (hash, fields) => {
+    const { library, hashIndex } = get();
+    const idx = hashIndex.get(hash);
+    if (idx === undefined) return undefined;
+    const updatedBook: Book = { ...library[idx]!, ...fields };
+    const newLibrary = library.slice();
+    newLibrary[idx] = updatedBook;
+    // hashIndex stays valid: book stays at the same index.
+    set({
+      library: newLibrary,
+      visibleLibrary: newLibrary.filter((b) => !b.deletedAt),
+    });
+    return updatedBook;
+  },
+
+  promoteBookToFront: (hash) => {
+    const { library, hashIndex } = get();
+    const idx = hashIndex.get(hash);
+    if (idx === undefined || idx === 0) return;
+    const book = library[idx]!;
+    const newLibrary = [book, ...library.slice(0, idx), ...library.slice(idx + 1)];
+    set({
+      library: newLibrary,
+      hashIndex: buildHashIndex(newLibrary),
+      visibleLibrary: newLibrary.filter((b) => !b.deletedAt),
+    });
+    // Intentionally no refreshGroups — group membership is unchanged by MRU.
   },
 
   rebuildHashIndex: () => {
