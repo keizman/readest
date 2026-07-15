@@ -5,59 +5,37 @@ import { EnvConfigType } from '@/services/environment';
 import { BookDoc } from '@/libs/document';
 import { useLibraryStore } from './libraryStore';
 
-// Throttle library.json writes triggered by per-book saveConfig.
-//
-// Why: `saveConfig` ran two large fs.writeFile IPC calls *every* invocation —
-// one for the per-book config.json and one for the WHOLE library.json (because
-// saveLibraryBooks writes a backup + the file itself). For a user with N
-// books in their shelf, that's `2 * JSON.stringify(N entries)` of work + 2
-// Tauri IPC round-trips per save. With auto-save firing once per second of
-// reading (useProgressAutoSave), Chrome DevTools' Bottom-Up profile shows
-// `processIpcMessage` chewing ~25% of main-thread time during a reading
-// session — directly responsible for the swipe jank the user is reporting
-// (touchmove gets queued behind IPC processing).
+// library.json is expensive for large shelves (read-merge-write of the whole
+// index over Tauri IPC). Progress autosave used to schedule that write every
+// ~30s, which showed up as a regular multi-second freeze while reading/TTS.
 //
 // Progress durability (do not regress):
 //   1. Per-book config.json is written *eagerly* on every saveConfig — this is
-//      the source of truth if the app is killed mid-session.
-//   2. library.json is throttled but force-flushed on book close, background,
-//      and pagehide so shelf progress/MRU is not lost on normal exit.
-//   3. In-memory shelf updates use patchBookFields (no refreshGroups) so a
-//      300+ book library does not freeze TTS/reader every autosave.
-//
-// LIBRARY_SAVE_THROTTLE_MS=30s: long enough to collapse a swipe burst into a
-// single IPC, short enough that a backgrounded app still gets a rollup soon.
-// Force-flush happens via flushPendingLibrarySave() on unmount + hide.
-const LIBRARY_SAVE_THROTTLE_MS = 30_000;
-let librarySaveTimeoutId: ReturnType<typeof setTimeout> | null = null;
+//      the source of truth if the app is killed mid-session (rough progress
+//      survives; at worst the last ~1–5s of debounce is missing).
+//   2. library.json is ONLY written on lifecycle flush (book close, app
+//      background, pagehide) — never on a mid-session timer.
+//   3. In-memory shelf updates use patchBookFields (no refreshGroups).
+//   4. MRU promote-to-front is deferred until that same lifecycle flush.
 let librarySaveAppService: { saveLibraryBooks: (books: Book[]) => Promise<void> } | null = null;
 /** True when in-memory library differs from last written library.json. */
 let libraryDiskDirty = false;
 /** Hashes that should be promoted to MRU front on the next library.json flush. */
 const pendingPromoteHashes = new Set<string>();
 
-const scheduleLibrarySave = (appService: {
+/** Mark library.json dirty; do not write until flushPendingLibrarySave(). */
+const markLibrarySavePending = (appService: {
   saveLibraryBooks: (books: Book[]) => Promise<void>;
 }) => {
   librarySaveAppService = appService;
   libraryDiskDirty = true;
-  if (librarySaveTimeoutId != null) return;
-  librarySaveTimeoutId = setTimeout(() => {
-    librarySaveTimeoutId = null;
-    void flushPendingLibrarySave();
-  }, LIBRARY_SAVE_THROTTLE_MS);
 };
 
 /**
  * Apply deferred MRU order and persist library.json if dirty.
- * Safe to call often; no-ops when nothing is pending.
+ * Call on reader unmount / app background / pagehide — not on a timer.
  */
 export const flushPendingLibrarySave = async () => {
-  if (librarySaveTimeoutId != null) {
-    clearTimeout(librarySaveTimeoutId);
-    librarySaveTimeoutId = null;
-  }
-
   // Promote first so the written library.json matches "last read" order.
   if (pendingPromoteHashes.size > 0) {
     const { promoteBookToFront } = useLibraryStore.getState();
@@ -78,7 +56,7 @@ export const flushPendingLibrarySave = async () => {
     // Keep dirty so a later flush can retry; progress is still on disk in
     // each book's config.json from the eager saveBookConfig path.
     libraryDiskDirty = true;
-    console.warn('Throttled library save failed:', err);
+    console.warn('Library rollup save failed:', err);
   }
 };
 
@@ -195,8 +173,8 @@ export const useBookDataStore = create<BookDataState>((set, get) => ({
     // Per-book config: always write eagerly — small, and the durability
     // guarantee if the process is killed before library.json is flushed.
     await appService.saveBookConfig(updatedBook, configToSave, settings);
-    // Library JSON: throttled; force-flushed on hide/close (see lifecycle hooks).
-    scheduleLibrarySave(appService);
+    // library.json: mark dirty only — written on hide/close (no mid-read timer).
+    markLibrarySavePending(appService);
   },
   updateBooknotes: (key: string, booknotes: BookNote[]) => {
     let updatedConfig: BookConfig | undefined;

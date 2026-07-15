@@ -390,10 +390,8 @@ describe('bookDataStore', () => {
       // Per-book config still writes eagerly — it's small and the source
       // of truth for reconstructing the shelf on next launch.
       expect(saveBookConfig).toHaveBeenCalledOnce();
-      // Library JSON write is throttled (see scheduleLibrarySave in
-      // bookDataStore) so a burst of saveConfig calls during reading
-      // doesn't fire IPC on every page turn. Force-flush here to
-      // observe the write actually happens.
+      // library.json is never written on a mid-session timer (that caused
+      // regular freezes with large shelves). Only lifecycle flush writes it.
       expect(saveLibraryBooks).not.toHaveBeenCalled();
       await flushPendingLibrarySave();
       expect(saveLibraryBooks).toHaveBeenCalledOnce();
