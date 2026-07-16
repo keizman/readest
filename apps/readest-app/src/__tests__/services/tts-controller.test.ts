@@ -1476,11 +1476,10 @@ describe('TTSController', () => {
       expect(mockView.tts!.prev).toHaveBeenCalledTimes(50);
     });
 
-    test('prefetches paragraphs even when audio cache byte-count exceeds capacity', async () => {
+    test('skips deep lookahead when audio cache byte-count exceeds capacity', async () => {
       // hasPrefetchCapacity=false means audioCacheBytes >= TTS_AUDIO_CACHE_MAX_BYTES.
-      // The cache is full of already-played audio; trimAudioCache() will evict old
-      // entries when new blobs are stored. Gathering + preloading must still proceed
-      // so the user has offline content ready.
+      // Deep look-ahead must stop instead of filling the FIFO cache with far-ahead
+      // audio and evicting near-playhead entries before playback consumes them.
       await controller.init();
       edgeTTSState.hasPrefetchCapacity = false;
       const paragraphs = ['<speak>one</speak>', '<speak>two</speak>', undefined];
@@ -1496,8 +1495,34 @@ describe('TTSController', () => {
 
       await controller.preloadNextSSML(300, 2);
 
-      expect(mockView.tts!.next).toHaveBeenCalled();
-      expect(speakMarksSpy).toHaveBeenCalled();
+      expect(mockView.tts!.next).not.toHaveBeenCalled();
+      expect(speakMarksSpy).not.toHaveBeenCalled();
+    });
+
+    test('stops deep lookahead when the audio cache fills during prefetch', async () => {
+      await controller.init();
+      const paragraphs = [
+        '<speak>one</speak>',
+        '<speak>two</speak>',
+        '<speak>three</speak>',
+        undefined,
+      ];
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {
+          edgeTTSState.hasPrefetchCapacity = false;
+          yield* [];
+        });
+
+      await controller.preloadNextSSML(300, 3);
+
+      expect(speakMarksSpy).toHaveBeenCalledOnce();
     });
 
     test('aborts stale lookahead prefetch when playback stops', async () => {

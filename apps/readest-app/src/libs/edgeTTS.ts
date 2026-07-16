@@ -402,7 +402,7 @@ export type EdgeSpeechTTSOptions = {
 // the optimistic 48 kbit/s estimate. Keep a hard byte cap large enough for a
 // real multi-minute lookahead at 2x+ speed without evicting future chunks as
 // soon as the current chapter warms.
-export const TTS_AUDIO_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+export const TTS_AUDIO_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 
 // Edge TTS SSML prosody rate silently caps here; higher values have no effect.
 export const EDGE_TTS_MAX_RATE = 2.0;
@@ -432,7 +432,7 @@ export class EdgeSpeechTTS {
     EdgeSpeechTTS.boundariesCache.delete(key);
   };
   // Entry caps sized well above what TTS_AUDIO_CACHE_MAX_BYTES can hold
-  // (~1000 typical batches at 64 MB), so the byte cap — which
+  // (~500 typical batches at 32 MB), so the byte cap — which
   // hasTTSPrefetchCapacity() gates prefetch on — is the effective limit and
   // the deep look-ahead can genuinely fill the cache instead of churning
   // against an entry-count ceiling.

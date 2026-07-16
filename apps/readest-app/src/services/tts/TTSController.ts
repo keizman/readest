@@ -10,7 +10,7 @@ import {
   TTSVoice,
 } from './types';
 import { createRejectFilter } from '@/utils/node';
-import { getEdgeTTSWsMaxConcurrent, WsSlotPriority } from '@/libs/edgeTTS';
+import { getEdgeTTSWsMaxConcurrent, hasTTSPrefetchCapacity, WsSlotPriority } from '@/libs/edgeTTS';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
@@ -34,14 +34,12 @@ import {
 // across sessions.
 let ttsPositionSequence = 0;
 
-// Deep look-ahead prefetch sized to genuinely fill the Edge audio cache
-// rather than stopping at a few minutes: two hours of speech at Edge's
-// 48 kbit/s MP3 is ~43 MB, comfortably inside TTS_AUDIO_CACHE_MAX_BYTES
-// (64 MB) and the entry caps, so the whole window stays cached without
-// evicting unplayed audio. Duration is estimated per paragraph (CJK chars vs.
-// words), so English and short dialogue receive the same real playback buffer
-// as dense CJK prose. Prefetch continues into following sections when needed.
-const PREFETCH_TARGET_SECONDS = 2 * 60 * 60;
+// Deep look-ahead prefetch sized to fill most of the Edge audio cache:
+// ~1.5 h of speech at Edge's 48 kbit/s MP3 is ~32 MB (TTS_AUDIO_CACHE_MAX_BYTES).
+// Duration is estimated per paragraph (CJK chars vs. words), so English and
+// short dialogue receive the same real playback buffer as dense CJK prose.
+// Prefetch continues into following sections when needed.
+const PREFETCH_TARGET_SECONDS = 90 * 60;
 const PREFETCH_MAX_PARAGRAPHS = 1500;
 // Paragraph-level prefetch workers, scaled to the WS backend pool so N relays
 // are all kept busy filling the cache. Capped at the pool's low-priority slot
@@ -708,11 +706,11 @@ export class TTSController extends EventTarget {
     let nextIndex = 0;
     const worker = async () => {
       for (;;) {
-        if (signal.aborted) return;
+        if (signal.aborted || !hasTTSPrefetchCapacity()) return;
         const index = nextIndex++;
         if (index >= rawSsmls.length) return;
         const ssml = await this.#preprocessSSML(rawSsmls[index]);
-        if (!ssml || signal.aborted) continue;
+        if (!ssml || signal.aborted || !hasTTSPrefetchCapacity()) continue;
         const marks: TTSMark[] = [];
         this.#appendSpeakableMarksFromSSML(marks, ssml);
         // Bounded, session-relative distance (paragraphs ahead of the currently
@@ -740,7 +738,7 @@ export class TTSController extends EventTarget {
     maxParagraphs: number = PREFETCH_MAX_PARAGRAPHS,
   ) {
     const tts = this.view.tts;
-    if (!tts || this.#prefetchInFlight) return;
+    if (!tts || this.#prefetchInFlight || !hasTTSPrefetchCapacity()) return;
     const abortController = new AbortController();
     this.#prefetchAbortController = abortController;
     this.#prefetchInFlight = true;
@@ -760,7 +758,7 @@ export class TTSController extends EventTarget {
     signal: AbortSignal,
   ) {
     const tts = this.view.tts;
-    if (!tts || signal.aborted) return;
+    if (!tts || signal.aborted || !hasTTSPrefetchCapacity()) return;
 
     // Gather the next SSMLs and rewind synchronously to avoid a race condition:
     // tts.next() replaces TTS.#ranges (used by setMark() during playback).
@@ -771,7 +769,14 @@ export class TTSController extends EventTarget {
     // a real time-based buffer (bounded by maxParagraphs).
     const rawSsmls: string[] = [];
     let estimatedSeconds = 0;
-    for (let i = 0; i < maxParagraphs && estimatedSeconds < targetSeconds && !signal.aborted; i++) {
+    for (
+      let i = 0;
+      i < maxParagraphs &&
+      estimatedSeconds < targetSeconds &&
+      !signal.aborted &&
+      hasTTSPrefetchCapacity();
+      i++
+    ) {
       const ssml = tts.next();
       if (!ssml) break;
       rawSsmls.push(ssml);
@@ -782,6 +787,7 @@ export class TTSController extends EventTarget {
     }
 
     await this.#preloadRawParagraphs(rawSsmls, signal, 0);
+    if (signal.aborted || !hasTTSPrefetchCapacity()) return;
 
     // A chapter boundary must not shrink the offline window. Build isolated
     // TTS iterators for following sections, so look-ahead can continue without
@@ -794,7 +800,8 @@ export class TTSController extends EventTarget {
       sectionIndex < sections.length &&
       paragraphCount < maxParagraphs &&
       estimatedSeconds < targetSeconds &&
-      !signal.aborted;
+      !signal.aborted &&
+      hasTTSPrefetchCapacity();
       sectionIndex++
     ) {
       const section = sections[sectionIndex];
@@ -814,7 +821,8 @@ export class TTSController extends EventTarget {
         raw &&
         paragraphCount < maxParagraphs &&
         estimatedSeconds < targetSeconds &&
-        !signal.aborted
+        !signal.aborted &&
+        hasTTSPrefetchCapacity()
       ) {
         estimatedSeconds += estimateSpeechDuration(raw.replace(/<[^>]+>/g, ''), this.ttsRate);
         paragraphCount++;
