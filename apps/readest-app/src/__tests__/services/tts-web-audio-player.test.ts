@@ -308,6 +308,22 @@ describe('WebAudioPlayer early end and paragraph handoff', () => {
     expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 2, 5);
   });
 
+  test('session-end is announced immediately when the final chunk is already inside the early window', async () => {
+    const { ctx, player, events, onEvent } = setup();
+    await player.ensureContext();
+    const gen = player.startSession(onEvent);
+    player.scheduleChunk(gen, makeBuffer(0.2), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+    player.endSession(gen);
+
+    expect(events.filter((e) => e.type === 'session-end')).toHaveLength(1);
+    expect(ctx.sources[0]!.stopped).toBe(false);
+
+    const gen2 = player.startSession(() => {});
+    player.scheduleChunk(gen2, makeBuffer(1), { trimStartSec: 0, mediaScale: 1, gapSec: 0 });
+
+    expect(ctx.sources[1]!.startedAt).toBeCloseTo(SAFETY + 0.2, 5);
+  });
+
   test('early end is suppressed while the user has paused the context', async () => {
     vi.useFakeTimers();
     const { player, events, onEvent } = setup();

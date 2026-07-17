@@ -7,7 +7,8 @@ import {
   EDGE_TTS_MAX_RATE,
   EDGE_TTS_PROTOCOL,
   getEdgeTTSWsMaxConcurrent,
-  isTTSPayloadCached,
+  getTTSPayloadCacheState,
+  type TTSPayloadCacheState,
   TTS_WS_MAX_CONCURRENT,
   TTSWordBoundary,
   WsSlotPriority,
@@ -39,6 +40,7 @@ import {
 } from './ttsDuration';
 import { buildBatches, partitionBatch } from './ttsBatch';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
+import { elapsedMs, nowMs, ttsLog, ttsWarn } from './ttsDiagnostics';
 
 // One Edge request is one immutable Web Audio source. Sentence boundaries are
 // metadata on that source, never PCM cut points — highlighting, the scrubber,
@@ -136,7 +138,13 @@ type BatchPrepareResult =
       voiceId: string;
       batchIndex: number;
       cacheHit: boolean;
+      cacheState: TTSPayloadCacheState;
       boundaryCount: number;
+      audioBytes: number;
+      fetchMs: number;
+      decodeMs: number;
+      pcmMs: number;
+      totalMs: number;
     }
   | { kind: 'skip'; marks: TTSMark[]; batchIndex: number }
   | { kind: 'fatal'; message: string; batchIndex: number };
@@ -246,7 +254,16 @@ export class EdgeTTSClient implements TTSClient {
         // from a flaky upstream is retryable — do not skip the sentence yet.
         if (isNoAudioSynthesisError(err, payload.text)) throw err;
         lastError = err;
-        console.warn(`Edge TTS fetch attempt ${attempt}/${maxAttempts} failed`, err);
+        ttsWarn(
+          'fetch-attempt-failed',
+          {
+            attempt,
+            maxAttempts,
+            priority,
+            textLen: payload.text.length,
+          },
+          err,
+        );
         if (attempt < maxAttempts) {
           const shouldRetry = await delayUnlessAborted(250 * attempt, signal);
           if (!shouldRetry) return undefined;
@@ -417,6 +434,7 @@ export class EdgeTTSClient implements TTSClient {
     // TTS_WS_MAX_CONCURRENT batches are warmed before playback; later batches
     // keep filling in a single background worker so long paragraphs do not fall
     // back to playback-time one-by-one synthesis.
+    const preloadStartedAt = nowMs();
     const batches = buildBatches(marks, startup);
     const criticalCount = this.#criticalPreloadBatches(batches.length);
     // Startup playback peels the first one or two sentences into separate
@@ -427,17 +445,39 @@ export class EdgeTTSClient implements TTSClient {
     const blockingCount = startup
       ? Math.min(2, criticalCount, batches.length)
       : Math.min(1, criticalCount);
-    const preloadBatch = async (batch: TTSMark[]) => {
+    if (priority === 'high') {
+      ttsLog('preload-start', {
+        priority,
+        startup,
+        awaitAll,
+        marks: marks.length,
+        batches: batches.length,
+        blocking: blockingCount,
+      });
+    }
+    const preloadBatch = async (batch: TTSMark[], index: number) => {
       const voiceLang = batch[0]!.language;
       const voiceId = await this.getVoiceIdFromLang(voiceLang);
       this.#currentVoiceId = voiceId;
       const text = batch.map((m) => m.text).join('');
-      const audio = await this.#createAudioDataWithRetry(
-        this.getPayload(voiceLang, text, voiceId),
-        signal,
-        priority,
-      );
+      const payload = this.getPayload(voiceLang, text, voiceId);
+      const cacheState = getTTSPayloadCacheState(payload);
+      const fetchStartedAt = nowMs();
+      const audio = await this.#createAudioDataWithRetry(payload, signal, priority);
       if (!audio) return;
+      const fetchMs = elapsedMs(fetchStartedAt);
+      if (priority === 'high' || fetchMs > 1000) {
+        ttsLog('preload-batch-ready', {
+          priority,
+          batch: index,
+          cacheHit: cacheState === 'ready',
+          cacheState,
+          fetchMs,
+          bytes: audio.data.byteLength,
+          boundaries: audio.boundaries.length,
+          textLen: text.length,
+        });
+      }
       const { perMark } = partitionBatch(batch, audio.boundaries);
       for (let i = 0; i < batch.length; i++) {
         const markBoundaries = perMark[i] ?? [];
@@ -458,15 +498,22 @@ export class EdgeTTSClient implements TTSClient {
     const runBatch = async (index: number) => {
       if (signal.aborted || index >= batches.length) return;
       try {
-        await preloadBatch(batches[index]!);
+        await preloadBatch(batches[index]!, index);
       } catch (err) {
-        console.warn('Error preloading batch', index, err);
+        ttsWarn('preload-batch-error', { batch: index, priority }, err);
       }
     };
     // Only launch the batches we will wait on. Starting the full "critical"
     // window in parallel used to race the playhead's first lines for WS slots
     // (non-blocking critical + deep-prefetch workers), so lines 1–2 stayed cold.
     await Promise.all(Array.from({ length: blockingCount }, (_, index) => runBatch(index)));
+    if (priority === 'high') {
+      ttsLog('preload-blocking-done', {
+        priority,
+        ms: elapsedMs(preloadStartedAt),
+        blocking: blockingCount,
+      });
+    }
     // Remaining work (rest of the paragraph, including non-blocking critical)
     // starts after release so opening audio is never delayed by it.
     let nextBackgroundIndex = blockingCount;
@@ -516,6 +563,7 @@ export class EdgeTTSClient implements TTSClient {
     rate: number,
     webAudioRate: number,
   ): Promise<BatchPrepareResult> {
+    const totalStartedAt = nowMs();
     if (signal.aborted || this.#activeGeneration !== generation) {
       return { kind: 'skip', marks: batch, batchIndex };
     }
@@ -531,41 +579,63 @@ export class EdgeTTSClient implements TTSClient {
       return { kind: 'skip', marks: batch, batchIndex };
     }
     const payload = this.getPayload(voiceLang, batchText, voiceId);
-    const cacheHit = isTTSPayloadCached(payload);
+    const cacheState = getTTSPayloadCacheState(payload);
 
     let audio: { data: ArrayBuffer; boundaries: TTSWordBoundary[] } | undefined;
+    let fetchMs = 0;
     try {
       // 'high': this batch is on the imminent-playback critical path, so it
       // must not queue behind background paragraph prefetch for the same WS
       // slots — that contention was a real source of the audible gaps this
       // pipeline exists to remove.
+      const fetchStartedAt = nowMs();
       audio = await this.#createAudioDataWithRetry(payload, signal, 'high');
+      fetchMs = elapsedMs(fetchStartedAt);
     } catch (error) {
       // Permanent unspeakable no-audio, OR speakable empty-audio that still
       // failed after retries: skip the batch so the session can continue
       // (do not wedge/kill the whole TTS run on one bad sentence).
       if (isNoAudioSynthesisError(error, batchText) || isEmptyAudioError(error)) {
-        console.warn('No audio data received for:', batchText);
+        ttsWarn('batch-no-audio', {
+          gen: generation,
+          batch: batchIndex,
+          textLen: batchText.length,
+        });
         return { kind: 'skip', marks: batch, batchIndex };
       }
       const message = error instanceof Error ? error.message : String(error);
-      console.warn('TTS error for batch:', batchText, message);
+      ttsWarn('batch-fetch-fatal', {
+        gen: generation,
+        batch: batchIndex,
+        textLen: batchText.length,
+        message,
+      });
       return { kind: 'fatal', message, batchIndex };
     }
     if (!audio || signal.aborted || this.#activeGeneration !== generation) {
       return { kind: 'skip', marks: batch, batchIndex };
     }
+    const audioBytes = audio.data.byteLength;
 
     let decoded: TTSAudioBuffer;
+    let decodeMs = 0;
     try {
+      const decodeStartedAt = nowMs();
       decoded = await this.#player.decode(audio.data);
+      decodeMs = elapsedMs(decodeStartedAt);
     } catch (error) {
-      console.warn('Failed to decode TTS audio for:', batchText, error);
+      ttsWarn(
+        'batch-decode-failed',
+        { gen: generation, batch: batchIndex, bytes: audioBytes },
+        error,
+      );
       return { kind: 'skip', marks: batch, batchIndex };
     }
 
     let prepared: ChunkMeta & { buffer: TTSAudioBuffer };
+    let pcmMs = 0;
     try {
+      const pcmStartedAt = nowMs();
       prepared = await this.#prepareBatchBuffer(
         decoded,
         batch,
@@ -573,8 +643,9 @@ export class EdgeTTSClient implements TTSClient {
         rate,
         webAudioRate,
       );
+      pcmMs = elapsedMs(pcmStartedAt);
     } catch (error) {
-      console.warn('Failed to prepare TTS audio batch:', batchText, error);
+      ttsWarn('batch-pcm-failed', { gen: generation, batch: batchIndex, bytes: audioBytes }, error);
       return { kind: 'skip', marks: batch, batchIndex };
     }
 
@@ -583,8 +654,14 @@ export class EdgeTTSClient implements TTSClient {
       prepared,
       voiceId,
       batchIndex,
-      cacheHit,
+      cacheHit: cacheState === 'ready',
+      cacheState,
       boundaryCount: audio.boundaries.length,
+      audioBytes,
+      fetchMs,
+      decodeMs,
+      pcmMs,
+      totalMs: elapsedMs(totalStartedAt),
     };
   }
 
@@ -654,10 +731,12 @@ export class EdgeTTSClient implements TTSClient {
         // (not the client) is the bottleneck — surface it instead of silently
         // stalling, which is what makes "playback froze" diagnosable in logs.
         const stallTimer = setTimeout(() => {
-          console.warn(
-            `[TTS] batch ${batchIndex} prepare still pending after ` +
-              `${BATCH_PREPARE_STALL_WARN_MS}ms — likely network/bandwidth, not client queue`,
-          );
+          ttsWarn('batch-prepare-stall', {
+            gen: generation,
+            batch: batchIndex,
+            waitMs: BATCH_PREPARE_STALL_WARN_MS,
+            hidden: isPageHidden(),
+          });
         }, BATCH_PREPARE_STALL_WARN_MS);
         let result: BatchPrepareResult;
         try {
@@ -685,15 +764,26 @@ export class EdgeTTSClient implements TTSClient {
           );
         }
 
+        const waitReadyStartedAt = nowMs();
         const ready = await this.#player.waitUntilReady(generation);
+        const waitReadyMs = elapsedMs(waitReadyStartedAt);
         if (!ready || signal.aborted || this.#activeGeneration !== generation) break;
 
-        console.log('[TTS] batch prepare', {
-          index: result.batchIndex,
+        ttsLog('batch-ready', {
+          gen: generation,
+          batch: result.batchIndex,
           cacheHit: result.cacheHit,
+          cacheState: result.cacheState,
+          bytes: result.audioBytes,
+          fetchMs: result.fetchMs,
+          decodeMs: result.decodeMs,
+          pcmMs: result.pcmMs,
+          totalMs: result.totalMs,
+          waitReadyMs,
           boundaries: result.boundaryCount,
           marks: result.prepared.marks.length,
-          durationSec: result.prepared.trimmedDurationSec.toFixed(2),
+          durMs: result.prepared.trimmedDurationSec * 1000,
+          hidden: isPageHidden(),
         });
 
         chunkMeta.push({

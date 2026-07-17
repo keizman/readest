@@ -29,20 +29,37 @@ export const useProgressAutoSave = (bookKey: string) => {
   const persistBookConfig = useCallback(async () => {
     // Skip while previewing a deep-link target — the user's actual
     // last-read position should not be overwritten by a transient view.
-    if (useReaderStore.getState().getViewState(bookKey)?.previewMode) return;
+    const viewState = useReaderStore.getState().getViewState(bookKey);
+    if (viewState?.previewMode || viewState?.isPrimary === false) return;
     const config = getConfig(bookKey);
     if (!config) return;
-    const currentLocation = config.location ?? null;
+    const progressForConfig = progress?.persistToConfig === false ? null : progress;
+    const currentLocation = progressForConfig?.location ?? config.location ?? null;
     if (!initializedRef.current) {
       initializedRef.current = true;
       lastSavedLocationRef.current = currentLocation;
       return;
     }
     if (currentLocation === lastSavedLocationRef.current) return;
+    const configToSave = progressForConfig?.location
+      ? {
+          ...config,
+          location: progressForConfig.location,
+          ...(progressForConfig.progress ? { progress: progressForConfig.progress } : {}),
+        }
+      : config;
     const settings = useSettingsStore.getState().settings;
-    await saveConfig(envConfig, bookKey, config, settings);
+    await saveConfig(envConfig, bookKey, configToSave, settings);
     lastSavedLocationRef.current = currentLocation;
-  }, [bookKey, envConfig, getConfig, saveConfig]);
+  }, [
+    bookKey,
+    envConfig,
+    getConfig,
+    progress?.location,
+    progress?.persistToConfig,
+    progress?.progress,
+    saveConfig,
+  ]);
 
   const persistBookConfigRef = useRef(persistBookConfig);
   persistBookConfigRef.current = persistBookConfig;

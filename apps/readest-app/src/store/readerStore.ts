@@ -2,7 +2,6 @@ import { create } from 'zustand';
 
 import {
   BookContent,
-  BookConfig,
   PageInfo,
   BookProgress,
   ViewSettings,
@@ -385,65 +384,17 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
 
     const pageInfo = bookData.isFixedLayout ? section : pageinfo;
     const progress: [number, number] = [pageInfo.current + 1, pageInfo.total];
-    const progressPercentage = Math.round((progress[0] / progress[1]) * 100);
 
-    // Shelf-level progress only stores page/total. TTS can relocate many times
-    // inside the same page as the spoken sentence changes, so avoid rewriting
-    // the large library store unless the visible page tuple or reading status
-    // actually changed. Precise CFI progress is still written below to
-    // bookDataStore + readerProgressStore for autosave/close recovery.
-    const { getBookByHash, updateBookProgress } = useLibraryStore.getState();
-    const existingBook = getBookByHash(id);
-    if (existingBook) {
-      let newReadingStatus = existingBook.readingStatus;
-      if (existingBook.readingStatus === 'unread') {
-        newReadingStatus = undefined;
-      }
-      if (progressPercentage >= 100 && existingBook.readingStatus !== 'finished') {
-        newReadingStatus = 'finished';
-      }
-      const existingProgress = existingBook.progress;
-      const pageProgressChanged =
-        !existingProgress ||
-        existingProgress[0] !== progress[0] ||
-        existingProgress[1] !== progress[1];
-      const readingStatusChanged = existingBook.readingStatus !== newReadingStatus;
-      if (pageProgressChanged || readingStatusChanged) {
-        updateBookProgress(id, progress, newReadingStatus);
-      }
-    }
-
-    // Only the primary view persists progress into the shared bookData
-    // config — secondary views in a parallel layout shouldn't overwrite
-    // it. Skip the bookDataStore write entirely when not primary to spare
-    // its subscribers a re-render.
-    if (viewState.isPrimary) {
-      useBookDataStore.setState((state) => {
-        const existing = state.booksData[id];
-        if (!existing) return state;
-        return {
-          booksData: {
-            ...state.booksData,
-            [id]: {
-              ...existing,
-              config: {
-                ...existing.config,
-                progress,
-                location,
-              } as BookConfig,
-            },
-          },
-        };
-      });
-    }
-
-    // Write progress to the standalone store. This is the only setState on
-    // the hot swipe path that the previous implementation routed through
-    // the (much bigger) readerStore — the split here is the whole point of
-    // the refactor: components subscribing to `useReaderStore()` without a
-    // selector will no longer re-render per page turn.
+    // Keep the hot relocate path confined to the tiny progress store.
+    // bookDataStore and libraryStore still have broad subscribers in the
+    // reader/library UI; touching them here turns a page gesture into a large
+    // React commit. useProgressAutoSave/bookDataStore.saveConfig merge this
+    // snapshot into config + shelf progress on the debounced/flush path, so
+    // close/background durability is preserved without blocking the gesture.
     setBookProgress(key, {
       location,
+      progress,
+      persistToConfig: viewState.isPrimary,
       sectionHref: tocItem?.href,
       sectionLabel: tocItem?.label,
       pageItem,

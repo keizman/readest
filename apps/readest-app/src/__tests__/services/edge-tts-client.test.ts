@@ -41,6 +41,7 @@ vi.mock('@/libs/edgeTTS', () => {
     TTS_AUDIO_CACHE_MAX_BYTES: 20 * 60 * 6 * 1024,
     getTTSAudioCacheBytes: () => 0,
     hasTTSPrefetchCapacity: () => true,
+    getTTSPayloadCacheState: () => 'miss',
     isTTSPayloadCached: () => false,
   };
 });

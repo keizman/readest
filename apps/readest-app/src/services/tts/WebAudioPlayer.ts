@@ -17,6 +17,8 @@
 // This module speaks to the context through structural interfaces so jsdom
 // tests can drive a fake clock.
 
+import { ttsLog, ttsWarn } from './ttsDiagnostics';
+
 export interface TTSAudioBuffer {
   readonly sampleRate: number;
   readonly length: number;
@@ -133,6 +135,9 @@ const MAX_AHEAD_SEC_HIDDEN = 300;
 
 let sharedContext: TTSAudioContext | null = null;
 
+const visibilityState = (): string =>
+  typeof document !== 'undefined' ? document.visibilityState : 'unknown';
+
 const getSharedContext = (): TTSAudioContext => {
   if (!sharedContext) {
     sharedContext = new AudioContext() as unknown as TTSAudioContext;
@@ -151,7 +156,7 @@ export const ensureSharedAudioContext = async (): Promise<void> => {
       await ctx.resume();
     }
   } catch (err) {
-    console.warn('[TTS] audio context warmup failed', err);
+    ttsWarn('audio-context-warmup-failed', undefined, err);
   }
 };
 
@@ -238,7 +243,12 @@ export class WebAudioPlayer {
     };
     this.#handoffNextStartTime = 0;
     this.#registerDeviceChangeListener();
-    console.log(`[TTS] session ${generation} start`);
+    ttsLog('session-start', {
+      gen: generation,
+      ctxState: ctx?.state,
+      handoffMs: ctx && handoff > 0 ? Math.max(0, (handoff - ctx.currentTime) * 1000) : undefined,
+      visibility: visibilityState(),
+    });
     return generation;
   }
 
@@ -266,15 +276,25 @@ export class WebAudioPlayer {
     session.chunks.push(chunk);
     session.nextStartTime = start + effectiveDuration + Math.max(0, timing.gapSec);
     source.start(start);
-    const scheduleGapMs = Math.max(0, (start - plannedStart) * 1000);
-    console.log(
-      `[TTS] schedule ${generation}:${chunk.index} at ${start.toFixed(2)} dur ${effectiveDuration.toFixed(2)}` +
-        (scheduleGapMs > 5 ? ` gap ${scheduleGapMs.toFixed(0)}ms` : ''),
-    );
+    const hasPlannedStart = plannedStart > 0;
+    const scheduleGapMs = hasPlannedStart ? Math.max(0, (start - plannedStart) * 1000) : 0;
+    ttsLog('schedule-chunk', {
+      gen: generation,
+      chunk: chunk.index,
+      lateMs: scheduleGapMs,
+      coldStartMs: hasPlannedStart ? undefined : start * 1000,
+      startMs: start * 1000,
+      durMs: effectiveDuration * 1000,
+      aheadMs: (session.nextStartTime - ctx.currentTime) * 1000,
+      visibility: visibilityState(),
+    });
     if (scheduleGapMs > 50 && chunk.index > 0) {
-      console.warn(
-        `[TTS] batch ${chunk.index} scheduled ${scheduleGapMs.toFixed(0)}ms late — likely cache/prefetch underrun`,
-      );
+      ttsWarn('schedule-late', {
+        gen: generation,
+        chunk: chunk.index,
+        lateMs: scheduleGapMs,
+        visibility: visibilityState(),
+      });
     }
     if (chunk.index === 0) {
       session.onEvent({ type: 'chunk-start', chunkIndex: 0 });
@@ -315,9 +335,14 @@ export class WebAudioPlayer {
     const waiters = session.waiters;
     session.waiters = [];
     for (const waiter of waiters) waiter(false);
+    const ctx = this.#ctx;
     this.#handoffNextStartTime = session.nextStartTime;
     this.#orphanedHandoffChunks = session.chunks.filter((c) => !c.ended);
-    console.log(`[TTS] session ${session.generation} handoff`);
+    ttsLog('session-handoff', {
+      gen: session.generation,
+      chunks: session.chunks.length,
+      tailMs: ctx ? Math.max(0, (session.nextStartTime - ctx.currentTime) * 1000) : undefined,
+    });
     return true;
   }
 
@@ -362,7 +387,7 @@ export class WebAudioPlayer {
     const waiters = session.waiters;
     session.waiters = [];
     for (const waiter of waiters) waiter(false);
-    console.log(`[TTS] session ${session.generation} abort`);
+    ttsLog('session-abort', { gen: session.generation, chunks: session.chunks.length });
   }
 
   async waitUntilReady(generation: number): Promise<boolean> {
@@ -470,7 +495,21 @@ export class WebAudioPlayer {
     const ctx = this.#ctx;
     if (!ctx) return;
     const fireInSec = session.nextStartTime - SESSION_END_EARLY_LEAD_SEC - ctx.currentTime;
-    if (fireInSec <= 0) return;
+    if (fireInSec <= 0) {
+      ttsLog('early-end-immediate', {
+        gen: session.generation,
+        remainingMs: (session.nextStartTime - ctx.currentTime) * 1000,
+        leadMs: SESSION_END_EARLY_LEAD_SEC * 1000,
+      });
+      this.#tryEarlyEnd(session);
+      return;
+    }
+    ttsLog('early-end-arm', {
+      gen: session.generation,
+      fireInMs: fireInSec * 1000,
+      remainingMs: (session.nextStartTime - ctx.currentTime) * 1000,
+      leadMs: SESSION_END_EARLY_LEAD_SEC * 1000,
+    });
     session.earlyEndTimer = setTimeout(() => this.#tryEarlyEnd(session), fireInSec * 1000);
   }
 
@@ -481,10 +520,22 @@ export class WebAudioPlayer {
     if (!ctx) return;
     // While paused the audio clock is frozen; announcing the end now would
     // advance paragraphs over silence. Leave it to onended after resume.
-    if (this.#userPaused || ctx.state !== 'running') return;
+    if (this.#userPaused || ctx.state !== 'running') {
+      ttsLog('early-end-suppressed', {
+        gen: session.generation,
+        ctxState: ctx.state,
+        userPaused: this.#userPaused,
+      });
+      return;
+    }
     const remainingSec = session.nextStartTime - ctx.currentTime;
     if (remainingSec > SESSION_END_EARLY_LEAD_SEC + 0.05) {
       // The audio clock lagged wall time (brief suspension); re-arm.
+      ttsLog('early-end-rearm', {
+        gen: session.generation,
+        remainingMs: remainingSec * 1000,
+        leadMs: SESSION_END_EARLY_LEAD_SEC * 1000,
+      });
       session.earlyEndTimer = setTimeout(
         () => this.#tryEarlyEnd(session),
         (remainingSec - SESSION_END_EARLY_LEAD_SEC) * 1000,
@@ -492,6 +543,10 @@ export class WebAudioPlayer {
       return;
     }
     session.endedEmitted = true;
+    ttsLog('early-end-emit', {
+      gen: session.generation,
+      remainingMs: remainingSec * 1000,
+    });
     session.onEvent({ type: 'session-end' });
   }
 
@@ -527,7 +582,7 @@ export class WebAudioPlayer {
         const outputDeviceRemoved = this.#knownOutputDeviceIds.some((id) => !newIds.includes(id));
         this.#knownOutputDeviceIds = newIds;
         if (outputDeviceRemoved && this.#session && !this.#userPaused) {
-          console.log('[TTS] audio output device removed; stopping playback');
+          ttsLog('audio-output-removed');
           this.#session.onEvent({ type: 'audio-interrupted' });
         }
       })
@@ -541,7 +596,7 @@ export class WebAudioPlayer {
     if (!this.#session) return;
     // Unexpected AudioContext suspension (e.g. Bluetooth disconnect on iOS,
     // incoming call): stop rather than silently resuming to another output.
-    console.log(`[TTS] audio context ${ctx.state}; stopping playback`);
+    ttsLog('audio-context-interrupted', { ctxState: ctx.state });
     this.#session.onEvent({ type: 'audio-interrupted' });
   }
 }

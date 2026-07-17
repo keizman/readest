@@ -25,6 +25,7 @@ import {
   rangeTextExcludingInert,
   TTSWordOffset,
 } from './wordHighlight';
+import { elapsedMs, nowMs, ttsLog, ttsWarn } from './ttsDiagnostics';
 
 // App-wide monotonic sequence for 'tts-position' events. A fresh TTSController
 // is constructed per `tts-speak`, so a per-instance counter would restart at 0
@@ -40,11 +41,18 @@ let ttsPositionSequence = 0;
 // short dialogue receive the same real playback buffer as dense CJK prose.
 // Prefetch continues into following sections when needed.
 const PREFETCH_TARGET_SECONDS = 90 * 60;
-const PREFETCH_MAX_PARAGRAPHS = 1500;
-// Paragraph-level prefetch workers, scaled to the WS backend pool so N relays
-// are all kept busy filling the cache. Capped at the pool's low-priority slot
-// budget (one slot is always reserved for the playhead's 'high' requests, and
-// 'high' jumps the wait queue), so a deeper prefetch can never starve playback.
+// Bound each look-ahead pass. A chapter with thousands of short blocks used to
+// make TTS startup walk the whole remaining section synchronously via
+// foliate's tts.next()/prev(), which can ANR Android before any network fetch
+// starts. Playback asks for look-ahead again on later boundaries, so a modest
+// per-pass window keeps the cache warm without monopolizing the main thread.
+const PREFETCH_MAX_PARAGRAPHS = 64;
+const PREFETCH_MAX_RAW_SSML_CHARS = 24_000;
+// Deep paragraph lookahead must stay distance-ordered: the next paragraph's
+// audio is more valuable than many far-ahead misses. Parallel paragraph workers
+// let dist=1..N contend with dist=0 on the backend, so playback could still
+// reach a cacheState=inflight next paragraph and sit silent until that low
+// prefetch completed.
 const prefetchParallelism = (): number => Math.max(1, getEdgeTTSWsMaxConcurrent() - 1);
 
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
@@ -126,6 +134,9 @@ export class TTSController extends EventTarget {
   #hasStartedPlayback = false;
   #prefetchAbortController: AbortController | null = null;
   #prefetchInFlight = false;
+  #speakStartupGeneration = 0;
+  #speakStartupInProgress = false;
+  #deferredPreloadNextSSML = false;
   #ttsSectionIndex: number = -1;
 
   // Virtual section timeline for position/duration/seek (Edge client only).
@@ -281,7 +292,7 @@ export class TTSController extends EventTarget {
       doc = section?.createDocument ? await section.createDocument() : undefined;
     }
     if (!doc) {
-      console.warn('[TTS] attachView: no document for section', sectionIndex);
+      ttsWarn('attach-view-no-document', { section: sectionIndex });
       return;
     }
     const { TTS } = await import('foliate-js/tts.js');
@@ -312,7 +323,7 @@ export class TTSController extends EventTarget {
         const anchored = view.resolveCFI(cfi).anchor(doc);
         if (anchored) newTts.from(anchored); // position the iterator; discard SSML
       } catch (err) {
-        console.warn('[TTS] attachView re-seed failed', err);
+        ttsWarn('attach-view-reseed-failed', undefined, err);
       }
     }
     this.#tts = newTts;
@@ -459,7 +470,7 @@ export class TTSController extends EventTarget {
 
     this.#tts = await this.#createTTS(doc, this.#getHighlighter());
     this.view.tts = this.#tts;
-    console.log(`[TTS] Initialized TTS for section ${sectionIndex}`);
+    ttsLog('section-tts-initialized', { section: sectionIndex });
 
     return true;
   }
@@ -691,6 +702,7 @@ export class TTSController extends EventTarget {
   #cancelPrefetch() {
     const controller = this.#prefetchAbortController;
     if (!controller) return;
+    ttsLog('prefetch-cancel');
     controller.abort();
     if (this.#prefetchAbortController === controller) {
       this.#prefetchAbortController = null;
@@ -698,38 +710,82 @@ export class TTSController extends EventTarget {
     this.#prefetchInFlight = false;
   }
 
+  #beginSpeakStartup(): number {
+    const generation = ++this.#speakStartupGeneration;
+    this.#speakStartupInProgress = true;
+    this.#deferredPreloadNextSSML = false;
+    return generation;
+  }
+
+  #finishSpeakStartup(generation: number, runDeferredPrefetch: boolean) {
+    if (generation !== this.#speakStartupGeneration || !this.#speakStartupInProgress) return;
+    this.#speakStartupInProgress = false;
+    const shouldRunPrefetch =
+      runDeferredPrefetch && this.#deferredPreloadNextSSML && this.state === 'playing';
+    this.#deferredPreloadNextSSML = false;
+    if (shouldRunPrefetch) {
+      ttsLog('prefetch-resume-after-boundary');
+      void this.preloadNextSSML();
+    }
+  }
+
+  #requestPreloadNextSSML() {
+    if (this.#speakStartupInProgress) {
+      if (!this.#deferredPreloadNextSSML) {
+        ttsLog('prefetch-defer-during-speak-start');
+      }
+      this.#deferredPreloadNextSSML = true;
+      return;
+    }
+    void this.preloadNextSSML();
+  }
+
   async #preloadRawParagraphs(
     rawSsmls: string[],
     signal: AbortSignal,
     distanceBase = 0,
   ): Promise<void> {
-    let nextIndex = 0;
+    const preloadOne = async (ssml: string | undefined, index: number): Promise<void> => {
+      if (!ssml || signal.aborted || !hasTTSPrefetchCapacity()) return;
+      const processed = await this.#preprocessSSML(ssml);
+      if (!processed || signal.aborted || !hasTTSPrefetchCapacity()) return;
+      const marks: TTSMark[] = [];
+      this.#appendSpeakableMarksFromSSML(marks, processed);
+      // Bounded, session-relative distance (paragraphs ahead of the currently
+      // playing paragraph). Resets every prefetch walk, so it never grows
+      // unbounded — it is only a diagnostic to see how far ahead a fetch is
+      // relative to the playhead (e.g. "dist=+37 while playing dist=0" points
+      // straight at a runaway look-ahead).
+      if (marks.length > 0) {
+        ttsLog('prefetch-paragraph', { dist: distanceBase + index, marks: marks.length });
+      }
+      // Deep look-ahead: 'low' priority (yields the reserved slot to the
+      // playhead) and awaitAll so each paragraph fully completes before the
+      // walk advances — no detached background fills accumulating behind the
+      // current sentence.
+      await this.#preloadMarks(marks, signal, false, 'low', true);
+    };
+
+    // Warm the immediate next paragraph first. Once dist=0 is safely in cache,
+    // fan out the remaining look-ahead so the cache is not reduced to one
+    // request at a time during normal playback.
+    await preloadOne(rawSsmls[0], 0);
+    if (signal.aborted || !hasTTSPrefetchCapacity()) return;
+
+    let nextIndex = 1;
     const worker = async () => {
       for (;;) {
         if (signal.aborted || !hasTTSPrefetchCapacity()) return;
         const index = nextIndex++;
         if (index >= rawSsmls.length) return;
-        const ssml = await this.#preprocessSSML(rawSsmls[index]);
-        if (!ssml || signal.aborted || !hasTTSPrefetchCapacity()) continue;
-        const marks: TTSMark[] = [];
-        this.#appendSpeakableMarksFromSSML(marks, ssml);
-        // Bounded, session-relative distance (paragraphs ahead of the currently
-        // playing paragraph). Resets every prefetch walk, so it never grows
-        // unbounded — it is only a diagnostic to see how far ahead a fetch is
-        // relative to the playhead (e.g. "dist=+37 while playing dist=0" points
-        // straight at a runaway look-ahead).
-        if (marks.length > 0) {
-          console.log('[TTS] prefetch', { dist: distanceBase + index, marks: marks.length });
-        }
-        // Deep look-ahead: 'low' priority (yields the reserved slot to the
-        // playhead) and awaitAll so each paragraph fully completes before the
-        // walk advances — no detached background fills accumulating behind the
-        // current sentence.
-        await this.#preloadMarks(marks, signal, false, 'low', true);
+        await preloadOne(rawSsmls[index], index);
       }
     };
     await Promise.all(
-      Array.from({ length: Math.min(prefetchParallelism(), rawSsmls.length) }, () => worker()),
+      Array.from(
+        { length: Math.min(prefetchParallelism(), Math.max(0, rawSsmls.length - 1)) },
+        () => worker(),
+      ),
     );
   }
 
@@ -769,10 +825,12 @@ export class TTSController extends EventTarget {
     // a real time-based buffer (bounded by maxParagraphs).
     const rawSsmls: string[] = [];
     let estimatedSeconds = 0;
+    let rawSsmlChars = 0;
     for (
       let i = 0;
       i < maxParagraphs &&
       estimatedSeconds < targetSeconds &&
+      rawSsmlChars < PREFETCH_MAX_RAW_SSML_CHARS &&
       !signal.aborted &&
       hasTTSPrefetchCapacity();
       i++
@@ -780,6 +838,7 @@ export class TTSController extends EventTarget {
       const ssml = tts.next();
       if (!ssml) break;
       rawSsmls.push(ssml);
+      rawSsmlChars += ssml.length;
       estimatedSeconds += estimateSpeechDuration(ssml.replace(/<[^>]+>/g, ''), this.ttsRate);
     }
     for (let i = 0; i < rawSsmls.length; i++) {
@@ -800,6 +859,7 @@ export class TTSController extends EventTarget {
       sectionIndex < sections.length &&
       paragraphCount < maxParagraphs &&
       estimatedSeconds < targetSeconds &&
+      rawSsmlChars < PREFETCH_MAX_RAW_SSML_CHARS &&
       !signal.aborted &&
       hasTTSPrefetchCapacity();
       sectionIndex++
@@ -821,10 +881,12 @@ export class TTSController extends EventTarget {
         raw &&
         paragraphCount < maxParagraphs &&
         estimatedSeconds < targetSeconds &&
+        rawSsmlChars < PREFETCH_MAX_RAW_SSML_CHARS &&
         !signal.aborted &&
         hasTTSPrefetchCapacity()
       ) {
         estimatedSeconds += estimateSpeechDuration(raw.replace(/<[^>]+>/g, ''), this.ttsRate);
+        rawSsmlChars += raw.length;
         paragraphCount++;
         sectionRawSsmls.push(raw);
         raw = sectionTTS.next();
@@ -862,6 +924,7 @@ export class TTSController extends EventTarget {
   }
 
   async #speak(ssml: string | undefined | Promise<string>, oneTime = false) {
+    const startupGeneration = oneTime ? 0 : this.#beginSpeakStartup();
     await this.stop(true);
     this.#terminated = false;
     this.#currentSpeakAbortController = new AbortController();
@@ -869,14 +932,29 @@ export class TTSController extends EventTarget {
 
     this.#currentSpeakPromise = new Promise(async (resolve, reject) => {
       try {
-        console.log('[TTS] speak');
+        const speakStartedAt = nowMs();
+        ttsLog('speak-start');
         this.state = 'playing';
 
         signal.addEventListener('abort', () => {
           resolve();
         });
 
-        ssml = await this.#preprocessSSML(await ssml);
+        const ssmlAwaitStartedAt = nowMs();
+        const rawSsml = await ssml;
+        ttsLog('speak-ssml-ready', {
+          waitMs: elapsedMs(ssmlAwaitStartedAt),
+          hasSsml: !!rawSsml,
+          sinceStartMs: elapsedMs(speakStartedAt),
+        });
+
+        const preprocessStartedAt = nowMs();
+        ssml = await this.#preprocessSSML(rawSsml);
+        ttsLog('speak-preprocess-done', {
+          ms: elapsedMs(preprocessStartedAt),
+          textLen: ssml?.length ?? 0,
+          sinceStartMs: elapsedMs(speakStartedAt),
+        });
         if (!ssml) {
           this.#nossmlCnt++;
           // FIXME: in case we are at the end of the book, need a better way to handle this
@@ -890,21 +968,33 @@ export class TTSController extends EventTarget {
               await this.stop();
             }
           }
-          console.log('[TTS] no SSML, skipping for', this.#nossmlCnt);
+          ttsLog('speak-no-ssml', { count: this.#nossmlCnt });
           return;
         } else {
           this.#nossmlCnt = 0;
         }
 
         const startup = !oneTime && !this.#hasStartedPlayback;
+        const parseStartedAt = nowMs();
         const { marks } = parseSSMLMarks(ssml, this.ttsLang);
         const speakableMarks = marks.filter((mark) => hasSpeakableText(mark.text));
+        ttsLog('speak-marks-ready', {
+          ms: elapsedMs(parseStartedAt),
+          marks: marks.length,
+          speakable: speakableMarks.length,
+          sinceStartMs: elapsedMs(speakStartedAt),
+        });
         if (!oneTime) {
           if (speakableMarks.length === 0) {
             resolve();
             return await this.forward();
           } else {
+            const markStartedAt = nowMs();
             this.dispatchSpeakMark(speakableMarks[0]);
+            ttsLog('speak-initial-mark-done', {
+              ms: elapsedMs(markStartedAt),
+              sinceStartMs: elapsedMs(speakStartedAt),
+            });
           }
           if (this.ttsClient === this.ttsEdgeClient) {
             // Paragraph-local marks guarantee preload and playback produce the
@@ -914,7 +1004,17 @@ export class TTSController extends EventTarget {
             // prefetch for the shared WS slots (that priority inversion was a
             // primary cause of the current sentence stalling while far-ahead
             // sentences were being fetched).
+            const preloadStartedAt = nowMs();
+            ttsLog('speak-preload-start', {
+              startup,
+              marks: speakableMarks.length,
+              sinceStartMs: elapsedMs(speakStartedAt),
+            });
             await this.#preloadMarks(speakableMarks, signal, startup, 'high');
+            ttsLog('speak-preload-done', {
+              ms: elapsedMs(preloadStartedAt),
+              sinceStartMs: elapsedMs(speakStartedAt),
+            });
           } else {
             await this.preloadSSML(ssml, signal, startup);
           }
@@ -927,12 +1027,24 @@ export class TTSController extends EventTarget {
           this.ttsClient === this.ttsEdgeClient
             ? this.ttsEdgeClient.speakMarks(speakableMarks, signal, false, startup)
             : await this.ttsClient.speak(ssml, signal, false, startup);
+        ttsLog('speak-playback-enter', {
+          startup,
+          sinceStartMs: elapsedMs(speakStartedAt),
+        });
         let lastCode;
         let lastMessage: string | undefined;
+        let firstBoundarySeen = false;
         for await (const { code, message } of iter) {
           if (signal.aborted) {
             resolve();
             return;
+          }
+          if (code === 'boundary' && !oneTime) {
+            if (!firstBoundarySeen) {
+              firstBoundarySeen = true;
+              ttsLog('speak-first-boundary', { sinceStartMs: elapsedMs(speakStartedAt) });
+            }
+            this.#finishSpeakStartup(startupGeneration, true);
           }
           lastCode = code;
           lastMessage = message;
@@ -972,7 +1084,7 @@ export class TTSController extends EventTarget {
           // consecutive failures so a wholly-unusable engine/connection stops
           // gracefully instead of silently racing to the end of the book.
           // See #4613, #4408.
-          console.warn('[TTS] skipping paragraph after speak error:', lastMessage);
+          ttsWarn('speak-skip-paragraph-after-error', { message: lastMessage });
           this.#consecutiveSpeakErrors++;
           resolve();
           if (this.#consecutiveSpeakErrors <= TTS_SPEAK_MAX_CONSECUTIVE_ERRORS) {
@@ -991,6 +1103,9 @@ export class TTSController extends EventTarget {
           reject(e);
         }
       } finally {
+        if (!oneTime) {
+          this.#finishSpeakStartup(startupGeneration, false);
+        }
         if (this.#currentSpeakAbortController) {
           this.#currentSpeakAbortController.abort();
           this.#currentSpeakAbortController = null;
@@ -1011,7 +1126,7 @@ export class TTSController extends EventTarget {
       })
       .catch((e) => this.error(e));
     if (!oneTime) {
-      this.preloadNextSSML();
+      this.#requestPreloadNextSSML();
       this.dispatchSpeakMark();
     }
   }
@@ -1036,7 +1151,7 @@ export class TTSController extends EventTarget {
       this.resume();
     }
     this.#speak(ssml);
-    this.preloadNextSSML();
+    this.#requestPreloadNextSSML();
   }
 
   async pause() {
@@ -1069,6 +1184,10 @@ export class TTSController extends EventTarget {
       this.#currentSpeakPromise = null;
     }
     this.state = 'stopped';
+    if (!keepPrefetch) {
+      this.#speakStartupInProgress = false;
+      this.#deferredPreloadNextSSML = false;
+    }
   }
 
   // goto previous mark/paragraph
@@ -1099,7 +1218,7 @@ export class TTSController extends EventTarget {
     } else {
       await this.#handleNavigationWithSSML(ssml, isPlaying);
     }
-    if (isPlaying && !byMark) this.preloadNextSSML();
+    if (isPlaying && !byMark) this.#requestPreloadNextSSML();
   }
 
   async setLang(lang: string) {
@@ -1234,7 +1353,7 @@ export class TTSController extends EventTarget {
         this.dispatchEvent(new CustomEvent('tts-highlight-mark', { detail: { cfi } }));
         this.#dispatchPosition(cfi, 'sentence');
         if (this.state === 'playing') {
-          void this.preloadNextSSML();
+          this.#requestPreloadNextSSML();
         }
       } catch {
         this.#suppressMarkHighlight = false;
@@ -1336,7 +1455,7 @@ export class TTSController extends EventTarget {
           : '';
         return { spoken: word, highlighted: highlighted || '(unmatched)' };
       });
-      console.log('[TTS] word-sync', { sentence: matchText, words: mapping });
+      ttsLog('word-sync', { textLen: matchText.length, words: mapping.length });
     }
     if (words.length === 0) {
       // No word boundaries for this chunk: the sentence highlight was

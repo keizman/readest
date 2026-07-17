@@ -135,6 +135,37 @@ describe('TTS', () => {
       expect(stripTags(ssml!)).toContain('First sentence');
     });
 
+    it('should stream Intl.Segmenter output without materializing the whole segment list', () => {
+      const originalArrayFrom = Array.from;
+      const segmenterSpy = vi.spyOn(Intl, 'Segmenter').mockImplementation(function MockSegmenter() {
+        return {
+          segment: () => ({
+            __ttsSegmentIterable: true,
+            *[Symbol.iterator]() {
+              yield { index: 0, segment: 'First sentence. ', isWordLike: true };
+              yield { index: 16, segment: 'Second sentence.', isWordLike: true };
+            },
+          }),
+        } as unknown as Intl.Segmenter;
+      } as unknown as typeof Intl.Segmenter);
+      const arrayFromSpy = vi.spyOn(Array, 'from').mockImplementation((items, mapFn, thisArg) => {
+        if ((items as { __ttsSegmentIterable?: boolean }).__ttsSegmentIterable) {
+          throw new Error('segment list was materialized');
+        }
+        return originalArrayFrom.call(Array, items, mapFn as never, thisArg) as never[];
+      });
+      try {
+        const doc = createHTMLDoc('<p>First sentence. Second sentence.</p>');
+        const tts = new TTS(doc, textWalker, undefined, highlight, 'sentence');
+        const ssml = tts.start();
+
+        expect(stripTags(ssml!)).toBe('First sentence. Second sentence.');
+      } finally {
+        arrayFromSpy.mockRestore();
+        segmenterSpy.mockRestore();
+      }
+    });
+
     it('should not include xml:lang on speak element when doc has no lang', () => {
       const doc = createHTMLDoc('<p>No lang content</p>');
       const tts = new TTS(doc, textWalker, undefined, highlight, 'word');

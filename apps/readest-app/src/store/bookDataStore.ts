@@ -4,6 +4,7 @@ import { Book, BookConfig, BookNote } from '@/types/book';
 import { EnvConfigType } from '@/services/environment';
 import { BookDoc } from '@/libs/document';
 import { useLibraryStore } from './libraryStore';
+import { getBookProgress } from './readerProgressStore';
 
 // library.json is expensive for large shelves (read-merge-write of the whole
 // index over Tauri IPC). Progress autosave used to schedule that write every
@@ -85,6 +86,50 @@ export interface BookData {
   isFixedLayout: boolean;
 }
 
+const isProgressTuple = (progress: BookConfig['progress']): progress is [number, number] => {
+  return (
+    Array.isArray(progress) &&
+    progress.length === 2 &&
+    Number.isFinite(progress[0]) &&
+    Number.isFinite(progress[1]) &&
+    progress[1] > 0
+  );
+};
+
+const getLiveProgressConfigPatch = (
+  bookKey: string,
+): (Pick<BookConfig, 'location'> & Partial<Pick<BookConfig, 'progress'>>) | null => {
+  const progress = getBookProgress(bookKey);
+  if (!progress?.location) return null;
+  if (progress.persistToConfig === false) return null;
+  return {
+    location: progress.location,
+    ...(isProgressTuple(progress.progress) ? { progress: progress.progress } : {}),
+  };
+};
+
+const getLiveReadingStatusPatch = (
+  book: Book,
+  progress: BookConfig['progress'],
+  now: number,
+): Partial<Book> => {
+  if (!isProgressTuple(progress)) return {};
+
+  let readingStatus = book.readingStatus;
+  if (readingStatus === 'unread') {
+    readingStatus = undefined;
+  }
+  if (Math.round((progress[0] / progress[1]) * 100) >= 100 && book.readingStatus !== 'finished') {
+    readingStatus = 'finished';
+  }
+  if (readingStatus === book.readingStatus) return {};
+
+  return {
+    readingStatus,
+    readingStatusUpdatedAt: now,
+  };
+};
+
 interface BookDataState {
   booksData: { [id: string]: BookData };
   getConfig: (key: string | null) => BookConfig | null;
@@ -157,10 +202,20 @@ export const useBookDataStore = create<BookDataState>((set, get) => ({
     // books), no MRU reorder. Reorder is deferred to library.json flush so
     // continuous reading/TTS does not freeze on large shelves.
     const now = Date.now();
+    const liveProgressPatch = getLiveProgressConfigPatch(bookKey);
+    const configToSave = {
+      ...config,
+      ...(liveProgressPatch ?? {}),
+      updatedAt: now,
+    };
+    const progressToPersist = configToSave.progress;
     const updatedBook = patchBookFields(hash, {
-      progress: config.progress,
+      progress: progressToPersist,
       updatedAt: now,
       downloadedAt: original.downloadedAt || now,
+      ...(liveProgressPatch
+        ? getLiveReadingStatusPatch(original, liveProgressPatch.progress, now)
+        : {}),
     });
     if (!updatedBook) return;
     pendingPromoteHashes.add(hash);
@@ -168,8 +223,10 @@ export const useBookDataStore = create<BookDataState>((set, get) => ({
     // Refresh updatedAt immutably via the store rather than mutating the
     // caller-provided object. This notifies Zustand subscribers and works
     // regardless of whether the caller passed the shared store config.
-    get().setConfig(bookKey, { updatedAt: now });
-    const configToSave = { ...config, updatedAt: now };
+    get().setConfig(bookKey, {
+      updatedAt: now,
+      ...(liveProgressPatch ?? {}),
+    });
     // Per-book config: always write eagerly — small, and the durability
     // guarantee if the process is killed before library.json is flushed.
     await appService.saveBookConfig(updatedBook, configToSave, settings);

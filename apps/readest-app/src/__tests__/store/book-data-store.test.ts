@@ -10,8 +10,9 @@ vi.mock('@/utils/md5', () => ({
 
 import { useBookDataStore, flushPendingLibrarySave } from '@/store/bookDataStore';
 import type { BookData } from '@/store/bookDataStore';
-import type { BookConfig, BookNote, Book } from '@/types/book';
+import type { BookConfig, BookNote, Book, BookProgress } from '@/types/book';
 import { useLibraryStore } from '@/store/libraryStore';
+import { useReaderProgressStore } from '@/store/readerProgressStore';
 import type { EnvConfigType } from '@/services/environment';
 import type { AppService } from '@/types/system';
 import type { SystemSettings } from '@/types/settings';
@@ -53,6 +54,7 @@ function makeBookNote(overrides: Partial<BookNote> = {}): BookNote {
 describe('bookDataStore', () => {
   beforeEach(() => {
     useBookDataStore.setState({ booksData: {} });
+    useReaderProgressStore.setState({ progresses: {} });
   });
 
   describe('getBookData', () => {
@@ -395,6 +397,110 @@ describe('bookDataStore', () => {
       expect(saveLibraryBooks).not.toHaveBeenCalled();
       await flushPendingLibrarySave();
       expect(saveLibraryBooks).toHaveBeenCalledOnce();
+    });
+
+    test('merges live reader progress into config and shelf progress on save', async () => {
+      const saveBookConfig = vi.fn().mockResolvedValue(undefined);
+      const saveLibraryBooks = vi.fn().mockResolvedValue(undefined);
+      const envConfig = makeEnvConfig({ saveBookConfig, saveLibraryBooks });
+
+      useLibraryStore.getState().setLibrary([makeLibraryBook({ hash: 'h1', progress: [1, 100] })]);
+
+      const data = makeBookData('h1', {
+        location: 'old-cfi',
+        progress: [1, 100],
+      });
+      useBookDataStore.setState({ booksData: { h1: data } });
+      useReaderProgressStore.setState({
+        progresses: {
+          'h1-view': {
+            location: 'live-cfi',
+            progress: [42, 100],
+          } as BookProgress,
+        },
+      });
+
+      await useBookDataStore
+        .getState()
+        .saveConfig(envConfig, 'h1-view', data.config!, FAKE_SETTINGS);
+
+      const persistedConfig = saveBookConfig.mock.calls[0]![1] as BookConfig;
+      expect(persistedConfig.location).toBe('live-cfi');
+      expect(persistedConfig.progress).toEqual([42, 100]);
+      expect(useBookDataStore.getState().getConfig('h1')).toMatchObject({
+        location: 'live-cfi',
+        progress: [42, 100],
+      });
+      expect(useLibraryStore.getState().getBookByHash('h1')?.progress).toEqual([42, 100]);
+    });
+
+    test('does not merge secondary view progress into saved config', async () => {
+      const saveBookConfig = vi.fn().mockResolvedValue(undefined);
+      const saveLibraryBooks = vi.fn().mockResolvedValue(undefined);
+      const envConfig = makeEnvConfig({ saveBookConfig, saveLibraryBooks });
+
+      useLibraryStore.getState().setLibrary([makeLibraryBook({ hash: 'h1', progress: [1, 100] })]);
+
+      const data = makeBookData('h1', {
+        location: 'primary-cfi',
+        progress: [1, 100],
+      });
+      useBookDataStore.setState({ booksData: { h1: data } });
+      useReaderProgressStore.setState({
+        progresses: {
+          'h1-secondary': {
+            location: 'secondary-cfi',
+            progress: [50, 100],
+            persistToConfig: false,
+          } as BookProgress,
+        },
+      });
+
+      await useBookDataStore
+        .getState()
+        .saveConfig(envConfig, 'h1-secondary', data.config!, FAKE_SETTINGS);
+
+      const persistedConfig = saveBookConfig.mock.calls[0]![1] as BookConfig;
+      expect(persistedConfig.location).toBe('primary-cfi');
+      expect(persistedConfig.progress).toEqual([1, 100]);
+      expect(useLibraryStore.getState().getBookByHash('h1')?.progress).toEqual([1, 100]);
+    });
+
+    test('updates reading status from live reader progress on save', async () => {
+      const saveBookConfig = vi.fn().mockResolvedValue(undefined);
+      const saveLibraryBooks = vi.fn().mockResolvedValue(undefined);
+      const envConfig = makeEnvConfig({ saveBookConfig, saveLibraryBooks });
+
+      useLibraryStore.getState().setLibrary([
+        makeLibraryBook({
+          hash: 'h1',
+          progress: [99, 100],
+          readingStatus: 'reading',
+          readingStatusUpdatedAt: 1000,
+        }),
+      ]);
+
+      const data = makeBookData('h1', {
+        location: 'almost-done',
+        progress: [99, 100],
+      });
+      useBookDataStore.setState({ booksData: { h1: data } });
+      useReaderProgressStore.setState({
+        progresses: {
+          'h1-view': {
+            location: 'done-cfi',
+            progress: [100, 100],
+          } as BookProgress,
+        },
+      });
+
+      await useBookDataStore
+        .getState()
+        .saveConfig(envConfig, 'h1-view', data.config!, FAKE_SETTINGS);
+
+      const stored = useLibraryStore.getState().getBookByHash('h1');
+      expect(stored?.readingStatus).toBe('finished');
+      expect(stored?.readingStatusUpdatedAt).toBeGreaterThan(1000);
     });
 
     test('does nothing for unknown book hash', async () => {

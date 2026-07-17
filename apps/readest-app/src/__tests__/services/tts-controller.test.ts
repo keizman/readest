@@ -10,11 +10,12 @@ import { AppService } from '@/types/system';
 
 const edgeTTSState = vi.hoisted(() => ({
   hasPrefetchCapacity: true,
+  maxConcurrent: 2,
 }));
 
 vi.mock('@/libs/edgeTTS', () => ({
   hasTTSPrefetchCapacity: () => edgeTTSState.hasPrefetchCapacity,
-  getEdgeTTSWsMaxConcurrent: () => 2,
+  getEdgeTTSWsMaxConcurrent: () => edgeTTSState.maxConcurrent,
 }));
 
 vi.mock('@/services/tts/WebSpeechClient', () => ({
@@ -176,6 +177,7 @@ describe('TTSController', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     edgeTTSState.hasPrefetchCapacity = true;
+    edgeTTSState.maxConcurrent = 2;
     mockView = createMockView();
     mockAppService = createMockAppService();
     controller = new TTSController(mockAppService, mockView, false);
@@ -1476,6 +1478,112 @@ describe('TTSController', () => {
       expect(mockView.tts!.prev).toHaveBeenCalledTimes(50);
     });
 
+    test('caps one deep-lookahead pass so huge chapters cannot block TTS startup', async () => {
+      await controller.init();
+      const paragraphs = Array.from({ length: 200 }, (_, i) => `<speak>paragraph ${i}</speak>`);
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {});
+
+      await controller.preloadNextSSML();
+
+      expect(mockView.tts!.next).toHaveBeenCalledTimes(64);
+      expect(mockView.tts!.prev).toHaveBeenCalledTimes(64);
+      expect(speakMarksSpy).toHaveBeenCalledTimes(64);
+    });
+
+    test('caps one deep-lookahead pass by raw SSML size for very large paragraphs', async () => {
+      await controller.init();
+      const largeParagraph = `<speak>${'word '.repeat(2500)}</speak>`;
+      const paragraphs = Array.from({ length: 20 }, () => largeParagraph);
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {});
+
+      await controller.preloadNextSSML();
+
+      expect(mockView.tts!.next).toHaveBeenCalledTimes(2);
+      expect(mockView.tts!.prev).toHaveBeenCalledTimes(2);
+      expect(speakMarksSpy).toHaveBeenCalledTimes(2);
+    });
+
+    test('preloads lookahead paragraphs in distance order so far-ahead work cannot delay the next paragraph', async () => {
+      edgeTTSState.maxConcurrent = 8;
+      await controller.init();
+      const paragraphs = Array.from({ length: 5 }, (_, i) => `<speak>paragraph ${i}</speak>`);
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      let releaseFirst!: () => void;
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {
+          if (speakMarksSpy.mock.calls.length === 1) {
+            await new Promise<void>((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          yield* [];
+        });
+
+      const prefetch = controller.preloadNextSSML(undefined, 5);
+      await vi.waitFor(() => expect(speakMarksSpy).toHaveBeenCalledTimes(1));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(speakMarksSpy).toHaveBeenCalledTimes(1);
+
+      releaseFirst();
+      await prefetch;
+      expect(speakMarksSpy).toHaveBeenCalledTimes(5);
+    });
+
+    test('continues parallel lookahead after the nearest paragraph has been cached', async () => {
+      edgeTTSState.maxConcurrent = 4;
+      await controller.init();
+      const paragraphs = Array.from({ length: 5 }, (_, i) => `<speak>paragraph ${i}</speak>`);
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      let releaseRemaining!: () => void;
+      const remainingReady = new Promise<void>((resolve) => {
+        releaseRemaining = resolve;
+      });
+      const speakMarksSpy = vi
+        .spyOn(controller.ttsEdgeClient, 'speakMarks')
+        .mockImplementation(async function* () {
+          if (speakMarksSpy.mock.calls.length > 1) {
+            await remainingReady;
+          }
+          yield* [];
+        });
+
+      const prefetch = controller.preloadNextSSML(undefined, 5);
+      await vi.waitFor(() => expect(speakMarksSpy.mock.calls.length).toBeGreaterThan(2));
+
+      releaseRemaining();
+      await prefetch;
+      expect(speakMarksSpy).toHaveBeenCalledTimes(5);
+    });
+
     test('skips deep lookahead when audio cache byte-count exceeds capacity', async () => {
       // hasPrefetchCapacity=false means audioCacheBytes >= TTS_AUDIO_CACHE_MAX_BYTES.
       // Deep look-ahead must stop instead of filling the FIFO cache with far-ahead
@@ -1523,6 +1631,94 @@ describe('TTSController', () => {
       await controller.preloadNextSSML(300, 3);
 
       expect(speakMarksSpy).toHaveBeenCalledOnce();
+    });
+
+    test('keeps active deep lookahead alive across normal paragraph handoff', async () => {
+      await controller.init();
+      let deepSignal: AbortSignal | undefined;
+      let releaseDeepPreload!: () => void;
+      let highPreloadSeen = false;
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>lookahead</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      vi.spyOn(controller.ttsEdgeClient, 'speakMarks').mockImplementation(
+        async function* (_marks, signal, preload, _startup, priority) {
+          if (preload && priority === 'low') {
+            deepSignal = signal;
+            await new Promise<void>((resolve) => {
+              releaseDeepPreload = resolve;
+            });
+            yield* [];
+            return;
+          }
+          if (preload && priority === 'high') {
+            highPreloadSeen = true;
+            yield* [];
+            return;
+          }
+          yield { code: 'end' } as TTSMessageEvent;
+        },
+      );
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      const prefetch = controller.preloadNextSSML(300, 1);
+      await vi.waitFor(() => expect(deepSignal).toBeDefined());
+
+      await controller.speak('<speak>now</speak>');
+
+      await vi.waitFor(() => expect(highPreloadSeen).toBe(true));
+      expect(deepSignal!.aborted).toBe(false);
+      releaseDeepPreload();
+      await prefetch;
+    });
+
+    test('defers deep lookahead until current Edge playback reaches the first boundary', async () => {
+      await controller.init();
+      const order: string[] = [];
+      let releaseBoundary!: () => void;
+      let releasePlayback!: () => void;
+      const paragraphs = ['<speak>future</speak>', undefined];
+      let index = 0;
+      mockView.tts = {
+        next: vi.fn(() => paragraphs[index++]),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+      vi.spyOn(controller.ttsEdgeClient, 'speakMarks').mockImplementation(
+        async function* (_marks, _signal, preload, _startup, priority) {
+          if (preload && priority === 'low') {
+            order.push('low-prefetch');
+            yield* [];
+            return;
+          }
+          if (preload) {
+            order.push('high-preload');
+            yield* [];
+            return;
+          }
+          order.push('playback-enter');
+          await new Promise<void>((resolve) => {
+            releaseBoundary = resolve;
+          });
+          yield { code: 'boundary', mark: '0' } as TTSMessageEvent;
+          await new Promise<void>((resolve) => {
+            releasePlayback = resolve;
+          });
+          yield { code: 'end' } as TTSMessageEvent;
+        },
+      );
+
+      await controller.speak('<speak>now</speak>');
+      await vi.waitFor(() => expect(order).toContain('playback-enter'));
+
+      expect(order).not.toContain('low-prefetch');
+
+      releaseBoundary();
+      await vi.waitFor(() => expect(order).toContain('low-prefetch'));
+      releasePlayback();
     });
 
     test('aborts stale lookahead prefetch when playback stops', async () => {

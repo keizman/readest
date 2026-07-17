@@ -11,6 +11,7 @@ import {
   withEdgeTTSAuthQuery,
 } from '@/services/environment';
 import { edgeTTSBackends } from '@/libs/edgeTTSBackends';
+import { ttsLog } from '@/services/tts/ttsDiagnostics';
 
 // Cloudflare Workers expose a global `WebSocketPair` that is not available in
 // browsers or Node.js. The Node `ws` package (used transitively via
@@ -390,6 +391,14 @@ export type WsSlotPriority = 'high' | 'low';
 const wsAbortError = (signal: AbortSignal): Error =>
   signal.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError');
 
+type CachedEdgeSpeechAudio = { blob: Blob; boundaries: TTSWordBoundary[] };
+
+type InflightEdgeSpeechAudio = {
+  promise: Promise<CachedEdgeSpeechAudio>;
+  priority: WsSlotPriority;
+  signal?: AbortSignal;
+};
+
 // 'self-hosted' connects to getEdgeTTSWsUrl(); 'bing' hits Microsoft directly.
 export type EdgeTTSWsTarget = 'self-hosted' | 'bing';
 
@@ -412,8 +421,13 @@ export const getTTSAudioCacheBytes = (): number => EdgeSpeechTTS.getAudioCacheBy
 export const hasTTSPrefetchCapacity = (): boolean =>
   EdgeSpeechTTS.getAudioCacheBytes() < TTS_AUDIO_CACHE_MAX_BYTES;
 
+export type TTSPayloadCacheState = 'ready' | 'inflight' | 'miss';
+
+export const getTTSPayloadCacheState = (payload: EdgeTTSPayload): TTSPayloadCacheState =>
+  EdgeSpeechTTS.getPayloadCacheState(payload);
+
 export const isTTSPayloadCached = (payload: EdgeTTSPayload): boolean =>
-  EdgeSpeechTTS.isPayloadCached(payload);
+  EdgeSpeechTTS.getPayloadCacheState(payload) !== 'miss';
 
 export class EdgeSpeechTTS {
   static voices = genVoiceList(EDGE_TTS_VOICES);
@@ -424,8 +438,14 @@ export class EdgeSpeechTTS {
   }
 
   static isPayloadCached(payload: EdgeTTSPayload): boolean {
+    return EdgeSpeechTTS.getPayloadCacheState(payload) !== 'miss';
+  }
+
+  static getPayloadCacheState(payload: EdgeTTSPayload): TTSPayloadCacheState {
     const cacheKey = hashTTSPayload(payload);
-    return EdgeSpeechTTS.audioCache.has(cacheKey) || EdgeSpeechTTS.inflight.has(cacheKey);
+    if (EdgeSpeechTTS.audioCache.has(cacheKey)) return 'ready';
+    if (EdgeSpeechTTS.inflight.has(cacheKey)) return 'inflight';
+    return 'miss';
   }
   private static onAudioCacheEvict = (key: string, blob: Blob) => {
     EdgeSpeechTTS.audioCacheBytes = Math.max(0, EdgeSpeechTTS.audioCacheBytes - blob.size);
@@ -453,10 +473,7 @@ export class EdgeSpeechTTS {
   // requests: the playback scheduler and the preload paths race for the same
   // sentences at every paragraph start, and without this map each racer opens
   // its own WSS connection for the same audio.
-  private static inflight = new Map<
-    string,
-    { promise: Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> }
-  >();
+  private static inflight = new Map<string, InflightEdgeSpeechAudio>();
   // Self-hosted HTTPS TTS cannot absorb concurrent synthesis; serialize network
   // fetches so preload, playback, and lookahead share one in-flight request.
   private static httpsRequestQueue: Promise<unknown> = Promise.resolve();
@@ -507,6 +524,17 @@ export class EdgeSpeechTTS {
     const insertAt = EdgeSpeechTTS.wsWaiters.findIndex((waiter) => waiter.priority === 'low');
     if (insertAt === -1) EdgeSpeechTTS.wsWaiters.push(entry);
     else EdgeSpeechTTS.wsWaiters.splice(insertAt, 0, entry);
+    // A low waiter can be queued only because the low-prefetch cap is full
+    // while the reserved high slot is still free. Once promoted, wake it right
+    // away instead of waiting for an unrelated low fetch to complete.
+    EdgeSpeechTTS.drainWsWaiters();
+  }
+
+  private static shouldBypassInflight(
+    entry: InflightEdgeSpeechAudio,
+    priority: WsSlotPriority,
+  ): boolean {
+    return priority === 'high' && entry.priority === 'low' && entry.signal?.aborted === true;
   }
 
   private static enqueueHttpsRequest<T>(fn: () => Promise<T>): Promise<T> {
@@ -548,11 +576,11 @@ export class EdgeSpeechTTS {
     signal?: AbortSignal,
     priority: WsSlotPriority = 'low',
     cacheKey?: string,
-  ): Promise<void> {
+  ): Promise<WsSlotPriority> {
     EdgeSpeechTTS.rejectIfAborted(signal);
     if (EdgeSpeechTTS.canAcquireWsSlot(priority)) {
       EdgeSpeechTTS.markWsSlotAcquired(priority);
-      return Promise.resolve();
+      return Promise.resolve(priority);
     }
     return new Promise((resolve, reject) => {
       let aborted = false;
@@ -572,8 +600,9 @@ export class EdgeSpeechTTS {
       const wake = () => {
         signal?.removeEventListener('abort', onAbort);
         if (aborted) return false;
-        EdgeSpeechTTS.markWsSlotAcquired(priority);
-        resolve();
+        const acquiredPriority = entry?.priority ?? priority;
+        EdgeSpeechTTS.markWsSlotAcquired(acquiredPriority);
+        resolve(acquiredPriority);
         return true;
       };
       entry = { wake, priority, cacheKey };
@@ -592,11 +621,7 @@ export class EdgeSpeechTTS {
     });
   }
 
-  private static releaseWsSlot(priority: WsSlotPriority): void {
-    EdgeSpeechTTS.wsInFlight = Math.max(0, EdgeSpeechTTS.wsInFlight - 1);
-    if (priority === 'low') {
-      EdgeSpeechTTS.wsLowInFlight = Math.max(0, EdgeSpeechTTS.wsLowInFlight - 1);
-    }
+  private static drainWsWaiters(): void {
     // Wake the highest-priority waiter the reserved-slot rule still admits.
     // Waiters are kept in priority order (high ahead of low), so once the front
     // waiter cannot be admitted — a 'low' waiter while the low-prefetch cap is
@@ -609,6 +634,14 @@ export class EdgeSpeechTTS {
     }
   }
 
+  private static releaseWsSlot(priority: WsSlotPriority): void {
+    EdgeSpeechTTS.wsInFlight = Math.max(0, EdgeSpeechTTS.wsInFlight - 1);
+    if (priority === 'low') {
+      EdgeSpeechTTS.wsLowInFlight = Math.max(0, EdgeSpeechTTS.wsLowInFlight - 1);
+    }
+    EdgeSpeechTTS.drainWsWaiters();
+  }
+
   private static runWithWsSlot<T>(
     fn: () => Promise<T>,
     signal?: AbortSignal,
@@ -618,13 +651,15 @@ export class EdgeSpeechTTS {
     // The consumer signal gates slot acquisition (queued waiters are dropped on
     // abort) but must not tear down a shared inflight fetch once the slot is
     // held — callers detach via awaitWithAbort on the inflight promise instead.
-    return EdgeSpeechTTS.acquireWsSlot(signal, priority, cacheKey).then(async () => {
-      try {
-        return await fn();
-      } finally {
-        EdgeSpeechTTS.releaseWsSlot(priority);
-      }
-    });
+    return EdgeSpeechTTS.acquireWsSlot(signal, priority, cacheKey).then(
+      async (acquiredPriority) => {
+        try {
+          return await fn();
+        } finally {
+          EdgeSpeechTTS.releaseWsSlot(acquiredPriority);
+        }
+      },
+    );
   }
 
   private protocol: EDGE_TTS_PROTOCOL = 'wss';
@@ -1193,9 +1228,12 @@ export class EdgeSpeechTTS {
     const pending = EdgeSpeechTTS.inflight.get(cacheKey);
     if (pending) {
       if (priority === 'high') EdgeSpeechTTS.promoteWsWaiter(cacheKey);
-      return EdgeSpeechTTS.awaitWithAbort(pending.promise, signal);
+      if (!EdgeSpeechTTS.shouldBypassInflight(pending, priority)) {
+        return EdgeSpeechTTS.awaitWithAbort(pending.promise, signal);
+      }
+      ttsLog('cache-bypass-aborted-low-inflight');
     }
-    const fetchFromNetwork = async (): Promise<{ blob: Blob; boundaries: TTSWordBoundary[] }> => {
+    const fetchFromNetwork = async (): Promise<CachedEdgeSpeechAudio> => {
       const cachedAfterQueue = EdgeSpeechTTS.audioCache.get(cacheKey);
       if (cachedAfterQueue) {
         return {
@@ -1225,7 +1263,7 @@ export class EdgeSpeechTTS {
         : this.wsTarget === 'self-hosted'
           ? EdgeSpeechTTS.runWithWsSlot(fetchFromNetwork, signal, priority, cacheKey)
           : fetchFromNetwork();
-    const entry = { promise };
+    const entry = { promise, priority, signal };
     EdgeSpeechTTS.inflight.set(cacheKey, entry);
     promise.then(
       () => {

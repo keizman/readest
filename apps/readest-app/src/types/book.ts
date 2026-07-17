@@ -425,6 +425,13 @@ export interface ViewSettings
 
 export interface BookProgress {
   location: string;
+  // Snapshot of BookConfig.progress for this relocate. Keeping it with the
+  // tiny progress store lets autosave persist exact page progress without
+  // writing bookDataStore on every page turn.
+  progress?: [number, number];
+  // False for secondary/parallel views: they can render their own progress UI,
+  // but must not overwrite the book's persisted last-read location.
+  persistToConfig?: boolean;
   sectionHref: string;
   sectionLabel: string;
   section: PageInfo;

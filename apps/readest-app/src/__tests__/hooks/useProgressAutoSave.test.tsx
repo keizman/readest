@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, renderHook } from '@testing-library/react';
 
-type Progress = { location: string } | null;
+type Progress = {
+  location: string;
+  progress?: [number, number];
+  persistToConfig?: boolean;
+} | null;
 
 const h = vi.hoisted(() => {
   // Zustand-like store mock. Supports both destructure form `store()`
@@ -20,6 +24,7 @@ const h = vi.hoisted(() => {
     config: { location: 'cfi-loc', updatedAt: 1000 } as { location: string; updatedAt: number },
     progress: { location: 'cfi-loc' } as Progress,
     previewMode: false,
+    isPrimary: true,
   };
 
   return {
@@ -45,7 +50,7 @@ vi.mock('@/store/bookDataStore', () => ({
 vi.mock('@/store/readerStore', () => ({
   useReaderStore: h.makeStore({
     getProgress: () => h.state.progress,
-    getViewState: () => ({ previewMode: h.state.previewMode }),
+    getViewState: () => ({ previewMode: h.state.previewMode, isPrimary: h.state.isPrimary }),
   }),
 }));
 
@@ -78,6 +83,7 @@ beforeEach(() => {
   h.state.config = { location: 'cfi-loc', updatedAt: 1000 };
   h.state.progress = { location: 'cfi-loc' };
   h.state.previewMode = false;
+  h.state.isPrimary = true;
 });
 
 afterEach(() => {
@@ -104,14 +110,22 @@ describe('useProgressAutoSave', () => {
     expect(h.saveConfigMock).not.toHaveBeenCalled();
 
     // Simulate the reader advancing to a new location (either user pagination
-    // or applyRemoteProgress.view.goTo). The config's location is what
-    // setProgress would have updated, and progress reference changes too.
-    h.state.config = { location: 'cfi-loc-next', updatedAt: 1000 };
-    h.state.progress = { location: 'cfi-loc-next' };
+    // or applyRemoteProgress.view.goTo). setProgress no longer writes the
+    // heavyweight bookDataStore immediately, so autosave must merge the tiny
+    // progress-store snapshot into the config it passes to saveConfig.
+    h.state.config = { location: 'cfi-loc', updatedAt: 1000 };
+    h.state.progress = { location: 'cfi-loc-next', progress: [2, 100] };
     rerender();
     await flushDebouncedSave();
 
     expect(h.saveConfigMock).toHaveBeenCalledTimes(1);
+    const saveConfigCalls = h.saveConfigMock.mock.calls as unknown as Array<
+      [unknown, unknown, { location: string; progress?: [number, number] }]
+    >;
+    expect(saveConfigCalls[0]![2]).toMatchObject({
+      location: 'cfi-loc-next',
+      progress: [2, 100],
+    });
   });
 
   test('periodically saves during continuous progress changes without waiting for idle debounce', async () => {
@@ -167,6 +181,24 @@ describe('useProgressAutoSave', () => {
     h.state.config = { location: 'cfi-different', updatedAt: 1000 };
     h.state.progress = { location: 'cfi-different' };
     renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+
+    expect(h.saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  test('skips save for secondary view progress', async () => {
+    const { rerender } = renderHook(() => useProgressAutoSave('h1-view1'));
+    await flushDebouncedSave();
+    h.saveConfigMock.mockClear();
+
+    h.state.isPrimary = false;
+    h.state.config = { location: 'cfi-loc', updatedAt: 1000 };
+    h.state.progress = {
+      location: 'secondary-cfi',
+      progress: [9, 100],
+      persistToConfig: false,
+    };
+    rerender();
     await flushDebouncedSave();
 
     expect(h.saveConfigMock).not.toHaveBeenCalled();

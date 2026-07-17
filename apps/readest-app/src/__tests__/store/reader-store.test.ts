@@ -341,26 +341,34 @@ describe('readerStore', () => {
         );
     };
 
-    test('keeps exact reader progress but skips shelf progress rewrite on same page', () => {
+    test('keeps exact reader progress but skips bookDataStore and shelf rewrites on same page', () => {
       const { updateBookProgress } = seedProgressBook([10, 100]);
 
       writeProgress('epubcfi(/2/4)', 9);
 
       expect(updateBookProgress).not.toHaveBeenCalled();
-      expect(getBookProgress('bookid-view')?.location).toBe('epubcfi(/2/4)');
-      expect(useBookDataStore.getState().booksData['bookid']?.config).toMatchObject({
+      expect(getBookProgress('bookid-view')).toMatchObject({
         location: 'epubcfi(/2/4)',
         progress: [10, 100],
       });
+      expect(useBookDataStore.getState().booksData['bookid']?.config).toEqual({
+        updatedAt: 1000,
+      });
     });
 
-    test('updates shelf progress when the visible page changes', () => {
+    test('keeps visible page changes in the tiny progress store only', () => {
       const { updateBookProgress } = seedProgressBook([10, 100]);
 
       writeProgress('epubcfi(/2/6)', 10);
 
-      expect(updateBookProgress).toHaveBeenCalledWith('bookid', [11, 100], 'reading');
-      expect(getBookProgress('bookid-view')?.location).toBe('epubcfi(/2/6)');
+      expect(updateBookProgress).not.toHaveBeenCalled();
+      expect(getBookProgress('bookid-view')).toMatchObject({
+        location: 'epubcfi(/2/6)',
+        progress: [11, 100],
+      });
+      expect(useBookDataStore.getState().booksData['bookid']?.config).toEqual({
+        updatedAt: 1000,
+      });
     });
   });
 
