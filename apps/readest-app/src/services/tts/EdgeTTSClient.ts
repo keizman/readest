@@ -294,13 +294,18 @@ export class EdgeTTSClient implements TTSClient {
 
   getVoiceIdFromLang = async (lang: string) => {
     const preferredVoiceId = TTSUtils.getPreferredVoice(this.name, lang);
-    const preferredVoice = this.#voices.find((v) => v.id === preferredVoiceId);
+    const preferredVoice = this.#voices.find(
+      (v) => v.id === preferredVoiceId && isSameLang(v.lang, lang),
+    );
     if (preferredVoice) return preferredVoice.id;
 
     const availableVoices = (await this.getVoices(lang))[0]?.voices || [];
     const defaultVoice: TTSVoice | null = availableVoices[0] || null;
     if (defaultVoice?.id === 'en-US-AnaNeural') return 'en-US-AriaNeural'; // avoid using AnaNeural as default
-    return defaultVoice?.id || this.#currentVoiceId || 'en-US-AriaNeural';
+    const currentVoice = this.#voices.find((v) => v.id === this.#currentVoiceId);
+    if (defaultVoice) return defaultVoice.id;
+    if (currentVoice && isSameLang(currentVoice.lang, lang)) return currentVoice.id;
+    return 'en-US-AriaNeural';
   };
 
   async *speak(ssml: string, signal: AbortSignal, preload = false, startup = false) {

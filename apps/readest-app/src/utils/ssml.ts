@@ -43,7 +43,7 @@ export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
     lang = primaryLang.split('-')[0]!.toLowerCase();
   }
   const textWithoutLangTags = ssml.replace(/<lang[^>]*>.*?<\/lang>/gs, '');
-  return inferLangFromScript(textWithoutLangTags, lang);
+  return inferLangFromScript(textWithoutLangTags, lang, primaryLang);
 };
 
 const normalizeForSpeakability = (text: string): string =>
@@ -135,7 +135,7 @@ export const parseSSMLMarks = (ssml: string, primaryLang?: string) => {
           offset,
           name: activeMark,
           text,
-          language: inferLangFromScript(text, currentLang) || currentLang,
+          language: inferLangFromScript(text, currentLang, defaultLang) || currentLang,
         });
       } else {
         plainText += cleanTextContent(rawText);

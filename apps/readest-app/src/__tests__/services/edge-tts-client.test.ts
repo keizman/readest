@@ -15,6 +15,7 @@ let createAudioDataBehavior = vi.fn<() => Promise<MockAudioData>>(() =>
 );
 let createAudioDataPayloads: Array<{ text: string }> = [];
 let parsedMarks: Array<{ name: string; text: string; language: string }> = [];
+let preferredVoiceId: string | null = null;
 
 // --- Mocks ---
 
@@ -63,7 +64,7 @@ vi.mock('@/services/tts/TTSUtils', async (importOriginal) => {
     await importOriginal<typeof import('@/services/tts/TTSUtils')>();
   return {
     TTSUtils: {
-      getPreferredVoice: vi.fn(() => null),
+      getPreferredVoice: vi.fn(() => preferredVoiceId),
       sortVoicesFunc: ActualTTSUtils.sortVoicesFunc,
       sortVoicesPreferLocaleFunc: ActualTTSUtils.sortVoicesPreferLocaleFunc,
     },
@@ -91,6 +92,7 @@ describe('EdgeTTSClient', () => {
     );
     createAudioDataPayloads = [];
     parsedMarks = [];
+    preferredVoiceId = null;
     client = new EdgeTTSClient();
   });
 
@@ -362,6 +364,12 @@ describe('EdgeTTSClient', () => {
     test('getVoiceIdFromLang still resolves an exact-locale default voice', async () => {
       expect(await client.getVoiceIdFromLang('en-GB')).toBe('en-GB-SoniaNeural');
       // AnaNeural sorts first for en-US but is avoided as default
+      expect(await client.getVoiceIdFromLang('en-US')).toBe('en-US-AriaNeural');
+    });
+
+    test('getVoiceIdFromLang ignores a stored voice from another language', async () => {
+      preferredVoiceId = 'fr-FR-DeniseNeural';
+
       expect(await client.getVoiceIdFromLang('en-US')).toBe('en-US-AriaNeural');
     });
 

@@ -70,6 +70,11 @@ describe('parseSSMLLang', () => {
     const ssml = ssmlNoLang('<mark name="0"/>안녕하세요');
     expect(parseSSMLLang(ssml)).toBe('ko');
   });
+
+  it('should prefer the Chinese book language for Han-only text mislabeled as Japanese', () => {
+    const ssml = ssmlWithLang('ja', '<mark name="0"/>唰,,');
+    expect(parseSSMLLang(ssml, 'zh-CN')).toBe('zh');
+  });
 });
 
 describe('parseSSMLMarks', () => {
@@ -162,6 +167,20 @@ describe('parseSSMLMarks', () => {
       const { marks } = parseSSMLMarks(ssml);
 
       expect(marks[0]!.language).toBe('ko');
+    });
+
+    it('should not keep Japanese for a Han-only Chinese fragment in a Chinese book', () => {
+      const ssml = ssmlWithLang('ja', '<mark name="0"/>唰,,');
+      const { marks } = parseSSMLMarks(ssml, 'zh-CN');
+
+      expect(marks[0]!.language).toBe('zh');
+    });
+
+    it('should not keep inline Japanese for a Han-only Chinese fragment', () => {
+      const ssml = ssmlWithLang('zh', '<lang xml:lang="ja"><mark name="0"/>唰,,</lang>');
+      const { marks } = parseSSMLMarks(ssml, 'zh-CN');
+
+      expect(marks[0]!.language).toBe('zh');
     });
   });
 

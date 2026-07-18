@@ -398,10 +398,18 @@ describe('inferLangFromScript', () => {
     expect(inferLangFromScript('日本語のひらがな', '')).toBe('ja');
   });
 
-  it('should return the provided lang when it is not empty or en', () => {
+  it('should return a non-CJK provided lang even when text contains CJK script', () => {
     expect(inferLangFromScript('你好', 'fr')).toBe('fr');
     expect(inferLangFromScript('한국어', 'de')).toBe('de');
-    expect(inferLangFromScript('こんにちは', 'zh')).toBe('zh');
+  });
+
+  it('should correct CJK language tags when the script is unambiguous', () => {
+    expect(inferLangFromScript('こんにちは', 'zh')).toBe('ja');
+    expect(inferLangFromScript('한국어', 'ja')).toBe('ko');
+  });
+
+  it('should prefer Chinese for Han-only fragments in a Chinese book', () => {
+    expect(inferLangFromScript('唰,,', 'ja', 'zh-CN')).toBe('zh');
   });
 
   it('should return the lang when text has no CJK characters', () => {

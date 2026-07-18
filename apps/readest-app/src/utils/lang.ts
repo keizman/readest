@@ -133,15 +133,31 @@ export const getLanguageName = (code: string): string => {
   return language ? language.name : lang;
 };
 
-export const inferLangFromScript = (text: string, lang: string): string => {
-  if (!lang || lang === 'en') {
-    if (/[\p{Script=Hangul}]/u.test(text)) {
-      return 'ko';
-    } else if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) {
-      return 'ja';
-    } else if (/[\p{Script=Han}]/u.test(text)) {
-      return 'zh';
-    }
+const primaryLangCode = (lang: string | null | undefined): string => {
+  if (!lang) return '';
+  const normalized = lang.toLowerCase();
+  return normalizedLangCode(code6392to6391(normalized) || normalized);
+};
+
+export const inferLangFromScript = (text: string, lang: string, preferredLang?: string): string => {
+  const primary = primaryLangCode(lang);
+  const preferredPrimary = primaryLangCode(preferredLang);
+  const canOverrideFromScript = !primary || primary === 'en' || isCJKLang(primary);
+
+  if (!canOverrideFromScript) {
+    return lang;
+  }
+
+  if (/[\p{Script=Hangul}]/u.test(text)) {
+    return 'ko';
+  }
+  if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) {
+    return 'ja';
+  }
+  if (/[\p{Script=Han}]/u.test(text)) {
+    if (primary === 'zh') return lang;
+    if (preferredPrimary === 'zh') return 'zh';
+    if (!primary || primary === 'en') return 'zh';
   }
   return lang;
 };
