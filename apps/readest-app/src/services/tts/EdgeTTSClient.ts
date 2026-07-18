@@ -1,5 +1,5 @@
 import { getUserLocale } from '@/utils/misc';
-import { isSameLang } from '@/utils/lang';
+import { inferLangFromScript, isSameLang } from '@/utils/lang';
 import { TTSClient, TTSMessageEvent } from './TTSClient';
 import {
   EdgeSpeechTTS,
@@ -216,6 +216,22 @@ export class EdgeTTSClient implements TTSClient {
       rate: Math.min(this.#rate, EDGE_TTS_MAX_RATE),
       pitch: this.#pitch,
     } as EdgeTTSPayload;
+  };
+
+  #inferBatchLang = (text: string, lang: string): string => {
+    const inferredLang = inferLangFromScript(text, lang, this.#primaryLang);
+    if (!isSameLang(lang, inferredLang) && isSameLang(inferredLang, this.#primaryLang)) {
+      return this.#primaryLang;
+    }
+    return inferredLang;
+  };
+
+  #resolveBatchVoice = async (batchText: string, batch: TTSMark[]) => {
+    const requestedLang = this.#inferBatchLang(batchText, batch[0]?.language || this.#primaryLang);
+    const voiceId = await this.getVoiceIdFromLang(requestedLang);
+    const voice = this.#voices.find((v) => v.id === voiceId);
+    const voiceLang = voice && isSameLang(voice.lang, requestedLang) ? voice.lang : requestedLang;
+    return { voiceLang, voiceId };
   };
 
   // Edge renders the MP3 at the prosody rate (≤ EDGE_TTS_MAX_RATE), so its word
@@ -461,10 +477,9 @@ export class EdgeTTSClient implements TTSClient {
       });
     }
     const preloadBatch = async (batch: TTSMark[], index: number) => {
-      const voiceLang = batch[0]!.language;
-      const voiceId = await this.getVoiceIdFromLang(voiceLang);
-      this.#currentVoiceId = voiceId;
       const text = batch.map((m) => m.text).join('');
+      const { voiceLang, voiceId } = await this.#resolveBatchVoice(text, batch);
+      this.#currentVoiceId = voiceId;
       const payload = this.getPayload(voiceLang, text, voiceId);
       const cacheState = getTTSPayloadCacheState(payload);
       const fetchStartedAt = nowMs();
@@ -572,17 +587,16 @@ export class EdgeTTSClient implements TTSClient {
     if (signal.aborted || this.#activeGeneration !== generation) {
       return { kind: 'skip', marks: batch, batchIndex };
     }
-    const voiceLang = batch[0]!.language;
-    const voiceId = await this.getVoiceIdFromLang(voiceLang);
+    const batchText = batch.map((m) => m.text).join('');
+    if (!hasSpeakableText(batchText)) {
+      return { kind: 'skip', marks: batch, batchIndex };
+    }
+    const { voiceLang, voiceId } = await this.#resolveBatchVoice(batchText, batch);
     if (signal.aborted || this.#activeGeneration !== generation) {
       return { kind: 'skip', marks: batch, batchIndex };
     }
     this.#speakingLang = voiceLang;
     this.#currentVoiceId = voiceId;
-    const batchText = batch.map((m) => m.text).join('');
-    if (!hasSpeakableText(batchText)) {
-      return { kind: 'skip', marks: batch, batchIndex };
-    }
     const payload = this.getPayload(voiceLang, batchText, voiceId);
     const cacheState = getTTSPayloadCacheState(payload);
 

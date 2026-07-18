@@ -4,6 +4,10 @@ import { code6392to6391, inferLangFromScript, isSameLang, isValidLang } from './
 const cleanTextContent = (text: string) =>
   text.replace(/\r\n/g, '  ').replace(/\r/g, ' ').replace(/\n/g, ' ').trimStart();
 
+const stripSSMLTags = (ssml: string): string => ssml.replace(/<[^>]+>/g, '');
+
+const hasLanguageBearingText = (text: string): boolean => /\p{L}/u.test(text);
+
 export const genSSML = (lang: string, text: string, voice: string, rate: number) => {
   const cleanedText = text.replace(/^<break\b[^>]*>/i, '');
   return `
@@ -25,7 +29,8 @@ export const genSSMLRaw = (text: string) => {
 
 export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
   let lang = 'en';
-  const match = ssml.match(/xml:lang\s*=\s*"([^"]+)"/);
+  const speakTag = ssml.match(/<speak\b[^>]*>/i)?.[0] ?? '';
+  const match = speakTag.match(/xml:lang\s*=\s*"([^"]+)"/);
   if (match && match[1]) {
     const parts = match[1].split('-');
     lang =
@@ -42,8 +47,12 @@ export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
   if (lang === 'en' && primaryLang && !isSameLang(lang, primaryLang)) {
     lang = primaryLang.split('-')[0]!.toLowerCase();
   }
-  const textWithoutLangTags = ssml.replace(/<lang[^>]*>.*?<\/lang>/gs, '');
-  return inferLangFromScript(textWithoutLangTags, lang, primaryLang);
+  const ssmlWithoutLangBlocks = ssml.replace(/<lang\b[^>]*>.*?<\/lang>/gis, '');
+  const textOutsideLangBlocks = stripSSMLTags(ssmlWithoutLangBlocks);
+  const textForScriptInference = hasLanguageBearingText(textOutsideLangBlocks)
+    ? ssmlWithoutLangBlocks
+    : ssml.replace(/<\/?lang\b[^>]*>/gi, '');
+  return inferLangFromScript(textForScriptInference, lang, primaryLang);
 };
 
 const normalizeForSpeakability = (text: string): string =>

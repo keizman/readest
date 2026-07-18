@@ -75,6 +75,11 @@ describe('parseSSMLLang', () => {
     const ssml = ssmlWithLang('ja', '<mark name="0"/>唰,,');
     expect(parseSSMLLang(ssml, 'zh-CN')).toBe('zh');
   });
+
+  it('should not treat the first inline lang block as the document language', () => {
+    const ssml = ssmlNoLang('<lang xml:lang="ja"><mark name="0"/>唰,,</lang>');
+    expect(parseSSMLLang(ssml, 'zh-CN')).toBe('zh');
+  });
 });
 
 describe('parseSSMLMarks', () => {
@@ -178,6 +183,20 @@ describe('parseSSMLMarks', () => {
 
     it('should not keep inline Japanese for a Han-only Chinese fragment', () => {
       const ssml = ssmlWithLang('zh', '<lang xml:lang="ja"><mark name="0"/>唰,,</lang>');
+      const { marks } = parseSSMLMarks(ssml, 'zh-CN');
+
+      expect(marks[0]!.language).toBe('zh');
+    });
+
+    it('should not keep Japanese for a first inline Han-only word without speak lang', () => {
+      const ssml = ssmlNoLang('<lang xml:lang="ja"><mark name="0"/>唰,,</lang>');
+      const { marks } = parseSSMLMarks(ssml, 'zh-CN');
+
+      expect(marks[0]!.language).toBe('zh');
+    });
+
+    it('should not keep Japanese for a first inline Han-only word with wrong speak lang', () => {
+      const ssml = ssmlWithLang('ja', '<lang xml:lang="ja"><mark name="0"/>唰,,</lang>');
       const { marks } = parseSSMLMarks(ssml, 'zh-CN');
 
       expect(marks[0]!.language).toBe('zh');

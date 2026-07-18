@@ -9,19 +9,32 @@ type MockAudioData = {
   data: ArrayBuffer;
   boundaries: Array<{ offset: number; duration: number; text: string }>;
 };
+type MockEdgePayload = {
+  lang: string;
+  text: string;
+  voice: string;
+  rate: number;
+  pitch: number;
+};
 let createAudioDataBehavior: (payloadText: string) => Promise<MockAudioData>;
+let createAudioDataPayloads: MockEdgePayload[] = [];
 let parsedMarks: Array<{ offset?: number; name: string; text: string; language: string }> = [];
 let hasPrefetchCapacity = true;
 
 vi.mock('@/libs/edgeTTS', () => {
-  const voices = [{ id: 'en-US-AriaNeural', name: 'Aria', lang: 'en-US' }];
+  const voices = [
+    { id: 'en-US-AriaNeural', name: 'Aria', lang: 'en-US' },
+    { id: 'ja-JP-KeitaNeural', name: 'Keita', lang: 'ja-JP' },
+    { id: 'zh-CN-YunxiNeural', name: 'Yunxi', lang: 'zh-CN' },
+  ];
   return {
     EdgeSpeechTTS: class MockEdgeSpeechTTS {
       static voices = voices;
       create = vi.fn().mockResolvedValue(undefined);
-      createAudioData = vi
-        .fn()
-        .mockImplementation((payload: { text: string }) => createAudioDataBehavior(payload.text));
+      createAudioData = vi.fn().mockImplementation((payload: MockEdgePayload) => {
+        createAudioDataPayloads.push(payload);
+        return createAudioDataBehavior(payload.text);
+      });
     },
     EDGE_TTS_MAX_RATE: 2.0,
     EDGE_TTS_PROTOCOL: 'wss',
@@ -102,6 +115,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
       rafCallbacks.delete(id);
     });
     createAudioDataBehavior = async () => audioOf(1);
+    createAudioDataPayloads = [];
     hasPrefetchCapacity = true;
     parsedMarks = [
       { name: '0', text: 'First sentence.', language: 'en' },
@@ -170,6 +184,26 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
     expect(fetchCount).toBe(1);
     expect(ctx().sources.length).toBe(1);
+  });
+
+  test('normalizes a Han-only playback batch before selecting the Edge voice', async () => {
+    parsedMarks = [{ name: '0', text: '唰,,', language: 'ja' }];
+    const client = await startClient();
+    client.setPrimaryLang('zh-CN');
+    await client.setVoice('ja-JP-KeitaNeural');
+
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    expect(createAudioDataPayloads[0]).toMatchObject({
+      lang: 'zh-CN',
+      text: '唰,,',
+      voice: 'zh-CN-YunxiNeural',
+    });
+
+    await ctx().advanceTo(2);
+    await done;
   });
 
   test('keeps sentences in one continuous source while mark and progress follow its clock', async () => {

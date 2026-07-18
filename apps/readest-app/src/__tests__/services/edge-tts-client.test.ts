@@ -10,10 +10,17 @@ type MockAudioData = {
   data: ArrayBuffer;
   boundaries: Array<{ offset: number; duration: number; text: string }>;
 };
+type MockEdgePayload = {
+  lang: string;
+  text: string;
+  voice: string;
+  rate: number;
+  pitch: number;
+};
 let createAudioDataBehavior = vi.fn<() => Promise<MockAudioData>>(() =>
   Promise.resolve({ data: new ArrayBuffer(8), boundaries: [] }),
 );
-let createAudioDataPayloads: Array<{ text: string }> = [];
+let createAudioDataPayloads: MockEdgePayload[] = [];
 let parsedMarks: Array<{ name: string; text: string; language: string }> = [];
 let preferredVoiceId: string | null = null;
 
@@ -25,12 +32,14 @@ vi.mock('@/libs/edgeTTS', () => {
     { id: 'en-US-AnaNeural', name: 'Ana', lang: 'en-US' },
     { id: 'en-GB-SoniaNeural', name: 'Sonia', lang: 'en-GB' },
     { id: 'fr-FR-DeniseNeural', name: 'Denise', lang: 'fr-FR' },
+    { id: 'ja-JP-KeitaNeural', name: 'Keita', lang: 'ja-JP' },
+    { id: 'zh-CN-YunxiNeural', name: 'Yunxi', lang: 'zh-CN' },
   ];
   return {
     EdgeSpeechTTS: class MockEdgeSpeechTTS {
       static voices = voices;
       create = vi.fn().mockImplementation(() => createBehavior());
-      createAudioData = vi.fn().mockImplementation((payload: { text: string }) => {
+      createAudioData = vi.fn().mockImplementation((payload: MockEdgePayload) => {
         createAudioDataPayloads.push(payload);
         return createAudioDataBehavior();
       });
@@ -133,7 +142,7 @@ describe('EdgeTTSClient', () => {
     test('populates voices from EdgeSpeechTTS.voices on init', async () => {
       await client.init();
       const voices = await client.getAllVoices();
-      expect(voices).toHaveLength(4);
+      expect(voices).toHaveLength(6);
       expect(voices.map((v) => v.id)).toContain('en-US-AriaNeural');
     });
 
@@ -273,7 +282,7 @@ describe('EdgeTTSClient', () => {
     test('returns voices from EdgeSpeechTTS after init', async () => {
       await client.init();
       const voices = await client.getAllVoices();
-      expect(voices).toHaveLength(4);
+      expect(voices).toHaveLength(6);
       expect(voices[0]!.id).toBe('en-US-AriaNeural');
     });
 
@@ -382,7 +391,7 @@ describe('EdgeTTSClient', () => {
     });
 
     test('marks group as disabled when no matching voices found', async () => {
-      const groups = await client.getVoices('zh-CN');
+      const groups = await client.getVoices('de-DE');
       expect(groups[0]!.disabled).toBe(true);
       expect(groups[0]!.voices).toHaveLength(0);
     });
@@ -444,6 +453,21 @@ describe('EdgeTTSClient', () => {
       await consumePreload(client, new AbortController().signal);
 
       expect(createAudioDataBehavior).toHaveBeenCalledTimes(5);
+    });
+
+    test('normalizes a Han-only preload batch before selecting the Edge voice', async () => {
+      await client.init();
+      client.setPrimaryLang('zh-CN');
+      await client.setVoice('ja-JP-KeitaNeural');
+      parsedMarks = [{ name: 'mark-0', text: '唰,,', language: 'ja' }];
+
+      await consumePreload(client, new AbortController().signal);
+
+      expect(createAudioDataPayloads[0]).toMatchObject({
+        lang: 'zh-CN',
+        text: '唰,,',
+        voice: 'zh-CN-YunxiNeural',
+      });
     });
 
     test('does not retry when the first preload attempt succeeds', async () => {
