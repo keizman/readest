@@ -1519,7 +1519,7 @@ describe('TTSController', () => {
       expect(speakMarksSpy).toHaveBeenCalledTimes(2);
     });
 
-    test('preloads lookahead paragraphs in distance order so far-ahead work cannot delay the next paragraph', async () => {
+    test('preloads the nearest five lookahead paragraphs in distance order before far-ahead work', async () => {
       edgeTTSState.maxConcurrent = 8;
       await controller.init();
       const paragraphs = Array.from({ length: 5 }, (_, i) => `<speak>paragraph ${i}</speak>`);
@@ -1529,40 +1529,45 @@ describe('TTSController', () => {
         prev: vi.fn(),
         doc: {},
       } as unknown as FoliateView['tts'];
-      let releaseFirst!: () => void;
+      let callIndex = 0;
+      const releases: Array<() => void> = [];
       const speakMarksSpy = vi
         .spyOn(controller.ttsEdgeClient, 'speakMarks')
         .mockImplementation(async function* () {
-          if (speakMarksSpy.mock.calls.length === 1) {
-            await new Promise<void>((resolve) => {
-              releaseFirst = resolve;
-            });
-          }
+          const currentIndex = callIndex++;
+          await new Promise<void>((resolve) => {
+            releases[currentIndex] = resolve;
+          });
           yield* [];
         });
 
       const prefetch = controller.preloadNextSSML(undefined, 5);
-      await vi.waitFor(() => expect(speakMarksSpy).toHaveBeenCalledTimes(1));
-      await Promise.resolve();
-      await Promise.resolve();
 
-      expect(speakMarksSpy).toHaveBeenCalledTimes(1);
+      for (let i = 0; i < 5; i++) {
+        await vi.waitFor(() => expect(speakMarksSpy).toHaveBeenCalledTimes(i + 1));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(speakMarksSpy).toHaveBeenCalledTimes(i + 1);
+        releases[i]!();
+      }
 
-      releaseFirst();
       await prefetch;
       expect(speakMarksSpy).toHaveBeenCalledTimes(5);
     });
 
-    test('continues parallel lookahead after the nearest paragraph has been cached', async () => {
+    test('continues parallel lookahead after the nearest five paragraphs have been cached', async () => {
       edgeTTSState.maxConcurrent = 4;
       await controller.init();
-      const paragraphs = Array.from({ length: 5 }, (_, i) => `<speak>paragraph ${i}</speak>`);
+      const paragraphs = Array.from({ length: 8 }, (_, i) => `<speak>paragraph ${i}</speak>`);
       let index = 0;
       mockView.tts = {
         next: vi.fn(() => paragraphs[index++]),
         prev: vi.fn(),
         doc: {},
       } as unknown as FoliateView['tts'];
+      let callIndex = 0;
+      let farStarted = false;
+      const releases: Array<() => void> = [];
       let releaseRemaining!: () => void;
       const remainingReady = new Promise<void>((resolve) => {
         releaseRemaining = resolve;
@@ -1570,18 +1575,33 @@ describe('TTSController', () => {
       const speakMarksSpy = vi
         .spyOn(controller.ttsEdgeClient, 'speakMarks')
         .mockImplementation(async function* () {
-          if (speakMarksSpy.mock.calls.length > 1) {
+          const currentIndex = callIndex++;
+          if (currentIndex < 5) {
+            await new Promise<void>((resolve) => {
+              releases[currentIndex] = resolve;
+            });
+          } else {
+            farStarted = true;
             await remainingReady;
           }
           yield* [];
         });
 
-      const prefetch = controller.preloadNextSSML(undefined, 5);
-      await vi.waitFor(() => expect(speakMarksSpy.mock.calls.length).toBeGreaterThan(2));
+      const prefetch = controller.preloadNextSSML(undefined, 8);
+      for (let i = 0; i < 5; i++) {
+        await vi.waitFor(() => expect(speakMarksSpy).toHaveBeenCalledTimes(i + 1));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(speakMarksSpy).toHaveBeenCalledTimes(i + 1);
+        expect(farStarted).toBe(false);
+        releases[i]!();
+      }
+      await vi.waitFor(() => expect(speakMarksSpy.mock.calls.length).toBeGreaterThan(5));
+      expect(farStarted).toBe(true);
 
       releaseRemaining();
       await prefetch;
-      expect(speakMarksSpy).toHaveBeenCalledTimes(5);
+      expect(speakMarksSpy).toHaveBeenCalledTimes(8);
     });
 
     test('skips deep lookahead when audio cache byte-count exceeds capacity', async () => {

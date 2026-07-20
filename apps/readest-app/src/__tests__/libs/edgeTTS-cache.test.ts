@@ -84,6 +84,10 @@ const waitForSocketReady = async (index: number) => {
   return h.sockets[index]!;
 };
 
+const expectAbortError = (error: unknown) => {
+  expect((error as { name?: string }).name).toBe('AbortError');
+};
+
 describe('EdgeSpeechTTS audio cache inflight sharing', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -94,7 +98,7 @@ describe('EdgeSpeechTTS audio cache inflight sharing', () => {
     vi.restoreAllMocks();
   });
 
-  test('bypasses an aborted low-priority inflight fill for high-priority playback', async () => {
+  test('shares an already-started low-priority inflight fill with high-priority playback', async () => {
     const { EdgeSpeechTTS } = await import('@/libs/edgeTTS');
     const tts = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'self-hosted' });
     const prefetchController = new AbortController();
@@ -104,18 +108,71 @@ describe('EdgeSpeechTTS audio cache inflight sharing', () => {
 
     const socket = await waitForSocketReady(0);
     prefetchController.abort();
-    await prefetchResult;
+    expectAbortError(await prefetchResult);
 
     const playback = tts.createAudioData(payload, new AbortController().signal, 'high');
-    const playbackSocket = await waitForSocketReady(1);
-    expect(h.sockets).toHaveLength(2);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.sockets).toHaveLength(1);
 
-    finishSocketWithAudio(playbackSocket);
+    finishSocketWithAudio(socket);
     await expect(playback).resolves.toMatchObject({
       data: expect.any(ArrayBuffer),
       boundaries: [],
     });
-    finishSocketWithAudio(socket);
+  });
+
+  test('starts high-priority playback when a matching low prefetch was aborted before its slot', async () => {
+    const { EdgeSpeechTTS, TTS_WS_MAX_CONCURRENT } = await import('@/libs/edgeTTS');
+    const tts = new EdgeSpeechTTS({ protocol: 'wss', wsTarget: 'self-hosted' });
+    const mk = (text: string) => ({
+      lang: 'zh-CN',
+      text,
+      voice: 'zh-CN-YunxiNeural',
+      rate: 1,
+      pitch: 1,
+    });
+
+    const lowLimit = Math.max(1, TTS_WS_MAX_CONCURRENT - 1);
+    const activeLows: Array<Promise<unknown>> = [];
+    for (let i = 0; i < lowLimit; i++) {
+      activeLows.push(
+        tts
+          .createAudioData(mk(`active-low-before-abort-${i}`), new AbortController().signal, 'low')
+          .catch((error: unknown) => error),
+      );
+      await waitForSocketReady(i);
+    }
+
+    const queuedController = new AbortController();
+    const sharedPayload = mk('queued low aborted before playback');
+    const queuedLow = tts
+      .createAudioData(sharedPayload, queuedController.signal, 'low')
+      .catch((error: unknown) => error);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.sockets).toHaveLength(lowLimit);
+
+    queuedController.abort();
+    expectAbortError(await queuedLow);
+
+    const high = tts.createAudioData(sharedPayload, new AbortController().signal, 'high');
+    const highSocket = await waitForSocketReady(lowLimit);
+    expect(h.sockets).toHaveLength(lowLimit + 1);
+    expect(String(highSocket.send.mock.calls[1]?.[0] ?? '')).toContain(
+      'queued low aborted before playback',
+    );
+
+    finishSocketWithAudio(highSocket);
+    await expect(high).resolves.toMatchObject({
+      data: expect.any(ArrayBuffer),
+      boundaries: [],
+    });
+
+    for (let i = 0; i < lowLimit; i++) {
+      finishSocketWithAudio(h.sockets[i]!);
+      await activeLows[i];
+    }
   });
 
   test('reserves a slot for high-priority playback so low prefetch cannot fill the pool', async () => {

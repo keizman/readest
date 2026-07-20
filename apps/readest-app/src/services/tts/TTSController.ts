@@ -46,13 +46,13 @@ const PREFETCH_TARGET_SECONDS = 90 * 60;
 // foliate's tts.next()/prev(), which can ANR Android before any network fetch
 // starts. Playback asks for look-ahead again on later boundaries, so a modest
 // per-pass window keeps the cache warm without monopolizing the main thread.
+const PREFETCH_NEAR_PARAGRAPHS = 5;
 const PREFETCH_MAX_PARAGRAPHS = 64;
 const PREFETCH_MAX_RAW_SSML_CHARS = 24_000;
-// Deep paragraph lookahead must stay distance-ordered: the next paragraph's
-// audio is more valuable than many far-ahead misses. Parallel paragraph workers
-// let dist=1..N contend with dist=0 on the backend, so playback could still
-// reach a cacheState=inflight next paragraph and sit silent until that low
-// prefetch completed.
+// Deep paragraph lookahead must stay distance-ordered near the playhead: the
+// next few paragraphs are more valuable than many far-ahead misses. Parallel
+// paragraph workers must not let distant content contend with this near window
+// on the backend.
 const prefetchParallelism = (): number => Math.max(1, getEdgeTTSWsMaxConcurrent() - 1);
 
 // Native TTS (Android System TTS / iOS) can report a terminal 'error' for an
@@ -766,13 +766,17 @@ export class TTSController extends EventTarget {
       await this.#preloadMarks(marks, signal, false, 'low', true);
     };
 
-    // Warm the immediate next paragraph first. Once dist=0 is safely in cache,
-    // fan out the remaining look-ahead so the cache is not reduced to one
-    // request at a time during normal playback.
-    await preloadOne(rawSsmls[0], 0);
-    if (signal.aborted || !hasTTSPrefetchCapacity()) return;
+    // Keep the near-playhead window strict: the next few paragraphs must be
+    // cached in distance order before far-ahead workers are allowed to run.
+    // Otherwise a failed/slow next paragraph can stall playback while much
+    // later content is already occupying cache and WS slots.
+    const nearCount = Math.min(PREFETCH_NEAR_PARAGRAPHS, rawSsmls.length);
+    for (let index = 0; index < nearCount; index++) {
+      await preloadOne(rawSsmls[index], index);
+      if (signal.aborted || !hasTTSPrefetchCapacity()) return;
+    }
 
-    let nextIndex = 1;
+    let nextIndex = nearCount;
     const worker = async () => {
       for (;;) {
         if (signal.aborted || !hasTTSPrefetchCapacity()) return;
@@ -783,7 +787,7 @@ export class TTSController extends EventTarget {
     };
     await Promise.all(
       Array.from(
-        { length: Math.min(prefetchParallelism(), Math.max(0, rawSsmls.length - 1)) },
+        { length: Math.min(prefetchParallelism(), Math.max(0, rawSsmls.length - nearCount)) },
         () => worker(),
       ),
     );

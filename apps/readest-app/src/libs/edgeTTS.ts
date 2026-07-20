@@ -513,6 +513,13 @@ export class EdgeSpeechTTS {
     });
   }
 
+  private static isAbortError(error: unknown): boolean {
+    return (
+      (error instanceof Error || error instanceof DOMException) &&
+      (error.name === 'AbortError' || error.message === 'Aborted')
+    );
+  }
+
   private static promoteWsWaiter(cacheKey: string): void {
     const index = EdgeSpeechTTS.wsWaiters.findIndex(
       (waiter) => waiter.cacheKey === cacheKey && waiter.priority === 'low',
@@ -528,13 +535,6 @@ export class EdgeSpeechTTS {
     // while the reserved high slot is still free. Once promoted, wake it right
     // away instead of waiting for an unrelated low fetch to complete.
     EdgeSpeechTTS.drainWsWaiters();
-  }
-
-  private static shouldBypassInflight(
-    entry: InflightEdgeSpeechAudio,
-    priority: WsSlotPriority,
-  ): boolean {
-    return priority === 'high' && entry.priority === 'low' && entry.signal?.aborted === true;
   }
 
   private static enqueueHttpsRequest<T>(fn: () => Promise<T>): Promise<T> {
@@ -1228,10 +1228,24 @@ export class EdgeSpeechTTS {
     const pending = EdgeSpeechTTS.inflight.get(cacheKey);
     if (pending) {
       if (priority === 'high') EdgeSpeechTTS.promoteWsWaiter(cacheKey);
-      if (!EdgeSpeechTTS.shouldBypassInflight(pending, priority)) {
+      try {
         return EdgeSpeechTTS.awaitWithAbort(pending.promise, signal);
+      } catch (error) {
+        if (
+          priority === 'high' &&
+          pending.priority === 'low' &&
+          pending.signal?.aborted === true &&
+          signal?.aborted !== true &&
+          EdgeSpeechTTS.isAbortError(error)
+        ) {
+          if (EdgeSpeechTTS.inflight.get(cacheKey) === pending) {
+            EdgeSpeechTTS.inflight.delete(cacheKey);
+          }
+          ttsLog('cache-retry-aborted-low-inflight');
+        } else {
+          throw error;
+        }
       }
-      ttsLog('cache-bypass-aborted-low-inflight');
     }
     const fetchFromNetwork = async (): Promise<CachedEdgeSpeechAudio> => {
       const cachedAfterQueue = EdgeSpeechTTS.audioCache.get(cacheKey);
