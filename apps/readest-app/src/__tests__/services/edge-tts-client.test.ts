@@ -470,6 +470,24 @@ describe('EdgeTTSClient', () => {
       });
     });
 
+    test('uses neighboring Chinese marks to normalize the first Han-only preload word', async () => {
+      await client.init();
+      await client.setVoice('ja-JP-KeitaNeural');
+      parsedMarks = [
+        { name: 'mark-0', text: '唰，', language: 'ja' },
+        { name: 'mark-1', text: '若是能让何婉莹加入队伍。', language: 'zh' },
+      ];
+
+      await consumePreload(client, new AbortController().signal);
+
+      expect(createAudioDataBehavior).toHaveBeenCalledTimes(1);
+      expect(createAudioDataPayloads[0]).toMatchObject({
+        lang: 'zh-CN',
+        text: '唰，若是能让何婉莹加入队伍。',
+        voice: 'zh-CN-YunxiNeural',
+      });
+    });
+
     test('does not retry when the first preload attempt succeeds', async () => {
       await client.init();
       parsedMarks = [{ name: 'mark-0', text: 'hello', language: 'en' }];

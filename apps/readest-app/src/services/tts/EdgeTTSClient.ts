@@ -1,5 +1,5 @@
 import { getUserLocale } from '@/utils/misc';
-import { inferLangFromScript, isSameLang } from '@/utils/lang';
+import { inferCJKLangFromScript, inferLangFromScript, isSameLang } from '@/utils/lang';
 import { TTSClient, TTSMessageEvent } from './TTSClient';
 import {
   EdgeSpeechTTS,
@@ -234,6 +234,20 @@ export class EdgeTTSClient implements TTSClient {
     return { voiceLang, voiceId };
   };
 
+  #normalizeMarksForBatching = (marks: TTSMark[]): TTSMark[] => {
+    const contextLang = inferCJKLangFromScript(marks.map((m) => m.text).join(''));
+    if (!contextLang) return marks;
+
+    let changed = false;
+    const normalizedMarks = marks.map((mark) => {
+      const language = inferLangFromScript(mark.text, mark.language, contextLang) || mark.language;
+      if (isSameLang(language, mark.language)) return mark;
+      changed = true;
+      return { ...mark, language };
+    });
+    return changed ? normalizedMarks : marks;
+  };
+
   // Edge renders the MP3 at the prosody rate (≤ EDGE_TTS_MAX_RATE), so its word
   // boundaries live in that sped-up timeline. Scale them back to rate-1.0 media
   // time — the reference frame the player's mediaScale and the section timeline
@@ -339,12 +353,13 @@ export class EdgeTTSClient implements TTSClient {
     preloadPriority: WsSlotPriority = 'low',
     preloadAwaitAll = false,
   ) {
+    const marks = this.#normalizeMarksForBatching(speakableMarks);
     if (preload) {
-      yield* this.#preload(speakableMarks, signal, startup, preloadPriority, preloadAwaitAll);
+      yield* this.#preload(marks, signal, startup, preloadPriority, preloadAwaitAll);
       return;
     }
 
-    if (speakableMarks.length === 0) {
+    if (marks.length === 0) {
       yield { code: 'end', message: 'Nothing to speak' } as TTSMessageEvent;
       return;
     }
@@ -374,7 +389,7 @@ export class EdgeTTSClient implements TTSClient {
     this.#isPlaying = true;
     this.#startPlaybackTracking(generation);
 
-    this.#runScheduler(speakableMarks, signal, generation, queue, chunkMeta, startup);
+    this.#runScheduler(marks, signal, generation, queue, chunkMeta, startup);
 
     let abortHandler: (() => void) | null = null;
     try {

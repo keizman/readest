@@ -11,6 +11,7 @@ import {
   code6392to6391,
   code6393to6391,
   getLanguageName,
+  inferCJKLangFromScript,
   inferLangFromScript,
   getLanguageInfo,
 } from '@/utils/lang';
@@ -364,6 +365,13 @@ describe('getLanguageName', () => {
 });
 
 describe('inferLangFromScript', () => {
+  it('should infer CJK language from script only', () => {
+    expect(inferCJKLangFromScript('你好世界')).toBe('zh');
+    expect(inferCJKLangFromScript('こんにちは')).toBe('ja');
+    expect(inferCJKLangFromScript('안녕하세요')).toBe('ko');
+    expect(inferCJKLangFromScript('Hello')).toBe('');
+  });
+
   it('should detect Korean from Hangul characters when lang is empty', () => {
     expect(inferLangFromScript('안녕하세요', '')).toBe('ko');
   });

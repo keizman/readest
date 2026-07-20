@@ -80,6 +80,11 @@ describe('parseSSMLLang', () => {
     const ssml = ssmlNoLang('<lang xml:lang="ja"><mark name="0"/>唰,,</lang>');
     expect(parseSSMLLang(ssml, 'zh-CN')).toBe('zh');
   });
+
+  it('should normalize Han-only Chinese text even when the speak tag is Japanese', () => {
+    const ssml = ssmlWithLang('ja', '<mark name="0"/>唰，若是能让何婉莹加入队伍。');
+    expect(parseSSMLLang(ssml)).toBe('zh');
+  });
 });
 
 describe('parseSSMLMarks', () => {
@@ -200,6 +205,16 @@ describe('parseSSMLMarks', () => {
       const { marks } = parseSSMLMarks(ssml, 'zh-CN');
 
       expect(marks[0]!.language).toBe('zh');
+    });
+
+    it('should normalize a Han-only Chinese sentence even when the speak tag is Japanese', () => {
+      const ssml = ssmlWithLang(
+        'ja',
+        '<mark name="0"/>唰，<mark name="1"/>若是能让何婉莹加入队伍。',
+      );
+      const { marks } = parseSSMLMarks(ssml);
+
+      expect(marks.map((mark) => mark.language)).toEqual(['zh', 'zh']);
     });
   });
 

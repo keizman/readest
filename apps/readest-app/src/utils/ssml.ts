@@ -1,5 +1,11 @@
 import { TTSMark } from '@/services/tts/types';
-import { code6392to6391, inferLangFromScript, isSameLang, isValidLang } from './lang';
+import {
+  code6392to6391,
+  inferCJKLangFromScript,
+  inferLangFromScript,
+  isSameLang,
+  isValidLang,
+} from './lang';
 
 const cleanTextContent = (text: string) =>
   text.replace(/\r\n/g, '  ').replace(/\r/g, ' ').replace(/\n/g, ' ').trimStart();
@@ -7,6 +13,20 @@ const cleanTextContent = (text: string) =>
 const stripSSMLTags = (ssml: string): string => ssml.replace(/<[^>]+>/g, '');
 
 const hasLanguageBearingText = (text: string): boolean => /\p{L}/u.test(text);
+
+const normalizeCJKMarkLanguages = (marks: TTSMark[], contextText: string): TTSMark[] => {
+  const contextLang = inferCJKLangFromScript(contextText);
+  if (!contextLang) return marks;
+
+  let changed = false;
+  const normalizedMarks = marks.map((mark) => {
+    const language = inferLangFromScript(mark.text, mark.language, contextLang) || mark.language;
+    if (isSameLang(language, mark.language)) return mark;
+    changed = true;
+    return { ...mark, language };
+  });
+  return changed ? normalizedMarks : marks;
+};
 
 export const genSSML = (lang: string, text: string, voice: string, rate: number) => {
   const cleanedText = text.replace(/^<break\b[^>]*>/i, '');
@@ -52,7 +72,12 @@ export const parseSSMLLang = (ssml: string, primaryLang?: string): string => {
   const textForScriptInference = hasLanguageBearingText(textOutsideLangBlocks)
     ? ssmlWithoutLangBlocks
     : ssml.replace(/<\/?lang\b[^>]*>/gi, '');
-  return inferLangFromScript(textForScriptInference, lang, primaryLang);
+  const inferredLang = inferLangFromScript(textForScriptInference, lang, primaryLang);
+  const contextLang = inferCJKLangFromScript(stripSSMLTags(textForScriptInference));
+  if (contextLang === 'zh' && isSameLang(inferredLang, 'ja') && !isSameLang(primaryLang, 'ja')) {
+    return 'zh';
+  }
+  return inferredLang;
 };
 
 const normalizeForSpeakability = (text: string): string =>
@@ -173,7 +198,7 @@ export const parseSSMLMarks = (ssml: string, primaryLang?: string) => {
     }
   }
 
-  return { plainText, marks };
+  return { plainText, marks: normalizeCJKMarkLanguages(marks, plainText) };
 };
 
 export const findSSMLMark = (charIndex: number, marks: TTSMark[]) => {

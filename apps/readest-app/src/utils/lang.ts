@@ -97,6 +97,19 @@ export const isSameLang = (lang1?: string | null, lang2?: string | null): boolea
   return normalizedLang1 === normalizedLang2;
 };
 
+export const inferCJKLangFromScript = (text: string): 'zh' | 'ja' | 'ko' | '' => {
+  if (/[\p{Script=Hangul}]/u.test(text)) {
+    return 'ko';
+  }
+  if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) {
+    return 'ja';
+  }
+  if (/[\p{Script=Han}]/u.test(text)) {
+    return 'zh';
+  }
+  return '';
+};
+
 export const isValidLang = (lang?: string) => {
   if (!lang) return false;
   if (typeof lang !== 'string') return false;
@@ -148,13 +161,11 @@ export const inferLangFromScript = (text: string, lang: string, preferredLang?: 
     return lang;
   }
 
-  if (/[\p{Script=Hangul}]/u.test(text)) {
-    return 'ko';
+  const scriptLang = inferCJKLangFromScript(text);
+  if (scriptLang === 'ko' || scriptLang === 'ja') {
+    return scriptLang;
   }
-  if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) {
-    return 'ja';
-  }
-  if (/[\p{Script=Han}]/u.test(text)) {
+  if (scriptLang === 'zh') {
     if (primary === 'zh') return lang;
     if (preferredPrimary === 'zh') return 'zh';
     if (!primary || primary === 'en') return 'zh';

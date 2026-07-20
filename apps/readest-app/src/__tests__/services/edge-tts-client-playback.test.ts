@@ -206,6 +206,29 @@ describe('EdgeTTSClient Web Audio playback', () => {
     await done;
   });
 
+  test('uses neighboring Chinese marks to normalize the first Han-only playback word', async () => {
+    parsedMarks = [
+      { name: '0', text: '唰，', language: 'ja' },
+      { name: '1', text: '若是能让何婉莹加入队伍。', language: 'zh' },
+    ];
+    const client = await startClient();
+    await client.setVoice('ja-JP-KeitaNeural');
+
+    const { done } = collectSpeak(client, new AbortController().signal);
+    await flush();
+    await flush();
+
+    expect(createAudioDataPayloads).toHaveLength(1);
+    expect(createAudioDataPayloads[0]).toMatchObject({
+      lang: 'zh-CN',
+      text: '唰，若是能让何婉莹加入队伍。',
+      voice: 'zh-CN-YunxiNeural',
+    });
+
+    await ctx().advanceTo(2);
+    await done;
+  });
+
   test('keeps sentences in one continuous source while mark and progress follow its clock', async () => {
     const firstText = 'First sentence.';
     const secondText = 'Second sentence.';
