@@ -1190,6 +1190,47 @@ describe('TTSController', () => {
       await controller.backward();
       expect(controller.state).toBe('backward-paused');
     });
+
+    test('auto-forward does not let the completed speak abort the next speak signal', async () => {
+      await controller.init();
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>second</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+
+      const playbackSignals: AbortSignal[] = [];
+      let releaseSecond!: () => void;
+      vi.spyOn(controller.ttsEdgeClient, 'speakMarks').mockImplementation(
+        async function* (_marks, signal, preload) {
+          if (preload) {
+            yield { code: 'end' } as TTSMessageEvent;
+            return;
+          }
+          playbackSignals.push(signal);
+          if (playbackSignals.length === 1) {
+            yield { code: 'end' } as TTSMessageEvent;
+            return;
+          }
+          yield { code: 'boundary', mark: '0' } as TTSMessageEvent;
+          await new Promise<void>((resolve) => {
+            releaseSecond = resolve;
+          });
+          yield { code: 'end' } as TTSMessageEvent;
+        },
+      );
+
+      await controller.speak('<speak>first</speak>');
+      await vi.waitFor(() => expect(playbackSignals).toHaveLength(2));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(playbackSignals[1]!.aborted).toBe(false);
+
+      releaseSecond();
+      await controller.stop();
+    });
   });
 
   describe('stop', () => {

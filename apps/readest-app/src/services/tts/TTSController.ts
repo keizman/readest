@@ -931,10 +931,11 @@ export class TTSController extends EventTarget {
     const startupGeneration = oneTime ? 0 : this.#beginSpeakStartup();
     await this.stop(true);
     this.#terminated = false;
-    this.#currentSpeakAbortController = new AbortController();
-    const { signal } = this.#currentSpeakAbortController;
+    const speakAbortController = new AbortController();
+    this.#currentSpeakAbortController = speakAbortController;
+    const { signal } = speakAbortController;
 
-    this.#currentSpeakPromise = new Promise(async (resolve, reject) => {
+    const speakPromise = new Promise<void>(async (resolve, reject) => {
       try {
         const speakStartedAt = nowMs();
         ttsLog('speak-start');
@@ -1110,14 +1111,15 @@ export class TTSController extends EventTarget {
         if (!oneTime) {
           this.#finishSpeakStartup(startupGeneration, false);
         }
-        if (this.#currentSpeakAbortController) {
+        if (this.#currentSpeakAbortController === speakAbortController) {
           this.#currentSpeakAbortController.abort();
           this.#currentSpeakAbortController = null;
         }
       }
     });
+    this.#currentSpeakPromise = speakPromise;
 
-    await this.#currentSpeakPromise.catch((e) => this.error(e));
+    await speakPromise.catch((e) => this.error(e));
   }
 
   async speak(ssml: string | Promise<string>, oneTime = false, oneTimeCallback?: () => void) {
@@ -1173,19 +1175,26 @@ export class TTSController extends EventTarget {
 
   async stop(keepPrefetch = false) {
     if (!keepPrefetch) this.#cancelPrefetch();
-    if (this.#currentSpeakAbortController) {
-      this.#currentSpeakAbortController.abort();
+    const speakAbortController = this.#currentSpeakAbortController;
+    const speakPromise = this.#currentSpeakPromise;
+    if (speakAbortController) {
+      speakAbortController.abort();
     }
     await this.ttsClient.stop().catch((e) => this.error(e));
 
-    if (this.#currentSpeakPromise) {
+    if (speakPromise) {
       const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Stop operation timed out')), 3000),
       );
-      await Promise.race([this.#currentSpeakPromise.catch((e) => this.error(e)), timeout]).catch(
-        (e) => this.error(e),
+      await Promise.race([speakPromise.catch((e) => this.error(e)), timeout]).catch((e) =>
+        this.error(e),
       );
-      this.#currentSpeakPromise = null;
+      if (this.#currentSpeakPromise === speakPromise) {
+        this.#currentSpeakPromise = null;
+      }
+    }
+    if (this.#currentSpeakAbortController === speakAbortController) {
+      this.#currentSpeakAbortController = null;
     }
     this.state = 'stopped';
     if (!keepPrefetch) {

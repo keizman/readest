@@ -485,7 +485,8 @@ describe('EdgeTTSClient Web Audio playback', () => {
       }
     })();
     await vi.waitFor(() => expect(fetchCount).toBeGreaterThan(2));
-    expect(fetchCount).toBe(5);
+    expect(fetchCount).toBeGreaterThanOrEqual(8);
+    expect(fetchCount).toBeLessThan(12);
     void done;
   });
 
@@ -528,7 +529,8 @@ describe('EdgeTTSClient Web Audio playback', () => {
       // it stayed capped at the same bounded visible-tier depth as any other
       // platform.
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(fetchCount).toBe(5);
+      expect(fetchCount).toBeGreaterThanOrEqual(8);
+      expect(fetchCount).toBeLessThan(12);
       void done;
     } finally {
       Object.defineProperty(navigator, 'userAgent', { value: originalUA, configurable: true });
@@ -567,7 +569,7 @@ describe('EdgeTTSClient Web Audio playback', () => {
 
       // Starts visible: the bounded visible lookahead is queued, and batch 0
       // never resolves, so the scheduler loop is parked on it.
-      await vi.waitFor(() => expect(fetchCount).toBe(5));
+      await vi.waitFor(() => expect(fetchCount).toBe(8));
 
       Object.defineProperty(document, 'visibilityState', {
         value: 'hidden',

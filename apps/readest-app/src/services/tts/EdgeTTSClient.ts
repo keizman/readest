@@ -52,11 +52,12 @@ const BATCH_EDGE_KEEP_SEC = 0.06;
 const EDGE_KEEP_SEC = 0.008;
 const TRAILING_KEEP_SEC = 0.004;
 const TICKS_PER_SECOND = 10_000_000;
-// Visible playback keeps the next five batches warm without letting far-ahead
-// high-priority work mask a slow/missing imminent line. EdgeSpeechTTS still
-// enforces TTS_WS_MAX_CONCURRENT network concurrency; this only keeps a bounded
-// wait queue warm.
-const PIPELINE_LOOKAHEAD_VISIBLE = 5;
+// Visible playback should keep materially more than the two active WS slots
+// queued, especially at 2x+ speed, but not jump to the aggressive hidden-tier
+// depth that previously overwhelmed the self-hosted relay while the app was
+// foregrounded. EdgeSpeechTTS still enforces TTS_WS_MAX_CONCURRENT network
+// concurrency; this only keeps a bounded wait queue warm.
+const PIPELINE_LOOKAHEAD_VISIBLE = 8;
 // While the app is backgrounded, WS fetches/decodes on the main thread can be
 // throttled far more than the bounded visible lookahead can absorb — that gap
 // between "audio already scheduled" and "next batch prepared" is exactly what
