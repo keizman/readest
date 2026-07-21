@@ -139,6 +139,53 @@ describe('proofreadTransformer', () => {
       expect(result).not.toContain('Hello');
     });
 
+    test('should apply legacy onlyForTTS rules to rendered content', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'legacy-tts-only',
+          scope: 'book',
+          pattern: 'noise',
+          replacement: '.',
+          enabled: true,
+          isRegex: false,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: true,
+          onlyForTTS: true,
+        },
+      ];
+      const ctx = createMockContext(rules, '<p>noise</p>');
+      const result = await proofreadTransformer.transform(ctx);
+
+      expect(result).toContain('<p>.</p>');
+      expect(result).not.toContain('noise');
+    });
+
+    test('should apply regular book rules when transforming TTS XML', async () => {
+      const rules: ProofreadRule[] = [
+        {
+          id: 'regular-book-rule',
+          scope: 'book',
+          pattern: 'noise',
+          replacement: '.',
+          enabled: true,
+          isRegex: false,
+          caseSensitive: true,
+          order: 1,
+          wholeWord: true,
+          onlyForTTS: false,
+        },
+      ];
+      const ctx = createMockContext(rules, '<speak><p>noise</p></speak>');
+      const result = await proofreadTransformer.transform(ctx, {
+        docType: 'text/xml',
+        onlyForTTS: true,
+      });
+
+      expect(result).toContain('<p>.</p>');
+      expect(result).not.toContain('noise');
+    });
+
     test('should apply multiple simple replacements', async () => {
       const rules: ProofreadRule[] = [
         {

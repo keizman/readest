@@ -796,6 +796,65 @@ describe('ProofreadRulesManager', () => {
     expect(within(ciRuleElement!).getAllByText(/No/)).toBeTruthy();
   });
 
+  it('does not display Only for TTS metadata for legacy rules', async () => {
+    const legacyRule: ProofreadRule = {
+      id: 'tts1',
+      scope: 'book',
+      pattern: 'legacy-tts-only',
+      replacement: 'normal-rule',
+      enabled: true,
+      isRegex: false,
+      caseSensitive: true,
+      order: 1,
+      wholeWord: true,
+      onlyForTTS: true,
+    };
+
+    (useSettingsStore.setState as unknown as (state: unknown) => void)({
+      settings: {
+        ...DEFAULT_SYSTEM_SETTINGS,
+        globalViewSettings: { proofreadRules: [] },
+      },
+    });
+
+    (useReaderStore.setState as unknown as (state: unknown) => void)({
+      viewStates: {
+        book1: {
+          viewSettings: {
+            proofreadRules: [legacyRule],
+          },
+        },
+      },
+    });
+
+    (useBookDataStore.setState as unknown as (state: unknown) => void)({
+      booksData: {
+        book1: {
+          id: 'book1',
+          book: null,
+          file: null,
+          config: {
+            viewSettings: {
+              proofreadRules: [legacyRule],
+            },
+          },
+          bookDoc: null,
+          isFixedLayout: false,
+        },
+      },
+    });
+
+    useSidebarStore.setState({ sideBarBookKey: 'book1' });
+
+    renderWithProviders(<ProofreadRulesManager />);
+    await Promise.resolve();
+    setProofreadRulesVisibility(true);
+
+    await screen.findByRole('dialog');
+    expect(screen.getByText('legacy-tts-only')).toBeTruthy();
+    expect(screen.queryByText('Only for TTS:')).toBeNull();
+  });
+
   it('opens when BookMenu item is clicked (integration)', async () => {
     // Arrange stores
     (useSettingsStore.setState as unknown as (state: unknown) => void)({

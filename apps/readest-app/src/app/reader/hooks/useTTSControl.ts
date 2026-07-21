@@ -622,17 +622,24 @@ export const useTTSControl = ({ bookKey, onRequestHidePanel }: UseTTSControlProp
     async (ssml: string) => {
       const rules = getMergedRules(bookKey);
       const viewSettings = getViewSettings(bookKey)!;
-      const ttsOnlyRules = rules.filter(
+      const ttsRules = rules.filter(
         (rule) =>
-          rule.enabled && rule.onlyForTTS && (rule.scope === 'book' || rule.scope === 'library'),
+          rule.enabled &&
+          !rule.deletedAt &&
+          rule.pattern.trim() &&
+          (rule.scope === 'book' || rule.scope === 'library'),
       );
-      if (ttsOnlyRules.length === 0) return ssml;
+      if (ttsRules.length === 0) return ssml;
 
       transformCtx['content'] = ssml;
-      transformCtx['viewSettings'] = viewSettings;
+      transformCtx['viewSettings'] = {
+        ...viewSettings,
+        proofreadRules: viewSettings.proofreadRules?.filter(
+          (rule) => rule.scope === 'book' || rule.scope === 'library',
+        ),
+      };
       ssml = await proofreadTransformer.transform(transformCtx, {
         docType: 'text/xml',
-        onlyForTTS: true,
       });
       return ssml;
     },

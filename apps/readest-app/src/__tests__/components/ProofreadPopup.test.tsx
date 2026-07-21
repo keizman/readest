@@ -99,6 +99,12 @@ describe('ProofreadPopup Component', () => {
       expect(screen.getByText('Apply')).toBeTruthy();
     });
 
+    it('should not render an Only for TTS control', () => {
+      renderWithProviders(<ProofreadPopup {...defaultProps} />);
+
+      expect(screen.queryByText('Only for TTS:')).toBeNull();
+    });
+
     it('should display selected text preview', () => {
       renderWithProviders(<ProofreadPopup {...defaultProps} />);
 

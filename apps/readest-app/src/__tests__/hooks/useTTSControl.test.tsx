@@ -78,6 +78,21 @@ const mockBookData = {
   book: { primaryLanguage: 'en', title: 'T', author: 'A', coverImageUrl: '' },
 };
 
+const proofreadStoreMockState = vi.hoisted(() => ({
+  mergedRules: [] as Array<{
+    id: string;
+    scope: 'selection' | 'book' | 'library';
+    pattern: string;
+    replacement: string;
+    enabled: boolean;
+    isRegex: boolean;
+    order: number;
+    wholeWord?: boolean;
+    caseSensitive?: boolean;
+    onlyForTTS?: boolean;
+  }>,
+}));
+
 vi.mock('@/store/readerStore', () => {
   const store = {
     hoveredBookKey: null,
@@ -113,7 +128,7 @@ vi.mock('@/store/readerProgressStore', () => ({
 
 vi.mock('@/store/proofreadStore', () => ({
   useProofreadStore: () => ({
-    getMergedRules: () => [],
+    getMergedRules: () => proofreadStoreMockState.mergedRules,
   }),
 }));
 
@@ -136,8 +151,17 @@ const ttsControllerInstances: unknown[] = [];
 const pendingInitResolvers: Array<() => void> = [];
 
 vi.mock('@/services/tts', () => ({
-  TTSController: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
+  TTSController: vi.fn().mockImplementation(function (
+    this: Record<string, unknown>,
+    _appService: unknown,
+    _view: unknown,
+    _isAuthenticated: unknown,
+    preprocessCallback: unknown,
+    onSectionChange: unknown,
+  ) {
     Object.assign(this, {
+      preprocessCallback,
+      onSectionChange,
       init: vi.fn().mockImplementation(
         () =>
           new Promise<void>((resolve) => {
@@ -248,6 +272,7 @@ vi.mock('@/utils/ttsTime', () => ({
 
 // Imports must come AFTER vi.mock calls so they pick up the mocked modules.
 import { useTTSControl } from '@/app/reader/hooks/useTTSControl';
+import { proofreadTransformer } from '@/services/transformers/proofread';
 import { ttsMediaBridge } from '@/services/tts/ttsMediaBridge';
 import { eventDispatcher } from '@/utils/event';
 import { useReaderStore } from '@/store/readerStore';
@@ -275,6 +300,7 @@ describe('useTTSControl concurrent tts-speak events', () => {
   beforeEach(() => {
     ttsControllerInstances.length = 0;
     pendingInitResolvers.length = 0;
+    proofreadStoreMockState.mergedRules = [];
   });
 
   afterEach(() => {
@@ -308,10 +334,64 @@ describe('useTTSControl concurrent tts-speak events', () => {
   });
 });
 
+describe('useTTSControl proofread preprocessing', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+    proofreadStoreMockState.mergedRules = [
+      {
+        id: 'book-rule',
+        scope: 'book',
+        pattern: 'noise',
+        replacement: '.',
+        enabled: true,
+        isRegex: false,
+        caseSensitive: true,
+        order: 1,
+        wholeWord: true,
+        onlyForTTS: false,
+      },
+    ];
+  });
+
+  afterEach(() => {
+    cleanup();
+    proofreadStoreMockState.mergedRules = [];
+  });
+
+  it('runs normal book proofread rules through the TTS SSML transformer', async () => {
+    render(<Harness />);
+
+    await act(async () => {
+      const p = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await p;
+    });
+
+    const controller = ttsControllerInstances[0] as {
+      preprocessCallback?: (ssml: string) => Promise<string>;
+    };
+    const transformSpy = vi.mocked(proofreadTransformer.transform);
+    transformSpy.mockClear();
+
+    await controller.preprocessCallback?.('<speak>noise</speak>');
+
+    expect(transformSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: '<speak>noise</speak>',
+        viewSettings: mockViewSettings,
+      }),
+      expect.objectContaining({ docType: 'text/xml' }),
+    );
+  });
+});
+
 describe('useTTSControl tts-sync-request (mode-entry replay)', () => {
   beforeEach(() => {
     ttsControllerInstances.length = 0;
     pendingInitResolvers.length = 0;
+    proofreadStoreMockState.mergedRules = [];
   });
 
   afterEach(() => {

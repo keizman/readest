@@ -391,7 +391,7 @@ export interface ProofreadRule {
   order: number; // Lower numbers apply first
   wholeWord?: boolean; // Match whole words only (uses \b word boundaries)
   caseSensitive?: boolean; // Case-sensitive matching (default true)
-  onlyForTTS?: boolean; // Only replace text for TTS, not in the book display (only for book/library scope)
+  onlyForTTS?: boolean; // Legacy flag; ignored. Live rules apply to display and TTS.
   // CRDT sync fields (book/selection scope rides the book-config sync). `updatedAt`
   // is the last-write-wins key for the per-id merge; `deletedAt` is a tombstone so a
   // deletion survives the merge instead of being resurrected by the peer's copy.

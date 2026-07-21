@@ -1860,6 +1860,26 @@ describe('TTSController', () => {
       expect(speakMarksSpy).toHaveBeenCalledTimes(2);
       expect(speakMarksSpy.mock.calls.every((call) => call[0].length === 1)).toBe(true);
     });
+
+    test('preprocesses next-section lookahead SSML before preloading it', async () => {
+      await controller.init();
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        next: vi.fn().mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const preprocess = vi.fn(async (ssml: string) => ssml.replace('hello', 'proofed'));
+      controller.preprocessCallback = preprocess;
+      const parseSpy = vi.mocked(parseSSMLMarks);
+      parseSpy.mockClear();
+      vi.spyOn(controller.ttsEdgeClient, 'speakMarks').mockImplementation(async function* () {});
+
+      await controller.preloadNextSSML(1, 1);
+
+      expect(preprocess).toHaveBeenCalledWith('<speak>hello</speak>');
+      expect(parseSpy).toHaveBeenCalledWith('<speak>proofed</speak>', '');
+    });
   });
 
   describe('initViewTTS', () => {

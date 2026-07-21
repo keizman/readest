@@ -1,7 +1,7 @@
 // Helpers for word-level TTS highlighting driven by Edge TTS word-boundary
 // metadata. Boundary words are matched sequentially against the text of the
-// currently spoken sentence range; an unmatched word (e.g. rewritten by a
-// TTS-only proofread rule) is skipped without advancing the search cursor so
+// currently spoken sentence range; an unmatched word (e.g. rewritten by
+// proofread preprocessing) is skipped without advancing the search cursor so
 // later words still align.
 
 export interface TTSWordOffset {
